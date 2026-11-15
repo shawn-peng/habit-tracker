@@ -1,8 +1,9 @@
-# Habit & Routine Tracker (iPhone, Mac, Android, Web)
+# Habit & Routine Tracker (Native Android, iPhone, Mac, Web)
 
-A 100% Python full-stack cross-platform **Habit & Routine Tracker** powered by:
-- **Backend Server:** Python **FastAPI** + **MongoDB** (`PyMongo AsyncMongoClient`) + **Argon2 / JWT Auth**
-- **Cross-Platform Client:** **Flet 1.0+** + async **`httpx`** targeting **iPhone (iOS)**, **Mac (macOS)**, **Android**, and **Web** from a single codebase.
+A full-stack cross-platform **Habit & Routine Tracker** powered by:
+- **Backend Server:** Python **FastAPI** + **MongoDB** (`PyMongo AsyncMongoClient`) + **Argon2 / JWT Auth** (`backend/`)
+- **Native Android App:** **Kotlin + Jetpack Compose + Material 3** (`android/`) connecting directly to the FastAPI backend
+- **Cross-Platform Client:** **Flet 1.0+** + async **`httpx`** targeting **iPhone (iOS)**, **Mac (macOS)**, **Android**, and **Web** (`frontend/`).
 
 ---
 
@@ -28,7 +29,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ---
 
-## 2. Run the Flet Client Locally (Desktop & Web)
+## 2. Native Android App (`android/`, Kotlin + Jetpack Compose)
+
+See [`android/README.md`](android/README.md) for full details.
+
+- **Cloud APK Build (No local Android SDK needed):** Every push or pull request on `main` (as well as `workflow_dispatch`) triggers the **`build-android-native`** job in GitHub Actions to run `./gradlew testDebugUnitTest assembleDebug` and upload **`android-native-apk`** (`HabitTracker-Android-debug.apk`).
+- **Local Development:** Open `android/` directly in **Android Studio** (JDK 17+). When running the backend on your PC (`uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`), use `http://10.0.2.2:8000` in the Android Emulator or your PC's LAN IP (e.g., `http://192.168.1.50:8000`) on a physical phone.
+
+---
+
+## 3. Run the Flet Client Locally (Desktop & Web)
 
 ```powershell
 cd frontend
@@ -47,7 +57,7 @@ When signing in from an iPhone or Android device on the same Wi-Fi network, set 
 
 ---
 
-## 3. Build for Web, Android, Mac, and iPhone
+## 4. Build Flet Clients for Web, Android, Mac, and iPhone
 
 ### Local Builds (from `frontend/`)
 - **Web static bundle:** `flet build web`

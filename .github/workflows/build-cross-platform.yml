@@ -46,6 +46,37 @@ jobs:
         working-directory: backend
         run: pytest -v
 
+  build-android-native:
+    name: Build Native Android App (Kotlin & Compose APK)
+    runs-on: ubuntu-latest
+    needs: backend-tests
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Unit Tests & Build Debug APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew testDebugUnitTest assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk HabitTracker-Android-debug.apk
+
+      - name: Upload Native Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-native-apk
+          path: android/HabitTracker-Android-debug.apk
+          if-no-files-found: error
+
   build-web-and-android:
     name: Build Web & Android (.apk)
     runs-on: ubuntu-latest

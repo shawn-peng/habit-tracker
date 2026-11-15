@@ -25,3 +25,13 @@ frontend/.flet/
 Thumbs.db
 .vscode/
 .idea/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+*.jks
+*.keystore
+!android/gradle/wrapper/gradle-wrapper.jar
