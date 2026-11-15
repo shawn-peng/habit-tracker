@@ -172,6 +172,19 @@ class HabitApiClient:
             "GET", "/api/habits/today", params={"target_date": target_date}
         )
 
+    async def get_period_schedule(
+        self,
+        period: str = "week",
+        anchor_date: str | None = None,
+        today: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"period": period}
+        if anchor_date:
+            params["anchor_date"] = anchor_date
+        if today:
+            params["today"] = today
+        return await self._request("GET", "/api/habits/schedule", params=params)
+
     async def list_habits(self, include_archived: bool = False) -> list[dict[str, Any]]:
         return await self._request(
             "GET",
@@ -207,6 +220,15 @@ class HabitApiClient:
     async def get_stats_summary(self, today: str) -> dict[str, Any]:
         return await self._request(
             "GET", "/api/stats/summary", params={"today": today}
+        )
+
+    async def get_sli_dashboard(
+        self, today: str, window_days: int = 30
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/api/stats/sli",
+            params={"today": today, "window_days": window_days},
         )
 
 

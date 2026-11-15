@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 
 from bson import ObjectId
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -17,11 +18,16 @@ from app.core import (
     HabitTodayOut,
     HabitUpdate,
     LoginRequest,
+    PeriodScheduleOut,
     RegisterRequest,
+    SliDashboardOut,
     StatsSummaryOut,
     TokenResponse,
     UserPublic,
+    build_period_schedule,
+    build_sli_dashboard,
     compute_30d_completion_rate,
+    compute_period_bounds,
     compute_streaks,
     create_access_token,
     ensure_indexes,
@@ -80,7 +86,12 @@ def _serialize_habit(habit_doc: dict) -> HabitOut:
         icon=habit_doc.get("icon", "check_circle"),
         frequency_type=habit_doc.get("frequency_type", "daily"),
         weekdays=habit_doc.get("weekdays", [0, 1, 2, 3, 4, 5, 6]),
+        monthly_mode=habit_doc.get("monthly_mode", "from_start"),
+        monthly_day=habit_doc.get("monthly_day", 1),
+        monthly_week=habit_doc.get("monthly_week", 1),
+        monthly_weekday=habit_doc.get("monthly_weekday", 0),
         target_per_day=habit_doc.get("target_per_day", 1),
+        target_slo=round(float(habit_doc.get("target_slo", 85.0)), 1),
         archived=habit_doc.get("archived", False),
         created_at=habit_doc["created_at"],
     )
@@ -192,7 +203,7 @@ async def create_habit(
 ) -> HabitOut:
     weekdays = (
         [0, 1, 2, 3, 4, 5, 6]
-        if payload.frequency_type == "daily"
+        if payload.frequency_type in ("daily", "monthly")
         else payload.weekdays
     )
     doc = {
@@ -203,7 +214,12 @@ async def create_habit(
         "icon": payload.icon,
         "frequency_type": payload.frequency_type,
         "weekdays": weekdays,
+        "monthly_mode": payload.monthly_mode,
+        "monthly_day": payload.monthly_day,
+        "monthly_week": payload.monthly_week,
+        "monthly_weekday": payload.monthly_weekday,
         "target_per_day": payload.target_per_day,
+        "target_slo": round(float(payload.target_slo), 1),
         "archived": False,
         "created_at": datetime.now(timezone.utc),
     }
@@ -223,7 +239,11 @@ async def update_habit(
         raise HTTPException(status_code=400, detail="Invalid habit ID")
 
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "target_slo" in updates:
+        updates["target_slo"] = round(float(updates["target_slo"]), 1)
     if updates.get("frequency_type") == "daily":
+        updates["weekdays"] = [0, 1, 2, 3, 4, 5, 6]
+    elif updates.get("frequency_type") == "monthly" and "weekdays" not in updates:
         updates["weekdays"] = [0, 1, 2, 3, 4, 5, 6]
 
     if not updates:
@@ -316,6 +336,49 @@ async def list_habits_for_date(
             )
         )
     return results
+
+
+@app.get("/api/habits/schedule", response_model=PeriodScheduleOut)
+async def get_habits_schedule(
+    period: Literal["week", "month"] = Query(default="week"),
+    anchor_date: str | None = Query(default=None),
+    today: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncDatabase = Depends(get_db),
+) -> PeriodScheduleOut:
+    today_date = _parse_iso_date(today)
+    parsed_anchor = _parse_iso_date(anchor_date) if anchor_date else today_date
+    start_date, end_date = compute_period_bounds(period, parsed_anchor)
+    user_id = str(current_user["_id"])
+
+    habits = [
+        doc
+        async for doc in db.habits.find({"user_id": user_id, "archived": False}).sort(
+            "created_at", 1
+        )
+    ]
+    habit_ids = [str(h["_id"]) for h in habits]
+    checkins_by_key: dict[tuple[str, str], dict] = {}
+    if habit_ids:
+        async for chk in db.checkins.find(
+            {
+                "user_id": user_id,
+                "habit_id": {"$in": habit_ids},
+                "date": {
+                    "$gte": start_date.isoformat(),
+                    "$lte": end_date.isoformat(),
+                },
+            }
+        ):
+            checkins_by_key[(chk["habit_id"], chk["date"])] = chk
+
+    return build_period_schedule(
+        habits=habits,
+        checkins_by_key=checkins_by_key,
+        period=period,
+        anchor_date=parsed_anchor,
+        today_date=today_date,
+    )
 
 
 @app.post("/api/habits/{habit_id}/checkin", response_model=HabitTodayOut)
@@ -459,6 +522,7 @@ async def get_stats_summary(
                 habit_id=hid,
                 title=h["title"],
                 color=h.get("color", "#6366F1"),
+                frequency_type=h.get("frequency_type", "daily"),
                 current_streak=curr_s,
                 best_streak=best_s,
                 completion_rate_30d=rate_30d,
@@ -478,4 +542,38 @@ async def get_stats_summary(
         overall_completion_rate_30d=overall_rate,
         last_7_days=last_7_days,
         habit_stats=habit_stats,
+    )
+
+
+@app.get("/api/stats/sli", response_model=SliDashboardOut)
+async def get_sli_dashboard(
+    window_days: int = Query(default=30, ge=7, le=365),
+    today: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncDatabase = Depends(get_db),
+) -> SliDashboardOut:
+    ref_date = _parse_iso_date(today)
+    user_id = str(current_user["_id"])
+
+    habits = [
+        doc
+        async for doc in db.habits.find({"user_id": user_id, "archived": False}).sort(
+            "created_at", 1
+        )
+    ]
+    habit_ids = [str(h["_id"]) for h in habits]
+    completed_by_habit: dict[str, set[str]] = {hid: set() for hid in habit_ids}
+
+    if habit_ids:
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": {"$in": habit_ids}, "completed": True},
+            {"habit_id": 1, "date": 1},
+        ):
+            completed_by_habit[chk["habit_id"]].add(chk["date"])
+
+    return build_sli_dashboard(
+        habits,
+        completed_by_habit,
+        ref_date,
+        window_days=window_days,
     )

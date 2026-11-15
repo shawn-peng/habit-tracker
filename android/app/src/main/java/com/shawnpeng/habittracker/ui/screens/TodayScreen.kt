@@ -54,6 +54,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.HabitToday
+import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.parseHabitColor
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -262,7 +263,21 @@ private fun TodayHabitCard(
     onOpenNote: () -> Unit,
 ) {
     val accentColor = parseHabitColor(habit.color)
+    val isMonthly = habit.frequencyType == "monthly"
+    val streakUnit = if (isMonthly) "月" else "天"
     val subtitleParts = buildList {
+        if (isMonthly) {
+            add(
+                formatFrequencySummary(
+                    frequencyType = habit.frequencyType,
+                    weekdays = habit.weekdays,
+                    monthlyMode = habit.monthlyMode,
+                    monthlyDay = habit.monthlyDay,
+                    monthlyWeek = habit.monthlyWeek,
+                    monthlyWeekday = habit.monthlyWeekday,
+                ),
+            )
+        }
         if (habit.targetPerDay > 1) {
             add("${habit.count} / ${habit.targetPerDay} 次")
         }
@@ -346,7 +361,7 @@ private fun TodayHabitCard(
                             },
                         )
                         Text(
-                            text = "${habit.currentStreak}天",
+                            text = "${habit.currentStreak}$streakUnit",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = if (habit.currentStreak > 0) {

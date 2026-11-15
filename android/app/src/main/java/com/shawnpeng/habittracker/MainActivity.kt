@@ -15,9 +15,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Today
 import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.CircularProgressIndicator
@@ -54,6 +56,8 @@ import com.shawnpeng.habittracker.ui.HabitViewModelFactory
 import com.shawnpeng.habittracker.ui.components.HabitFormDialog
 import com.shawnpeng.habittracker.ui.screens.AuthScreen
 import com.shawnpeng.habittracker.ui.screens.HabitsScreen
+import com.shawnpeng.habittracker.ui.screens.ScheduleScreen
+import com.shawnpeng.habittracker.ui.screens.SliDashboardScreen
 import com.shawnpeng.habittracker.ui.screens.StatsScreen
 import com.shawnpeng.habittracker.ui.screens.TodayScreen
 import com.shawnpeng.habittracker.ui.theme.HabitTrackerTheme
@@ -186,19 +190,31 @@ private fun MainShell(
                 NavigationBarItem(
                     selected = uiState.selectedTab == 1,
                     onClick = { vm.selectTab(1) },
-                    icon = { Icon(Icons.Rounded.Checklist, contentDescription = null) },
-                    label = { Text("习惯") },
+                    icon = { Icon(Icons.Rounded.CalendarMonth, contentDescription = null) },
+                    label = { Text("待办") },
                 )
                 NavigationBarItem(
                     selected = uiState.selectedTab == 2,
                     onClick = { vm.selectTab(2) },
+                    icon = { Icon(Icons.Rounded.Checklist, contentDescription = null) },
+                    label = { Text("习惯") },
+                )
+                NavigationBarItem(
+                    selected = uiState.selectedTab == 3,
+                    onClick = { vm.selectTab(3) },
                     icon = { Icon(Icons.Rounded.Insights, contentDescription = null) },
                     label = { Text("统计") },
+                )
+                NavigationBarItem(
+                    selected = uiState.selectedTab == 4,
+                    onClick = { vm.selectTab(4) },
+                    icon = { Icon(Icons.Rounded.Speed, contentDescription = null) },
+                    label = { Text("SLI") },
                 )
             }
         },
         floatingActionButton = {
-            if (uiState.selectedTab == 0 || uiState.selectedTab == 1) {
+            if (uiState.selectedTab == 0 || uiState.selectedTab == 2) {
                 FloatingActionButton(
                     onClick = {
                         editingHabit = null
@@ -227,7 +243,17 @@ private fun MainShell(
                     onDecrementCheckin = vm::decrementCheckin,
                     onUpdateNote = vm::updateCheckinNote,
                 )
-                1 -> HabitsScreen(
+                1 -> ScheduleScreen(
+                    period = uiState.schedulePeriod,
+                    anchorDate = uiState.scheduleAnchorDate,
+                    schedule = uiState.periodSchedule,
+                    onSelectPeriod = vm::setSchedulePeriod,
+                    onShiftPeriod = vm::shiftSchedulePeriod,
+                    onResetCurrent = vm::resetScheduleToCurrent,
+                    onPrimaryCheckin = vm::schedulePrimaryCheckin,
+                    onDecrementCheckin = vm::scheduleDecrementCheckin,
+                )
+                2 -> HabitsScreen(
                     habits = uiState.allHabits,
                     showArchived = uiState.showArchived,
                     onToggleShowArchived = vm::toggleShowArchived,
@@ -238,7 +264,13 @@ private fun MainShell(
                     onToggleArchive = vm::toggleArchive,
                     onDeleteHabit = vm::deleteHabit,
                 )
-                else -> StatsScreen(summary = uiState.statsSummary)
+                3 -> StatsScreen(summary = uiState.statsSummary)
+                else -> SliDashboardScreen(
+                    dashboard = uiState.sliDashboard,
+                    selectedWindowDays = uiState.sliWindowDays,
+                    onSelectWindow = vm::selectSliWindow,
+                    onUpdateTargetSlo = vm::updateHabitTargetSlo,
+                )
             }
 
             if (uiState.isRefreshing) {

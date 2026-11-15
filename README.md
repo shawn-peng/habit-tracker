@@ -4,12 +4,17 @@ A full-stack cross-platform **Habit & Routine Tracker** powered by:
 - **Backend Server:** Python **FastAPI** + **MongoDB** (`PyMongo AsyncMongoClient`) + **Argon2 / JWT Auth** (`backend/`)
 - **Native Android App:** **Kotlin + Jetpack Compose + Material 3** (`android/`) connecting directly to the FastAPI backend
 - **Cross-Platform Client:** **Flet 1.0+** + async **`httpx`** targeting **iPhone (iOS)**, **Mac (macOS)**, **Android**, and **Web** (`frontend/`).
+- **Personal SLI & Error Budget Dashboard (`SLI`):** SRE-style reliability analytics (`GET /api/stats/sli`) with configurable per-habit `target_slo`, rolling `7d/30d/90d` SLIs, error budget remaining & multi-window burn rates, rolling SLI trend chart, and weekday reliability diagnostics across both clients.
 
 ---
 
 ## 1. Start the Server (MongoDB + FastAPI)
 
-### Start MongoDB (via Docker)
+### Option A: MongoDB Atlas (M0 Free on Google Cloud)
+1. Create an **M0 (Free)** cluster hosted on **Google Cloud** in MongoDB Atlas (e.g., `us-central1` Iowa or `us-east1` South Carolina) with a database user (`readWrite` on `habit_tracker`) and IP access rule.
+2. Copy `backend/.env.example` to `backend/.env` and set `MONGODB_URI` to your Atlas `mongodb+srv://...` connection string (plus a strong random `JWT_SECRET`).
+
+### Option B: Local MongoDB (via Docker)
 ```powershell
 docker compose up -d mongodb
 ```
@@ -26,6 +31,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 - Interactive API docs: `http://localhost:8000/docs`
 - Run backend unit tests: `pytest -v`
+
+### Deploy Backend to Google Cloud Run + MongoDB Atlas
+- `backend/Dockerfile` listens on Cloud Run's injected `$PORT` (`8080` on Cloud Run, defaulting to `8000` locally).
+- Configure runtime environment variables (or Secret Manager secrets) on the Cloud Run service:
+  - `MONGODB_URI` (`mongodb+srv://...`, keeping `maxPoolSize=20&maxIdleTimeMS=60000` for serverless scaling within Atlas M0's 500-connection limit)
+  - `MONGODB_DB_NAME=habit_tracker`
+  - `JWT_SECRET` (a secure random secret, distinct from local dev)
+  - `CORS_ORIGINS` (your deployed web origin or `*` for native/web token-based clients)
+- Co-locate your Cloud Run service and Atlas M0 cluster in the **same GCP region** (e.g., `us-central1` / `CENTRAL_US` or `us-east1` / `EASTERN_US`) for single-digit ms database latency.
+- **Atlas M0 Network Access with Cloud Run:** VPC Peering and Private Service Connect require Atlas Dedicated `M10+`. For `M0`, either route Cloud Run egress through Cloud NAT with a static IP allowlisted in Atlas, or allow `0.0.0.0/0` in Atlas Network Access combined with strong SCRAM credentials and TLS (enforced automatically by `mongodb+srv://`).
 
 ---
 
@@ -66,9 +81,22 @@ When signing in from an iPhone or Android device on the same Wi-Fi network, set 
 - **iPhone `.ipa` (on a Mac):** `flet build ipa`
 
 ### Cloud Builds for Mac & iPhone (from Windows)
-Push to `https://github.com/shawn-peng/habit-tracker` and trigger the **Build Cross-Platform Clients & Test Backend** workflow under the GitHub **Actions** tab (`workflow_dispatch`) to compile macOS, iOS, Android, and Web artifacts on GitHub-hosted `macos-latest` and `ubuntu-latest` runners.
+Push to `https://github.com/shawn-peng/habit-tracker` and trigger the **Build Cross-Platform Clients & Test Backend** workflow under the GitHub **Actions** tab (`workflow_dispatch`) to compile iOS, macOS, Android, and Web artifacts on GitHub-hosted `macos-latest` and `ubuntu-latest` runners.
 
-When dispatching the workflow manually, choose an `ios_target` option:
-- **`ios-simulator`** *(default)* — Builds an unsigned `.app` bundle for the macOS iOS Simulator (no Apple Developer certificates required).
-- **`ipa-unsigned`** — Compiles an unsigned iOS `.xcarchive` (`--flutter-build-args=--no-codesign`) for manual/external signing.
-- **`ipa-signed`** — Builds a signed `.ipa` using your `IOS_TEAM_ID` GitHub repository secret (and configured signing credentials).
+When dispatching the workflow manually:
+- **`ios_target`:**
+  - **`ipa-unsigned`** *(default)* — Compiles an unsigned iOS archive and packages `Payload/<App>.app` into a sideload-ready `HabitTracker-iOS-Unsigned.ipa`, uploaded as the **`ios-ipa`** artifact (no paid Apple Developer account or certificates required).
+  - **`ios-simulator`** — Builds an unsigned `.app` bundle for the macOS iOS Simulator.
+  - **`ipa-signed`** — Builds a signed `.ipa` using your `IOS_TEAM_ID` GitHub repository secret (and configured signing credentials).
+- **`ios_only`:** Check this option to skip the macOS desktop, Web, and Android builds when you only want a faster iPhone `.ipa` build.
+
+#### Personal iPhone Sideloading from Windows (Free Apple ID)
+To install `HabitTracker-iOS-Unsigned.ipa` onto your own iPhone without publishing to the App Store (free Apple ID certificates remain valid for **7 days** and allow up to **3** sideloaded apps per device):
+1. Download the **`ios-ipa`** artifact from the completed GitHub Actions run and unzip it to obtain `HabitTracker-iOS-Unsigned.ipa`.
+2. Install using any personal sideloading tool with your Apple ID:
+   - **SideStore (recommended):** Complete the one-time setup from Windows (install SideStore + pair with your PC), then import `HabitTracker-iOS-Unsigned.ipa` on your iPhone. With SideStore's local VPN (`LocalDevVPN` / WireGuard) enabled, SideStore refreshes the 7-day signature directly on your iPhone without needing your PC.
+   - **AltStore:** Run **AltServer** on Windows, install AltStore on your iPhone, and open `HabitTracker-iOS-Unsigned.ipa` in AltStore (AltServer refreshes it over USB or same-network Wi-Fi sync).
+   - **Sideloadly:** Connect your iPhone to Windows via USB, drag `HabitTracker-iOS-Unsigned.ipa` into Sideloadly, sign in with your Apple ID, and click **Start**.
+3. On your iPhone before launching the app for the first time:
+   - Enable **Developer Mode** under **Settings → Privacy & Security → Developer Mode** (requires a reboot).
+   - Trust your Apple ID developer certificate under **Settings → General → VPN & Device Management**.

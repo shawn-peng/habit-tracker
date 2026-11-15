@@ -190,6 +190,7 @@ fun StatsScreen(summary: StatsSummary?) {
         } else {
             items(stats.habitStats, key = { it.habitId }) { hs ->
                 val accentColor = parseHabitColor(hs.color)
+                val streakUnit = if (hs.frequencyType == "monthly") "月" else "天"
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
@@ -233,13 +234,13 @@ fun StatsScreen(summary: StatsSummary?) {
 
                         Column(horizontalAlignment = Alignment.End) {
                             Text(
-                                text = "当前 ${hs.currentStreak} 天",
+                                text = "当前 ${hs.currentStreak} $streakUnit",
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.tertiary,
                             )
                             Text(
-                                text = "最佳 ${hs.bestStreak} 天",
+                                text = "最佳 ${hs.bestStreak} $streakUnit",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )

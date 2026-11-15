@@ -12,7 +12,10 @@ import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.HabitCreateRequest
 import com.shawnpeng.habittracker.data.HabitToday
 import com.shawnpeng.habittracker.data.HabitUpdateRequest
+import com.shawnpeng.habittracker.data.PeriodSchedule
+import com.shawnpeng.habittracker.data.ScheduleHabitItem
 import com.shawnpeng.habittracker.data.SessionPreferences
+import com.shawnpeng.habittracker.data.SliDashboard
 import com.shawnpeng.habittracker.data.StatsSummary
 import com.shawnpeng.habittracker.data.UserPublic
 import java.time.LocalDate
@@ -34,9 +37,14 @@ data class HabitUiState(
     val selectedTab: Int = 0,
     val selectedDate: LocalDate = LocalDate.now(),
     val todayHabits: List<HabitToday> = emptyList(),
+    val schedulePeriod: String = "week",
+    val scheduleAnchorDate: LocalDate = LocalDate.now(),
+    val periodSchedule: PeriodSchedule? = null,
     val allHabits: List<Habit> = emptyList(),
     val showArchived: Boolean = false,
     val statsSummary: StatsSummary? = null,
+    val sliWindowDays: Int = 30,
+    val sliDashboard: SliDashboard? = null,
     val snackbarMessage: String? = null,
 )
 
@@ -185,9 +193,15 @@ class HabitViewModel(
                 it.copy(
                     isAuthenticated = false,
                     currentUser = null,
+                    selectedTab = 0,
+                    selectedDate = LocalDate.now(),
                     todayHabits = emptyList(),
+                    schedulePeriod = "week",
+                    scheduleAnchorDate = LocalDate.now(),
+                    periodSchedule = null,
                     allHabits = emptyList(),
                     statsSummary = null,
+                    sliDashboard = null,
                     authError = null,
                 )
             }
@@ -249,11 +263,54 @@ class HabitViewModel(
         )
     }
 
+    fun setSchedulePeriod(period: String) {
+        if (period != "week" && period != "month") return
+        if (_uiState.value.schedulePeriod == period) return
+        _uiState.update { it.copy(schedulePeriod = period) }
+        viewModelScope.launch {
+            loadTabData(1)
+        }
+    }
+
+    fun shiftSchedulePeriod(delta: Long) {
+        val current = _uiState.value.scheduleAnchorDate
+        val next = if (_uiState.value.schedulePeriod == "month") {
+            current.plusMonths(delta)
+        } else {
+            current.plusWeeks(delta)
+        }
+        _uiState.update { it.copy(scheduleAnchorDate = next) }
+        viewModelScope.launch {
+            loadTabData(1)
+        }
+    }
+
+    fun resetScheduleToCurrent() {
+        val today = LocalDate.now()
+        _uiState.update { it.copy(scheduleAnchorDate = today) }
+        viewModelScope.launch {
+            loadTabData(1)
+        }
+    }
+
+    fun schedulePrimaryCheckin(item: ScheduleHabitItem) {
+        val targetDate = LocalDate.parse(item.date)
+        if (targetDate.isAfter(LocalDate.now())) return
+        val action = if (item.targetPerDay <= 1) "toggle" else "increment"
+        performCheckin(item.habitId, CheckinRequest(date = item.date, action = action))
+    }
+
+    fun scheduleDecrementCheckin(item: ScheduleHabitItem) {
+        val targetDate = LocalDate.parse(item.date)
+        if (targetDate.isAfter(LocalDate.now()) || item.count <= 0) return
+        performCheckin(item.habitId, CheckinRequest(date = item.date, action = "decrement"))
+    }
+
     private fun performCheckin(habitId: String, request: CheckinRequest) {
         viewModelScope.launch {
             try {
                 api.checkinHabit(habitId, request)
-                loadTabData(0)
+                loadTabData(_uiState.value.selectedTab)
             } catch (exc: ApiException) {
                 handleAuthenticatedError(exc)
             }
@@ -274,7 +331,12 @@ class HabitViewModel(
                             icon = request.icon,
                             frequencyType = request.frequencyType,
                             weekdays = request.weekdays,
+                            monthlyMode = request.monthlyMode,
+                            monthlyDay = request.monthlyDay,
+                            monthlyWeek = request.monthlyWeek,
+                            monthlyWeekday = request.monthlyWeekday,
                             targetPerDay = request.targetPerDay,
+                            targetSlo = request.targetSlo,
                         ),
                     )
                     _uiState.update { it.copy(snackbarMessage = "习惯已更新") }
@@ -318,12 +380,35 @@ class HabitViewModel(
     fun toggleShowArchived(show: Boolean) {
         _uiState.update { it.copy(showArchived = show) }
         viewModelScope.launch {
-            loadTabData(1)
+            loadTabData(2)
         }
     }
 
     fun consumeSnackbar() {
         _uiState.update { it.copy(snackbarMessage = null) }
+    }
+
+    fun selectSliWindow(windowDays: Int) {
+        if (_uiState.value.sliWindowDays == windowDays) return
+        _uiState.update { it.copy(sliWindowDays = windowDays) }
+        viewModelScope.launch {
+            loadTabData(4)
+        }
+    }
+
+    fun updateHabitTargetSlo(habitId: String, targetSlo: Double) {
+        val rounded = kotlin.math.round(targetSlo * 10.0) / 10.0
+        viewModelScope.launch {
+            _uiState.update { it.copy(isRefreshing = true) }
+            try {
+                api.updateHabit(habitId, HabitUpdateRequest(targetSlo = rounded))
+                _uiState.update { it.copy(snackbarMessage = "已更新目标 SLO") }
+                loadTabData(_uiState.value.selectedTab)
+            } catch (exc: ApiException) {
+                _uiState.update { it.copy(isRefreshing = false) }
+                handleAuthenticatedError(exc)
+            }
+        }
     }
 
     private suspend fun loadTabData(tabIndex: Int) {
@@ -335,12 +420,28 @@ class HabitViewModel(
                     _uiState.update { it.copy(isRefreshing = false, todayHabits = items) }
                 }
                 1 -> {
+                    val state = _uiState.value
+                    val schedule = api.getPeriodSchedule(
+                        period = state.schedulePeriod,
+                        anchorDate = isoDate(state.scheduleAnchorDate),
+                        today = isoDate(LocalDate.now()),
+                    )
+                    _uiState.update { it.copy(isRefreshing = false, periodSchedule = schedule) }
+                }
+                2 -> {
                     val items = api.listHabits(includeArchived = _uiState.value.showArchived)
                     _uiState.update { it.copy(isRefreshing = false, allHabits = items) }
                 }
-                else -> {
+                3 -> {
                     val summary = api.getStatsSummary(isoDate(LocalDate.now()))
                     _uiState.update { it.copy(isRefreshing = false, statsSummary = summary) }
+                }
+                else -> {
+                    val dashboard = api.getSliDashboard(
+                        today = isoDate(LocalDate.now()),
+                        windowDays = _uiState.value.sliWindowDays,
+                    )
+                    _uiState.update { it.copy(isRefreshing = false, sliDashboard = dashboard) }
                 }
             }
         } catch (exc: ApiException) {

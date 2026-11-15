@@ -139,6 +139,33 @@ class HabitApiClient(
         )
     }
 
+    suspend fun getSliDashboard(today: String, windowDays: Int = 30): SliDashboard {
+        return executeJson(
+            method = "GET",
+            pathSegments = listOf("api", "stats", "sli"),
+            queryParams = mapOf(
+                "today" to today,
+                "window_days" to windowDays.toString(),
+            ),
+        )
+    }
+
+    suspend fun getPeriodSchedule(
+        period: String = "week",
+        anchorDate: String? = null,
+        today: String? = null,
+    ): PeriodSchedule {
+        return executeJson(
+            method = "GET",
+            pathSegments = listOf("api", "habits", "schedule"),
+            queryParams = buildMap {
+                put("period", period)
+                anchorDate?.let { put("anchor_date", it) }
+                today?.let { put("today", it) }
+            },
+        )
+    }
+
     private suspend inline fun <reified T> executeJson(
         method: String,
         pathSegments: List<String>,

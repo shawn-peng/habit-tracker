@@ -167,7 +167,15 @@ private fun ManageHabitCard(
     onDeleteRequest: () -> Unit,
 ) {
     val accentColor = parseHabitColor(habit.color)
-    val freqText = formatFrequencySummary(habit.frequencyType, habit.weekdays)
+    val freqText = formatFrequencySummary(
+        frequencyType = habit.frequencyType,
+        weekdays = habit.weekdays,
+        monthlyMode = habit.monthlyMode,
+        monthlyDay = habit.monthlyDay,
+        monthlyWeek = habit.monthlyWeek,
+        monthlyWeekday = habit.monthlyWeekday,
+    )
+    val targetUnitLabel = if (habit.frequencyType == "monthly") "单次目标" else "每日目标"
     val titleSuffix = if (habit.archived) " (已归档)" else ""
 
     Card(
@@ -204,7 +212,7 @@ private fun ManageHabitCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = "$freqText · 每日目标 ${habit.targetPerDay} 次",
+                        text = "$freqText · $targetUnitLabel ${habit.targetPerDay} 次 · SLO ${habit.targetSlo}%",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

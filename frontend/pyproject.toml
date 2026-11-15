@@ -20,6 +20,7 @@ path = "src"
 
 [tool.flet.ios.info]
 NSAppTransportSecurity = { NSAllowsArbitraryLoads = true }
+NSLocalNetworkUsageDescription = "Connect to your Habit Tracker backend server on your local Wi-Fi network."
 
 [tool.flet.macos]
 entitlement = { "com.apple.security.network.client" = true }
