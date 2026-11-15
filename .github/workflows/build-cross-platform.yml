@@ -1,0 +1,162 @@
+name: Build Cross-Platform Clients & Test Backend
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      ios_target:
+        description: "iPhone build mode (ios-simulator requires no Apple certs; ipa-unsigned builds archive without codesign; ipa-signed uses IOS_TEAM_ID secret)"
+        required: false
+        default: "ios-simulator"
+        type: choice
+        options:
+          - ios-simulator
+          - ipa-unsigned
+          - ipa-signed
+
+env:
+  PYTHONUTF8: "1"
+  FLET_CLI_NO_RICH_OUTPUT: "1"
+
+jobs:
+  backend-tests:
+    name: Backend Unit Tests (Python 3.14)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Backend Dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Streak & Schema Tests
+        working-directory: backend
+        run: pytest -v
+
+  build-web-and-android:
+    name: Build Web & Android (.apk)
+    runs-on: ubuntu-latest
+    needs: backend-tests
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: frontend/requirements.txt
+
+      - name: Cache Flet & Flutter Toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/flutter
+            ~/.flet
+          key: flet-linux-${{ hashFiles('frontend/pyproject.toml', 'frontend/requirements.txt') }}
+
+      - name: Install uv & Flet CLI
+        working-directory: frontend
+        run: |
+          python -m pip install --upgrade pip uv
+          pip install -r requirements.txt
+
+      - name: Build Static Web App
+        working-directory: frontend
+        run: flet build web --yes --verbose
+
+      - name: Build Android APK
+        working-directory: frontend
+        run: flet build apk --yes --verbose
+
+      - name: Upload Web & Android Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-and-android-builds
+          path: |
+            frontend/build/web
+            frontend/build/apk
+          if-no-files-found: error
+
+  build-macos-and-ios:
+    name: Build macOS (.app) & iPhone (iOS)
+    runs-on: macos-latest
+    needs: backend-tests
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: frontend/requirements.txt
+
+      - name: Cache Flet & Flutter Toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/flutter
+            ~/.flet
+          key: flet-macos-${{ hashFiles('frontend/pyproject.toml', 'frontend/requirements.txt') }}
+
+      - name: Install uv & Flet CLI
+        working-directory: frontend
+        run: |
+          python -m pip install --upgrade pip uv
+          pip install -r requirements.txt
+
+      - name: Build macOS Desktop App (.app)
+        working-directory: frontend
+        run: |
+          flet build macos --yes --verbose
+          ditto -c -k --sequesterRsrc --keepParent build/macos HabitTracker-macOS.zip
+
+      - name: Build iPhone App (${{ inputs.ios_target || 'ios-simulator' }})
+        working-directory: frontend
+        env:
+          IOS_MODE: ${{ inputs.ios_target || 'ios-simulator' }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          if [ "$IOS_MODE" = "ipa-signed" ]; then
+            if [ -z "$IOS_TEAM_ID" ]; then
+              echo "::error::IOS_TEAM_ID secret is required when ios_target is ipa-signed."
+              exit 1
+            fi
+            flet build ipa --yes --verbose --team "$IOS_TEAM_ID"
+          elif [ "$IOS_MODE" = "ipa-unsigned" ]; then
+            flet build ipa --yes --verbose --flutter-build-args=--no-codesign
+            ARCHIVE_PATH=$(find build -name "*.xcarchive" -maxdepth 5 | head -n 1)
+            if [ -n "$ARCHIVE_PATH" ]; then
+              ditto -c -k --sequesterRsrc --keepParent "$ARCHIVE_PATH" HabitTracker-iOS-UnsignedArchive.zip
+            fi
+          else
+            flet build ios-simulator --yes --verbose
+            ditto -c -k --sequesterRsrc --keepParent build/ios-simulator HabitTracker-iOS-Simulator.zip
+          fi
+
+      - name: Upload Apple (macOS & iPhone) Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-macos-and-ios-builds
+          path: |
+            frontend/HabitTracker-*.zip
+            frontend/build/ipa/*.ipa
+          if-no-files-found: error

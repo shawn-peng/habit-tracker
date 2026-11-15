@@ -1,0 +1,28 @@
+[project]
+name = "habit-tracker-client"
+version = "0.1.0"
+description = "Cross-platform Habit & Routine Tracker (iPhone, Mac, Android, Web)"
+requires-python = ">=3.12"
+dependencies = [
+    "flet>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[tool.flet]
+org = "com.shawnpeng"
+product = "Habit Tracker"
+company = "Shawn Peng"
+copyright = "Copyright (C) 2026 Shawn Peng"
+build_number = 1
+
+[tool.flet.app]
+path = "src"
+
+[tool.flet.ios.info]
+NSAppTransportSecurity = { NSAllowsArbitraryLoads = true }
+
+[tool.flet.macos]
+entitlement = { "com.apple.security.network.client" = true }
+
+[tool.flet.android]
+permission = { "android.permission.INTERNET" = true }

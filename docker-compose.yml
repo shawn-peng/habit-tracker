@@ -1,0 +1,35 @@
+services:
+  mongodb:
+    image: mongo:8.0
+    container_name: habit_tracker_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional containerized FastAPI server (run with: docker compose --profile full up -d --build)
+  backend:
+    build:
+      context: ./backend
+    container_name: habit_tracker_api
+    profiles: ["full"]
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB_NAME: habit_tracker
+      JWT_SECRET: change-this-in-production-to-a-long-random-secret
+      CORS_ORIGINS: "*"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
