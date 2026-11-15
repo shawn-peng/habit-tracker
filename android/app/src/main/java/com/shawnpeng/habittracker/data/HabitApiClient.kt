@@ -43,17 +43,39 @@ class HabitApiClient(
         return normalized
     }
 
-    suspend fun register(name: String, email: String, password: String): TokenResponse {
+    suspend fun register(name: String, email: String, password: String): RegisterResponse {
         val body = encodeFullJson.encodeToString(
             RegisterRequest(name = name, email = email, password = password),
         )
-        val response: TokenResponse = executeJson(
+        return executeJson(
             method = "POST",
             pathSegments = listOf("api", "auth", "register"),
             jsonBody = body,
         )
+    }
+
+    suspend fun verifyEmail(email: String, code: String): TokenResponse {
+        val body = encodeFullJson.encodeToString(
+            VerifyEmailRequest(email = email, code = code),
+        )
+        val response: TokenResponse = executeJson(
+            method = "POST",
+            pathSegments = listOf("api", "auth", "verify-email"),
+            jsonBody = body,
+        )
         authToken = response.accessToken
         return response
+    }
+
+    suspend fun resendVerification(email: String): RegisterResponse {
+        val body = encodeFullJson.encodeToString(
+            ResendVerificationRequest(email = email),
+        )
+        return executeJson(
+            method = "POST",
+            pathSegments = listOf("api", "auth", "resend-verification"),
+            jsonBody = body,
+        )
     }
 
     suspend fun login(email: String, password: String): TokenResponse {
@@ -63,6 +85,57 @@ class HabitApiClient(
         val response: TokenResponse = executeJson(
             method = "POST",
             pathSegments = listOf("api", "auth", "login"),
+            jsonBody = body,
+        )
+        authToken = response.accessToken
+        return response
+    }
+
+    suspend fun forgotPassword(email: String): ForgotPasswordResponse {
+        val body = encodeFullJson.encodeToString(
+            ForgotPasswordRequest(email = email),
+        )
+        return executeJson(
+            method = "POST",
+            pathSegments = listOf("api", "auth", "forgot-password"),
+            jsonBody = body,
+        )
+    }
+
+    suspend fun resetPassword(
+        email: String,
+        code: String,
+        newPassword: String,
+    ): TokenResponse {
+        val body = encodeFullJson.encodeToString(
+            ResetPasswordRequest(
+                email = email,
+                code = code,
+                newPassword = newPassword,
+            ),
+        )
+        val response: TokenResponse = executeJson(
+            method = "POST",
+            pathSegments = listOf("api", "auth", "reset-password"),
+            jsonBody = body,
+        )
+        authToken = response.accessToken
+        return response
+    }
+
+    suspend fun changePassword(
+        currentPassword: String,
+        newPassword: String,
+    ): TokenResponse {
+        val body = encodeFullJson.encodeToString(
+            ChangePasswordRequest(
+                currentPassword = currentPassword,
+                newPassword = newPassword,
+            ),
+        )
+        val response: TokenResponse = executeJson(
+            method = "POST",
+            pathSegments = listOf("api", "auth", "change-password"),
             jsonBody = body,
         )
         authToken = response.accessToken

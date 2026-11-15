@@ -4,6 +4,7 @@ from typing import Any
 import flet as ft
 
 from api_client import (
+    DEFAULT_API_URL,
     ApiError,
     HabitApiClient,
     StorageHelper,
@@ -127,73 +128,409 @@ class HabitTrackerApp:
             self.render_shell()
 
     # -----------------------------------------------------------------------
-    # Authentication Screen (Login / Register + Server URL Config)
+    # Authentication Screen (Login / Register / Verify Email / Forgot Password)
     # -----------------------------------------------------------------------
-    def render_auth_screen(self, is_register: bool = False) -> None:
+    def render_auth_screen(
+        self,
+        is_register: bool = False,
+        auth_mode: str | None = None,
+        prefill_email: str = "",
+        initial_info: str = "",
+    ) -> None:
         self.page.navigation_bar = None
         self.page.controls.clear()
+
+        mode = auth_mode or ("register" if is_register else "login")
+        has_reset_code = False
 
         server_input = ft.TextField(
             label="Server API URL",
             value=self.api.base_url,
             prefix_icon=ft.Icons.CLOUD_OUTLINED,
-            hint_text="http://localhost:8000 or https://your-server.com",
+            hint_text="https://habit-tracker-api-142205380680.us-central1.run.app",
         )
         name_input = ft.TextField(
             label="Your Name",
             prefix_icon=ft.Icons.PERSON_OUTLINE,
-            visible=is_register,
+            visible=(mode == "register"),
+            autofocus=(mode == "register"),
         )
         email_input = ft.TextField(
             label="Email",
+            value=prefill_email,
             prefix_icon=ft.Icons.EMAIL_OUTLINED,
             keyboard_type=ft.KeyboardType.EMAIL,
+            autofocus=(
+                mode in ("login", "forgot")
+                or (mode == "verify_email" and not prefill_email)
+            ),
         )
         password_input = ft.TextField(
             label="Password",
             prefix_icon=ft.Icons.LOCK_OUTLINE,
             password=True,
             can_reveal_password=True,
+            visible=(mode in ("login", "register")),
+        )
+        info_text = ft.Text(initial_info, color="#047857", size=12)
+        info_banner = ft.Container(
+            padding=10,
+            border_radius=8,
+            bgcolor="#ECFDF5",
+            visible=bool(initial_info),
+            content=info_text,
+        )
+        code_input = ft.TextField(
+            label="6-Digit Verification Code",
+            prefix_icon=ft.Icons.PIN_OUTLINED,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            max_length=6,
+            visible=(mode == "verify_email"),
+            autofocus=(mode == "verify_email" and bool(prefill_email)),
+        )
+        new_pwd_input = ft.TextField(
+            label="New Password (min 6 chars)",
+            prefix_icon=ft.Icons.LOCK_RESET_ROUNDED,
+            password=True,
+            can_reveal_password=True,
+            visible=False,
+        )
+        confirm_pwd_input = ft.TextField(
+            label="Confirm New Password",
+            prefix_icon=ft.Icons.LOCK_OUTLINE,
+            password=True,
+            can_reveal_password=True,
+            visible=False,
         )
         error_text = ft.Text("", color=ft.Colors.RED_600, size=13, visible=False)
+        submit_label = {
+            "register": "Create Account",
+            "verify_email": "Verify Email & Sign In",
+            "forgot": "Send Verification Code",
+        }.get(mode, "Sign In")
         submit_btn = ft.FilledButton(
-            content=ft.Text("Create Account" if is_register else "Sign In"),
+            content=ft.Text(submit_label),
             width=340,
         )
 
-        async def handle_submit(_e: Any) -> None:
+        have_code_btn = ft.TextButton(
+            content=ft.Text("Already have a 6-digit code?"),
+            visible=(mode == "forgot"),
+        )
+        resend_btn = ft.TextButton(
+            content=ft.Text(
+                "Resend Verification Code" if mode == "verify_email" else "Resend Code"
+            ),
+            visible=(mode == "verify_email"),
+        )
+
+        def reveal_reset_inputs() -> None:
+            nonlocal has_reset_code
+            has_reset_code = True
+            code_input.visible = True
+            new_pwd_input.visible = True
+            confirm_pwd_input.visible = True
+            submit_btn.content = ft.Text("Reset Password & Sign In")
+            have_code_btn.visible = False
+            resend_btn.visible = True
+
+        def format_code_message(
+            resp: dict[str, Any], default_msg: str, dev_key: str
+        ) -> str:
+            msg = resp.get("message", default_msg)
+            dev_code = resp.get(dev_key)
+            if dev_code:
+                msg = f"{msg}\nDev verification code: {dev_code}"
+            return msg
+
+        async def send_reset_code() -> None:
+            error_text.visible = False
+            email = (email_input.value or "").strip()
+            if not email:
+                raise ApiError("Please enter your email")
+            resp = await self.api.forgot_password(email=email)
+            info_text.value = format_code_message(
+                resp,
+                "If an account exists for this email, a 6-digit verification code has been sent.",
+                "dev_reset_code",
+            )
+            info_banner.visible = True
+            reveal_reset_inputs()
+
+        async def send_registration_code() -> None:
+            error_text.visible = False
+            email = (email_input.value or "").strip()
+            if not email:
+                raise ApiError("Please enter your email")
+            resp = await self.api.resend_verification(email=email)
+            info_text.value = format_code_message(
+                resp,
+                "A new 6-digit verification code has been sent to your email.",
+                "dev_verification_code",
+            )
+            info_banner.visible = True
+
+        async def handle_submit(_e: Any = None) -> None:
+            if submit_btn.disabled:
+                return
             error_text.visible = False
             submit_btn.disabled = True
             self.page.update()
 
-            await self.api.set_base_url(server_input.value or "http://localhost:8000")
+            await self.api.set_base_url(server_input.value or DEFAULT_API_URL)
             email = (email_input.value or "").strip()
             pwd = password_input.value or ""
             name = (name_input.value or "").strip()
+            screen_replaced = False
 
             try:
-                if is_register:
+                if mode == "register":
                     if not name:
                         raise ApiError("Please enter your name")
-                    await self.api.register(name=name, email=email, password=pwd)
+                    resp = await self.api.register(name=name, email=email, password=pwd)
+                    msg = format_code_message(
+                        resp,
+                        "A 6-digit verification code has been sent to your email.",
+                        "dev_verification_code",
+                    )
+                    screen_replaced = True
+                    self.render_auth_screen(
+                        auth_mode="verify_email",
+                        prefill_email=email,
+                        initial_info=msg,
+                    )
+                    return
+                elif mode == "verify_email":
+                    code = (code_input.value or "").strip()
+                    if not email:
+                        raise ApiError("Please enter your email")
+                    if len(code) != 6 or not code.isdigit():
+                        raise ApiError(
+                            "Please enter the 6-digit numeric verification code"
+                        )
+                    await self.api.verify_email(email=email, code=code)
+                    screen_replaced = True
+                    self.selected_tab = 0
+                    await self.refresh_current_tab()
+                    self.render_shell()
+                    show_toast(self.page, "Email verified! Welcome to Habit Tracker.")
+                    return
+                elif mode == "forgot":
+                    if not has_reset_code:
+                        await send_reset_code()
+                        return
+                    code = (code_input.value or "").strip()
+                    new_pwd = new_pwd_input.value or ""
+                    confirm_pwd = confirm_pwd_input.value or ""
+                    if not email:
+                        raise ApiError("Please enter your email")
+                    if len(code) != 6 or not code.isdigit():
+                        raise ApiError("Please enter the 6-digit numeric verification code")
+                    if len(new_pwd) < 6:
+                        raise ApiError("New password must be at least 6 characters")
+                    if new_pwd != confirm_pwd:
+                        raise ApiError("Passwords do not match")
+                    await self.api.reset_password(
+                        email=email, code=code, new_password=new_pwd
+                    )
+                    screen_replaced = True
+                    self.selected_tab = 0
+                    await self.refresh_current_tab()
+                    self.render_shell()
+                    show_toast(self.page, "Password reset successfully!")
+                    return
                 else:
                     await self.api.login(email=email, password=pwd)
 
+                screen_replaced = True
                 self.selected_tab = 0
                 await self.refresh_current_tab()
                 self.render_shell()
                 return
             except ApiError as err:
+                if mode == "login" and err.status_code == 403:
+                    screen_replaced = True
+                    self.render_auth_screen(
+                        auth_mode="verify_email",
+                        prefill_email=email,
+                        initial_info="Please enter the 6-digit verification code sent to your email (or click Resend Code).",
+                    )
+                    return
                 error_text.value = err.message
                 error_text.visible = True
             finally:
-                submit_btn.disabled = False
+                if not screen_replaced:
+                    submit_btn.disabled = False
+                    self.page.update()
+
+        async def handle_resend(_e: Any) -> None:
+            error_text.visible = False
+            resend_btn.disabled = True
+            self.page.update()
+            await self.api.set_base_url(server_input.value or DEFAULT_API_URL)
+            try:
+                if mode == "verify_email":
+                    await send_registration_code()
+                else:
+                    await send_reset_code()
+            except ApiError as err:
+                error_text.value = err.message
+                error_text.visible = True
+            finally:
+                resend_btn.disabled = False
                 self.page.update()
 
-        submit_btn.on_click = handle_submit
+        def handle_have_code(_e: Any) -> None:
+            error_text.visible = False
+            reveal_reset_inputs()
+            self.page.update()
 
-        def toggle_mode(_e: Any) -> None:
-            self.render_auth_screen(is_register=not is_register)
+        async def on_server_submit(_e: Any = None) -> None:
+            if mode == "register" and not (name_input.value or "").strip():
+                await name_input.focus()
+            elif not (email_input.value or "").strip():
+                await email_input.focus()
+            elif mode in ("login", "register") and not (password_input.value or ""):
+                await password_input.focus()
+            elif mode == "verify_email":
+                if not (code_input.value or "").strip():
+                    await code_input.focus()
+                else:
+                    await handle_submit(_e)
+            elif mode == "forgot" and has_reset_code:
+                if not (code_input.value or "").strip():
+                    await code_input.focus()
+                elif not (new_pwd_input.value or ""):
+                    await new_pwd_input.focus()
+                elif not (confirm_pwd_input.value or ""):
+                    await confirm_pwd_input.focus()
+                else:
+                    await handle_submit(_e)
+            else:
+                await handle_submit(_e)
+
+        async def on_name_submit(_e: Any = None) -> None:
+            if (name_input.value or "").strip() and not (email_input.value or "").strip():
+                await email_input.focus()
+            elif (name_input.value or "").strip() and not (password_input.value or ""):
+                await password_input.focus()
+            else:
+                await handle_submit(_e)
+
+        async def on_email_submit(_e: Any = None) -> None:
+            if mode in ("login", "register"):
+                if (email_input.value or "").strip() and not (password_input.value or ""):
+                    await password_input.focus()
+                else:
+                    await handle_submit(_e)
+            elif mode == "verify_email":
+                if (email_input.value or "").strip() and not (code_input.value or "").strip():
+                    await code_input.focus()
+                else:
+                    await handle_submit(_e)
+            elif not has_reset_code:
+                await handle_submit(_e)
+            elif (email_input.value or "").strip() and not (code_input.value or "").strip():
+                await code_input.focus()
+            elif (email_input.value or "").strip() and not (new_pwd_input.value or ""):
+                await new_pwd_input.focus()
+            elif (email_input.value or "").strip() and not (confirm_pwd_input.value or ""):
+                await confirm_pwd_input.focus()
+            else:
+                await handle_submit(_e)
+
+        async def on_code_submit(_e: Any = None) -> None:
+            if mode == "verify_email":
+                await handle_submit(_e)
+            elif (code_input.value or "").strip() and not (new_pwd_input.value or ""):
+                await new_pwd_input.focus()
+            elif (code_input.value or "").strip() and not (confirm_pwd_input.value or ""):
+                await confirm_pwd_input.focus()
+            else:
+                await handle_submit(_e)
+
+        async def on_new_pwd_submit(_e: Any = None) -> None:
+            if (new_pwd_input.value or "") and not (confirm_pwd_input.value or ""):
+                await confirm_pwd_input.focus()
+            else:
+                await handle_submit(_e)
+
+        server_input.on_submit = on_server_submit
+        name_input.on_submit = on_name_submit
+        email_input.on_submit = on_email_submit
+        password_input.on_submit = handle_submit
+        code_input.on_submit = on_code_submit
+        new_pwd_input.on_submit = on_new_pwd_submit
+        confirm_pwd_input.on_submit = handle_submit
+        submit_btn.on_click = handle_submit
+        resend_btn.on_click = handle_resend
+        have_code_btn.on_click = handle_have_code
+
+        def switch_mode(next_mode: str) -> None:
+            cleaned_url = (server_input.value or "").strip().rstrip("/")
+            if cleaned_url:
+                self.api.base_url = cleaned_url
+            self.render_auth_screen(
+                auth_mode=next_mode,
+                prefill_email=(email_input.value or "").strip(),
+            )
+
+        footer_links: list[ft.Control] = []
+        if mode == "login":
+            footer_links.append(
+                ft.TextButton(
+                    content=ft.Text("Forgot Password?"),
+                    on_click=lambda _e: switch_mode("forgot"),
+                )
+            )
+            footer_links.append(
+                ft.TextButton(
+                    content=ft.Text("New here? Create an Account"),
+                    on_click=lambda _e: switch_mode("register"),
+                )
+            )
+        elif mode == "register":
+            footer_links.append(
+                ft.TextButton(
+                    content=ft.Text("Already have a code? Verify Email"),
+                    on_click=lambda _e: switch_mode("verify_email"),
+                )
+            )
+            footer_links.append(
+                ft.TextButton(
+                    content=ft.Text("Already have an account? Sign In"),
+                    on_click=lambda _e: switch_mode("login"),
+                )
+            )
+        elif mode == "verify_email":
+            footer_links.extend(
+                [
+                    resend_btn,
+                    ft.TextButton(
+                        content=ft.Text("Back to Sign In"),
+                        on_click=lambda _e: switch_mode("login"),
+                    ),
+                ]
+            )
+        else:
+            footer_links.extend(
+                [
+                    have_code_btn,
+                    resend_btn,
+                    ft.TextButton(
+                        content=ft.Text("Back to Sign In"),
+                        on_click=lambda _e: switch_mode("login"),
+                    ),
+                ]
+            )
+
+        subtitle_text = {
+            "forgot": "Reset your password with a 6-digit email verification code",
+            "verify_email": "Enter the 6-digit verification code sent to your email",
+        }.get(
+            mode,
+            "Sync your daily routines across iPhone, Mac, Android & Web",
+        )
 
         card = ft.Container(
             width=400,
@@ -218,7 +555,7 @@ class HabitTrackerApp:
                         alignment=ft.MainAxisAlignment.CENTER,
                     ),
                     ft.Text(
-                        "Sync your daily routines across iPhone, Mac, Android & Web",
+                        subtitle_text,
                         size=13,
                         color=ft.Colors.BLUE_GREY_600,
                         text_align=ft.TextAlign.CENTER,
@@ -228,16 +565,13 @@ class HabitTrackerApp:
                     name_input,
                     email_input,
                     password_input,
+                    info_banner,
+                    code_input,
+                    new_pwd_input,
+                    confirm_pwd_input,
                     error_text,
                     submit_btn,
-                    ft.TextButton(
-                        content=ft.Text(
-                            "Already have an account? Sign In"
-                            if is_register
-                            else "New here? Create an Account"
-                        ),
-                        on_click=toggle_mode,
-                    ),
+                    *footer_links,
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 tight=True,
@@ -349,6 +683,11 @@ class HabitTrackerApp:
                                         f"Hi, {user_name}",
                                         size=14,
                                         color=ft.Colors.BLUE_GREY_700,
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.KEY_ROUNDED,
+                                        tooltip="Change Password",
+                                        on_click=lambda _e: self._open_change_password_dialog(),
                                     ),
                                     ft.IconButton(
                                         icon=ft.Icons.LOGOUT_ROUNDED,
@@ -2533,6 +2872,103 @@ class HabitTrackerApp:
                 content=ft.Text("Save SLO"),
                 on_click=save_slo,
             ),
+        ]
+        open_dialog(self.page, dialog)
+
+    def _open_change_password_dialog(self) -> None:
+        current_input = ft.TextField(
+            label="Current Password",
+            prefix_icon=ft.Icons.LOCK_OUTLINE,
+            password=True,
+            can_reveal_password=True,
+        )
+        new_input = ft.TextField(
+            label="New Password (min 6 chars)",
+            prefix_icon=ft.Icons.LOCK_RESET_ROUNDED,
+            password=True,
+            can_reveal_password=True,
+        )
+        confirm_input = ft.TextField(
+            label="Confirm New Password",
+            prefix_icon=ft.Icons.LOCK_OUTLINE,
+            password=True,
+            can_reveal_password=True,
+        )
+        err_text = ft.Text("", color=ft.Colors.RED_600, size=12, visible=False)
+        dialog = ft.AlertDialog(modal=True)
+        submit_btn = ft.FilledButton(content=ft.Text("Update Password"))
+
+        async def handle_save(_e: Any) -> None:
+            err_text.visible = False
+            cur = current_input.value or ""
+            new_pwd = new_input.value or ""
+            confirm_pwd = confirm_input.value or ""
+
+            if not cur:
+                err_text.value = "Please enter your current password"
+                err_text.visible = True
+                self.page.update()
+                return
+            if len(new_pwd) < 6:
+                err_text.value = "New password must be at least 6 characters"
+                err_text.visible = True
+                self.page.update()
+                return
+            if new_pwd != confirm_pwd:
+                err_text.value = "New passwords do not match"
+                err_text.visible = True
+                self.page.update()
+                return
+            if new_pwd == cur:
+                err_text.value = "New password must be different from current password"
+                err_text.visible = True
+                self.page.update()
+                return
+
+            submit_btn.disabled = True
+            self.page.update()
+            try:
+                await self.api.change_password(
+                    current_password=cur, new_password=new_pwd
+                )
+                close_dialog(self.page, dialog)
+                show_toast(self.page, "Password updated successfully!")
+                return
+            except ApiError as err:
+                if err.status_code == 401:
+                    close_dialog(self.page, dialog)
+                    await self.api.logout()
+                    self.render_auth_screen()
+                    show_toast(self.page, err.message, is_error=True)
+                    return
+                err_text.value = err.message
+                err_text.visible = True
+            finally:
+                submit_btn.disabled = False
+                self.page.update()
+
+        submit_btn.on_click = handle_save
+
+        dialog.title = ft.Text("Change Password")
+        dialog.content = ft.Container(
+            width=360,
+            content=ft.Column(
+                [
+                    current_input,
+                    new_input,
+                    confirm_input,
+                    err_text,
+                ],
+                tight=True,
+                spacing=10,
+            ),
+        )
+        dialog.actions = [
+            ft.TextButton(
+                content=ft.Text("Cancel"),
+                on_click=lambda _e: close_dialog(self.page, dialog),
+            ),
+            submit_btn,
         ]
         open_dialog(self.page, dialog)
 

@@ -1,6 +1,10 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
+import logging
+import smtplib
 
 from bson import ObjectId
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
@@ -8,6 +12,7 @@ import pytest
 from app.core import (
     HabitCreate,
     HabitUpdate,
+    Settings,
     build_period_schedule,
     build_sli_dashboard,
     compute_30d_completion_rate,
@@ -16,11 +21,17 @@ from app.core import (
     compute_habit_sli,
     compute_period_bounds,
     compute_streaks,
+    create_access_token,
     get_current_user,
     get_db,
+    hash_password,
+    hash_reset_code,
     is_scheduled_on,
     scheduled_monthly_day,
+    send_password_reset_email,
+    send_registration_verification_email,
 )
+import app.main as main_module
 from app.main import _serialize_habit, app
 
 
@@ -432,6 +443,17 @@ class _FakeInsertResult:
         self.inserted_id = inserted_id
 
 
+class _FakeDeleteResult:
+    def __init__(self, deleted_count: int):
+        self.deleted_count = deleted_count
+
+
+class _FakeUpdateResult:
+    def __init__(self, matched_count: int, upserted_id=None):
+        self.matched_count = matched_count
+        self.upserted_id = upserted_id
+
+
 class _FakeCollection:
     def __init__(self, docs: list[dict] | None = None):
         self.docs = list(docs or [])
@@ -451,6 +473,36 @@ class _FakeCollection:
         stored = {**doc, "_id": oid}
         self.docs.append(stored)
         return _FakeInsertResult(oid)
+
+    async def update_one(
+        self, query: dict, update: dict, upsert: bool = False
+    ) -> _FakeUpdateResult:
+        doc = await self.find_one(query)
+        if doc is not None:
+            if "$set" in update:
+                doc.update(update["$set"])
+            return _FakeUpdateResult(matched_count=1)
+        if upsert:
+            new_doc = {k: v for k, v in query.items() if not isinstance(v, dict)}
+            if "$set" in update:
+                new_doc.update(update["$set"])
+            oid = ObjectId()
+            new_doc.setdefault("_id", oid)
+            self.docs.append(new_doc)
+            return _FakeUpdateResult(matched_count=0, upserted_id=new_doc["_id"])
+        return _FakeUpdateResult(matched_count=0)
+
+    async def delete_one(self, query: dict) -> _FakeDeleteResult:
+        for idx, doc in enumerate(self.docs):
+            if self._matches(doc, query):
+                self.docs.pop(idx)
+                return _FakeDeleteResult(1)
+        return _FakeDeleteResult(0)
+
+    async def delete_many(self, query: dict) -> _FakeDeleteResult:
+        before = len(self.docs)
+        self.docs = [doc for doc in self.docs if not self._matches(doc, query)]
+        return _FakeDeleteResult(before - len(self.docs))
 
     async def find_one_and_update(
         self, query: dict, update: dict, return_document: bool = True
@@ -479,9 +531,19 @@ class _FakeCollection:
 
 
 class _FakeDb:
-    def __init__(self, habits: list[dict] | None = None, checkins: list[dict] | None = None):
+    def __init__(
+        self,
+        habits: list[dict] | None = None,
+        checkins: list[dict] | None = None,
+        users: list[dict] | None = None,
+        password_resets: list[dict] | None = None,
+        email_verifications: list[dict] | None = None,
+    ):
         self.habits = _FakeCollection(habits)
         self.checkins = _FakeCollection(checkins)
+        self.users = _FakeCollection(users)
+        self.password_resets = _FakeCollection(password_resets)
+        self.email_verifications = _FakeCollection(email_verifications)
 
 
 def test_sli_endpoint_and_habit_target_slo_via_testclient():
@@ -820,3 +882,740 @@ def test_schedule_endpoint_via_testclient():
         assert len(month_data["days"]) == 30
     finally:
         app.dependency_overrides.clear()
+
+
+def _register_and_verify_user(
+    client: TestClient,
+    captured_codes: list[tuple[str, str, str]],
+    *,
+    name: str,
+    email: str,
+    password: str,
+) -> dict:
+    reg_resp = client.post(
+        "/api/auth/register",
+        json={"name": name, "email": email, "password": password},
+    )
+    assert reg_resp.status_code == 201
+    assert reg_resp.json()["verification_required"] is True
+    assert "access_token" not in reg_resp.json()
+    code = captured_codes[-1][2]
+    verify_resp = client.post(
+        "/api/auth/verify-email",
+        json={"email": email, "code": code},
+    )
+    assert verify_resp.status_code == 200
+    return verify_resp.json()
+
+
+def test_forgot_and_reset_password_flow_and_token_invalidation(monkeypatch):
+    fake_db = _FakeDb()
+    sent_reset_codes: list[tuple[str, str, str]] = []
+    sent_verify_codes: list[tuple[str, str, str]] = []
+
+    async def fake_send_reset(
+        to_email: str, user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_reset_codes.append((to_email, user_name, code))
+
+    async def fake_send_verify(
+        to_email: str, user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_verify_codes.append((to_email, user_name, code))
+
+    monkeypatch.setattr(main_module, "send_password_reset_email", fake_send_reset)
+    monkeypatch.setattr(
+        main_module, "send_registration_verification_email", fake_send_verify
+    )
+    app.dependency_overrides[get_db] = lambda: fake_db
+    try:
+        client = TestClient(app)
+
+        verified_data = _register_and_verify_user(
+            client,
+            sent_verify_codes,
+            name="Shawn",
+            email="Shawn@Example.com",
+            password="oldPassword1",
+        )
+        old_token = verified_data["access_token"]
+
+        # Unknown email returns generic 200 without sending an email
+        unknown_resp = client.post(
+            "/api/auth/forgot-password",
+            json={"email": "nobody@example.com"},
+        )
+        assert unknown_resp.status_code == 200
+        assert "If an account exists" in unknown_resp.json()["message"]
+        assert unknown_resp.json()["dev_reset_code"] is None
+        assert len(sent_reset_codes) == 0
+
+        # Registered email triggers 6-digit code email and stores only HMAC hash
+        forgot_resp = client.post(
+            "/api/auth/forgot-password",
+            json={"email": "shawn@example.com"},
+        )
+        assert forgot_resp.status_code == 200
+        assert len(sent_reset_codes) == 1
+        sent_to, sent_name, code = sent_reset_codes[0]
+        assert sent_to == "shawn@example.com"
+        assert sent_name == "Shawn"
+        assert len(code) == 6 and code.isdigit()
+
+        reset_record = next(
+            d for d in fake_db.password_resets.docs if d["email"] == "shawn@example.com"
+        )
+        assert reset_record["code_hash"]
+        assert code not in str(reset_record)
+
+        # Wrong code fails with 400 and increments attempts
+        wrong_code = "000000" if code != "000000" else "111111"
+        bad_reset = client.post(
+            "/api/auth/reset-password",
+            json={
+                "email": "shawn@example.com",
+                "code": wrong_code,
+                "new_password": "newPassword2",
+            },
+        )
+        assert bad_reset.status_code == 400
+        assert bad_reset.json()["detail"] == "Invalid or expired verification code"
+        assert reset_record["attempts"] == 1
+
+        # Valid code succeeds, returns rotated TokenResponse, and deletes reset record
+        ok_reset = client.post(
+            "/api/auth/reset-password",
+            json={
+                "email": "SHAWN@example.com",
+                "code": f" {code} ",
+                "new_password": "newPassword2",
+            },
+        )
+        assert ok_reset.status_code == 200
+        new_token = ok_reset.json()["access_token"]
+        assert new_token != old_token
+        assert not any(
+            d["email"] == "shawn@example.com" for d in fake_db.password_resets.docs
+        )
+
+        # Code cannot be reused
+        reuse_resp = client.post(
+            "/api/auth/reset-password",
+            json={
+                "email": "shawn@example.com",
+                "code": code,
+                "new_password": "anotherPassword3",
+            },
+        )
+        assert reuse_resp.status_code == 400
+
+        # Old JWT is invalidated via token_version while new JWT works
+        old_me = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {old_token}"},
+        )
+        assert old_me.status_code == 401
+
+        new_me = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {new_token}"},
+        )
+        assert new_me.status_code == 200
+        assert new_me.json()["email"] == "shawn@example.com"
+        assert new_me.json()["email_verified"] is True
+
+        # Old password rejected, new password accepted
+        old_login = client.post(
+            "/api/auth/login",
+            json={"email": "shawn@example.com", "password": "oldPassword1"},
+        )
+        assert old_login.status_code == 401
+
+        new_login = client.post(
+            "/api/auth/login",
+            json={"email": "shawn@example.com", "password": "newPassword2"},
+        )
+        assert new_login.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_reset_password_attempt_lockout_and_naive_utc_expiry(monkeypatch):
+    fake_db = _FakeDb()
+    sent_reset_codes: list[str] = []
+    sent_verify_codes: list[tuple[str, str, str]] = []
+
+    async def fake_send_reset(
+        _to_email: str, _user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_reset_codes.append(code)
+
+    async def fake_send_verify(
+        to_email: str, user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_verify_codes.append((to_email, user_name, code))
+
+    monkeypatch.setattr(main_module, "send_password_reset_email", fake_send_reset)
+    monkeypatch.setattr(
+        main_module, "send_registration_verification_email", fake_send_verify
+    )
+    app.dependency_overrides[get_db] = lambda: fake_db
+    try:
+        client = TestClient(app)
+        _register_and_verify_user(
+            client,
+            sent_verify_codes,
+            name="Lock",
+            email="lock@example.com",
+            password="password1",
+        )
+
+        assert (
+            client.post("/api/auth/forgot-password", json={"email": "lock@example.com"}).status_code
+            == 200
+        )
+        valid_code = sent_reset_codes[-1]
+        wrong_code = "000000" if valid_code != "000000" else "999999"
+
+        for i in range(5):
+            r = client.post(
+                "/api/auth/reset-password",
+                json={
+                    "email": "lock@example.com",
+                    "code": wrong_code,
+                    "new_password": "newPassword1",
+                },
+            )
+            assert r.status_code == 400
+            if i == 4:
+                assert "Too many failed attempts" in r.json()["detail"]
+
+        # Attempt 6 with the real code is blocked
+        locked = client.post(
+            "/api/auth/reset-password",
+            json={
+                "email": "lock@example.com",
+                "code": valid_code,
+                "new_password": "newPassword1",
+            },
+        )
+        assert locked.status_code == 400
+        assert "Too many failed attempts" in locked.json()["detail"]
+
+        # Requests 2..5 succeed, 6th request within 15 min window hits 429
+        for _ in range(4):
+            assert (
+                client.post(
+                    "/api/auth/forgot-password", json={"email": "lock@example.com"}
+                ).status_code
+                == 200
+            )
+        rate_limited = client.post(
+            "/api/auth/forgot-password", json={"email": "lock@example.com"}
+        )
+        assert rate_limited.status_code == 429
+
+        # Naive UTC datetime (as returned by PyMongo) in expires_at compares cleanly
+        latest_code = sent_reset_codes[-1]
+        record = next(d for d in fake_db.password_resets.docs if d["email"] == "lock@example.com")
+        record["expires_at"] = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        expired_resp = client.post(
+            "/api/auth/reset-password",
+            json={
+                "email": "lock@example.com",
+                "code": latest_code,
+                "new_password": "newPassword1",
+            },
+        )
+        assert expired_resp.status_code == 400
+        assert expired_resp.json()["detail"] == "Invalid or expired verification code"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_change_password_endpoint_and_session_rotation(monkeypatch):
+    fake_db = _FakeDb()
+    sent_verify_codes: list[tuple[str, str, str]] = []
+
+    async def fake_send_verify(
+        to_email: str, user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_verify_codes.append((to_email, user_name, code))
+
+    monkeypatch.setattr(
+        main_module, "send_registration_verification_email", fake_send_verify
+    )
+    app.dependency_overrides[get_db] = lambda: fake_db
+    try:
+        client = TestClient(app)
+        verified_data = _register_and_verify_user(
+            client,
+            sent_verify_codes,
+            name="Alice",
+            email="alice@example.com",
+            password="firstPassword",
+        )
+        token_v0 = verified_data["access_token"]
+
+        # Wrong current password returns 400 (not 401)
+        wrong_cur = client.post(
+            "/api/auth/change-password",
+            headers={"Authorization": f"Bearer {token_v0}"},
+            json={"current_password": "wrongPassword", "new_password": "secondPassword"},
+        )
+        assert wrong_cur.status_code == 400
+        assert wrong_cur.json()["detail"] == "Current password is incorrect"
+
+        # Same password returns 400
+        same_pwd = client.post(
+            "/api/auth/change-password",
+            headers={"Authorization": f"Bearer {token_v0}"},
+            json={"current_password": "firstPassword", "new_password": "firstPassword"},
+        )
+        assert same_pwd.status_code == 400
+
+        # Valid change returns rotated token and invalidates token_v0
+        ok_change = client.post(
+            "/api/auth/change-password",
+            headers={"Authorization": f"Bearer {token_v0}"},
+            json={"current_password": "firstPassword", "new_password": "secondPassword"},
+        )
+        assert ok_change.status_code == 200
+        token_v1 = ok_change.json()["access_token"]
+        assert token_v1 != token_v0
+
+        assert (
+            client.get(
+                "/api/auth/me", headers={"Authorization": f"Bearer {token_v0}"}
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
+                "/api/auth/me", headers={"Authorization": f"Bearer {token_v1}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"email": "alice@example.com", "password": "secondPassword"},
+            ).status_code
+            == 200
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_send_password_reset_email_dev_log_and_smtp_mock(monkeypatch, caplog):
+    # 1. Local dev fallback logs warning when SMTP_HOST is empty
+    dev_cfg = Settings(smtp_host="")
+    with caplog.at_level(logging.WARNING, logger="habit_tracker.auth"):
+        asyncio.run(
+            send_password_reset_email(
+                "dev@example.com", "Dev", "654321", 15, cfg=dev_cfg
+            )
+        )
+    assert "654321" in caplog.text
+    assert "dev@example.com" in caplog.text
+
+    # 2. SMTP path calls STARTTLS, login, and send_message
+    events: list[tuple] = []
+
+    class _FakeSmtp:
+        def __init__(self, host, port, timeout=None):
+            events.append(("init", host, port, timeout))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def ehlo(self):
+            events.append(("ehlo",))
+
+        def starttls(self, context=None):
+            events.append(("starttls", context is not None))
+
+        def login(self, user, pwd):
+            events.append(("login", user, pwd))
+
+        def send_message(self, msg):
+            events.append(("send", msg["To"], msg["Subject"]))
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSmtp)
+    smtp_cfg = Settings(
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        smtp_username="mailer",
+        smtp_password="secret",
+        smtp_from_email="noreply@example.com",
+        smtp_use_tls=True,
+        smtp_use_ssl=False,
+    )
+    asyncio.run(
+        send_password_reset_email("u@example.com", "User", "123456", 15, cfg=smtp_cfg)
+    )
+    assert ("init", "smtp.example.com", 587, 10) in events
+    assert ("starttls", True) in events
+    assert ("login", "mailer", "secret") in events
+    assert ("send", "u@example.com", "Habit Tracker Password Reset Code: 123456") in events
+
+    # 3. SMTP connection failure raises HTTP 502
+    def _failing_smtp(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(smtplib, "SMTP", _failing_smtp)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            send_password_reset_email("u@example.com", "User", "123456", 15, cfg=smtp_cfg)
+        )
+    assert exc_info.value.status_code == 502
+
+
+def test_register_email_verification_flow_and_unverified_login_blocked(monkeypatch):
+    fake_db = _FakeDb()
+    sent_verify_codes: list[tuple[str, str, str]] = []
+
+    async def fake_send_verify(
+        to_email: str, user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_verify_codes.append((to_email, user_name, code))
+
+    monkeypatch.setattr(
+        main_module, "send_registration_verification_email", fake_send_verify
+    )
+    app.dependency_overrides[get_db] = lambda: fake_db
+    try:
+        client = TestClient(app)
+
+        reg_resp = client.post(
+            "/api/auth/register",
+            json={
+                "name": "Shawn",
+                "email": "Shawn@Example.com",
+                "password": "secretPassword1",
+            },
+        )
+        assert reg_resp.status_code == 201
+        reg_body = reg_resp.json()
+        assert reg_body["email"] == "shawn@example.com"
+        assert reg_body["verification_required"] is True
+        assert reg_body["expires_in_minutes"] == 15
+        assert reg_body["dev_verification_code"] is None
+        assert "access_token" not in reg_body
+
+        assert len(sent_verify_codes) == 1
+        sent_to, sent_name, code = sent_verify_codes[0]
+        assert sent_to == "shawn@example.com"
+        assert sent_name == "Shawn"
+        assert len(code) == 6 and code.isdigit()
+
+        user_doc = next(
+            u for u in fake_db.users.docs if u["email"] == "shawn@example.com"
+        )
+        assert user_doc["email_verified"] is False
+
+        verif_doc = next(
+            d for d in fake_db.email_verifications.docs if d["email"] == "shawn@example.com"
+        )
+        assert verif_doc["code_hash"]
+        assert code not in str(verif_doc)
+        assert verif_doc["code_hash"] != hash_reset_code("shawn@example.com", code)
+
+        # Wrong password still returns 401
+        bad_pwd = client.post(
+            "/api/auth/login",
+            json={"email": "shawn@example.com", "password": "wrongPassword"},
+        )
+        assert bad_pwd.status_code == 401
+
+        # Right password before verification returns 403
+        unverified_login = client.post(
+            "/api/auth/login",
+            json={"email": "shawn@example.com", "password": "secretPassword1"},
+        )
+        assert unverified_login.status_code == 403
+        assert "verify your email" in unverified_login.json()["detail"].lower()
+
+        # Wrong verification code returns 400 and increments attempts
+        wrong_code = "000000" if code != "000000" else "111111"
+        bad_verify = client.post(
+            "/api/auth/verify-email",
+            json={"email": "shawn@example.com", "code": wrong_code},
+        )
+        assert bad_verify.status_code == 400
+        assert verif_doc["attempts"] == 1
+
+        # Valid verification code activates account, clears pending records, and returns JWT
+        ok_verify = client.post(
+            "/api/auth/verify-email",
+            json={"email": "SHAWN@example.com", "code": f" {code} "},
+        )
+        assert ok_verify.status_code == 200
+        verify_body = ok_verify.json()
+        assert verify_body["user"]["email_verified"] is True
+        token = verify_body["access_token"]
+        assert user_doc["email_verified"] is True
+        assert not any(
+            d["email"] == "shawn@example.com" for d in fake_db.email_verifications.docs
+        )
+
+        # Login and authenticated routes work after verification
+        me_resp = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert me_resp.status_code == 200
+        assert me_resp.json()["email_verified"] is True
+
+        ok_login = client.post(
+            "/api/auth/login",
+            json={"email": "shawn@example.com", "password": "secretPassword1"},
+        )
+        assert ok_login.status_code == 200
+
+        # Re-registering an already verified email returns 409 Conflict
+        dup_reg = client.post(
+            "/api/auth/register",
+            json={
+                "name": "Other",
+                "email": "shawn@example.com",
+                "password": "anotherPassword2",
+            },
+        )
+        assert dup_reg.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_re_register_unverified_and_resend_verification_limits_and_legacy_users(monkeypatch):
+    legacy_oid = ObjectId()
+    fake_db = _FakeDb(
+        users=[
+            {
+                "_id": legacy_oid,
+                "name": "Legacy User",
+                "email": "legacy@example.com",
+                "password_hash": hash_password("legacyPass1"),
+                "token_version": 0,
+                "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            }
+        ]
+    )
+    sent_verify_codes: list[str] = []
+
+    async def fake_send_verify(
+        _to_email: str, _user_name: str, code: str, _expire_minutes: int
+    ):
+        sent_verify_codes.append(code)
+
+    monkeypatch.setattr(
+        main_module, "send_registration_verification_email", fake_send_verify
+    )
+    app.dependency_overrides[get_db] = lambda: fake_db
+    try:
+        client = TestClient(app)
+
+        # 1. Legacy user document without `email_verified` field continues working seamlessly
+        legacy_login = client.post(
+            "/api/auth/login",
+            json={"email": "legacy@example.com", "password": "legacyPass1"},
+        )
+        assert legacy_login.status_code == 200
+        assert legacy_login.json()["user"]["email_verified"] is True
+        legacy_me = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {legacy_login.json()['access_token']}"},
+        )
+        assert legacy_me.status_code == 200
+
+        # 2. Register unverified user, then re-register same unverified email with new name/password
+        r1 = client.post(
+            "/api/auth/register",
+            json={"name": "Typo Name", "email": "retry@example.com", "password": "oldPassword1"},
+        )
+        assert r1.status_code == 201
+        first_code = sent_verify_codes[-1]
+
+        r2 = client.post(
+            "/api/auth/register",
+            json={"name": "Fixed Name", "email": "retry@example.com", "password": "newPassword2"},
+        )
+        assert r2.status_code == 201
+        second_code = sent_verify_codes[-1]
+        user_doc = next(u for u in fake_db.users.docs if u["email"] == "retry@example.com")
+        assert user_doc["name"] == "Fixed Name"
+
+        # Forged/stale token for an unverified account is blocked by get_current_user with 403
+        stale_jwt = create_access_token(str(user_doc["_id"]), "retry@example.com", 0)
+        blocked_me = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {stale_jwt}"},
+        )
+        assert blocked_me.status_code == 403
+
+        # 3. Resend verification up to window limit (sends 3, 4, 5 succeed; 6th returns 429)
+        for _ in range(3):
+            resend_ok = client.post(
+                "/api/auth/resend-verification",
+                json={"email": "retry@example.com"},
+            )
+            assert resend_ok.status_code == 200
+        resend_limited = client.post(
+            "/api/auth/resend-verification",
+            json={"email": "retry@example.com"},
+        )
+        assert resend_limited.status_code == 429
+
+        # First code is no longer valid after re-send/re-register replaced it
+        latest_code = sent_verify_codes[-1]
+        if first_code != latest_code:
+            assert (
+                client.post(
+                    "/api/auth/verify-email",
+                    json={"email": "retry@example.com", "code": first_code},
+                ).status_code
+                == 400
+            )
+            # Reset attempts so 5-attempt lockout check below starts cleanly
+            next(
+                d for d in fake_db.email_verifications.docs if d["email"] == "retry@example.com"
+            )["attempts"] = 0
+
+        # 4. Five wrong verification attempts lock out the active code cleanly
+        wrong_code = "000000" if latest_code != "000000" else "999999"
+        for i in range(5):
+            bad_resp = client.post(
+                "/api/auth/verify-email",
+                json={"email": "retry@example.com", "code": wrong_code},
+            )
+            assert bad_resp.status_code == 400
+            if i == 4:
+                assert "Too many failed attempts" in bad_resp.json()["detail"]
+
+        locked_resp = client.post(
+            "/api/auth/verify-email",
+            json={"email": "retry@example.com", "code": latest_code},
+        )
+        assert locked_resp.status_code == 400
+        assert "Too many failed attempts" in locked_resp.json()["detail"]
+
+        # 5. Rewind rate-limit window, verify naive UTC expiry check, then verify with fresh code
+        verif_doc = next(
+            d for d in fake_db.email_verifications.docs if d["email"] == "retry@example.com"
+        )
+        verif_doc["window_started_at"] = datetime.now(timezone.utc) - timedelta(minutes=20)
+        assert (
+            client.post(
+                "/api/auth/resend-verification", json={"email": "retry@example.com"}
+            ).status_code
+            == 200
+        )
+        fresh_code = sent_verify_codes[-1]
+
+        verif_doc["expires_at"] = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        assert (
+            client.post(
+                "/api/auth/verify-email",
+                json={"email": "retry@example.com", "code": fresh_code},
+            ).status_code
+            == 400
+        )
+
+        verif_doc["expires_at"] = datetime.now(timezone.utc) + timedelta(minutes=15)
+        verified_resp = client.post(
+            "/api/auth/verify-email",
+            json={"email": "retry@example.com", "code": fresh_code},
+        )
+        assert verified_resp.status_code == 200
+
+        # Resend rejects already-verified accounts
+        already_verified = client.post(
+            "/api/auth/resend-verification",
+            json={"email": "retry@example.com"},
+        )
+        assert already_verified.status_code == 400
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_send_registration_verification_email_dev_log_and_smtp_mock(monkeypatch, caplog):
+    # 1. Local dev fallback logs warning when SMTP_HOST is empty
+    dev_cfg = Settings(smtp_host="")
+    with caplog.at_level(logging.WARNING, logger="habit_tracker.auth"):
+        asyncio.run(
+            send_registration_verification_email(
+                "dev@example.com", "Dev", "654321", 15, cfg=dev_cfg
+            )
+        )
+    assert "DEV EMAIL VERIFICATION" in caplog.text
+    assert "654321" in caplog.text
+    assert "dev@example.com" in caplog.text
+
+    # 2. SMTP path calls STARTTLS, login, and send_message
+    events: list[tuple] = []
+
+    class _FakeSmtp:
+        def __init__(self, host, port, timeout=None):
+            events.append(("init", host, port, timeout))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def ehlo(self):
+            events.append(("ehlo",))
+
+        def starttls(self, context=None):
+            events.append(("starttls", context is not None))
+
+        def login(self, user, pwd):
+            events.append(("login", user, pwd))
+
+        def send_message(self, msg):
+            events.append(("send", msg["To"], msg["Subject"]))
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSmtp)
+    smtp_cfg = Settings(
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        smtp_username="mailer",
+        smtp_password="secret",
+        smtp_from_email="noreply@example.com",
+        smtp_use_tls=True,
+        smtp_use_ssl=False,
+    )
+    asyncio.run(
+        send_registration_verification_email(
+            "u@example.com", "User", "123456", 15, cfg=smtp_cfg
+        )
+    )
+    assert ("init", "smtp.example.com", 587, 10) in events
+    assert ("starttls", True) in events
+    assert ("login", "mailer", "secret") in events
+    assert (
+        "send",
+        "u@example.com",
+        "Habit Tracker Email Verification Code: 123456",
+    ) in events
+
+    # 3. SMTP failure raises HTTP 502
+    def _failing_smtp(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(smtplib, "SMTP", _failing_smtp)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            send_registration_verification_email(
+                "u@example.com", "User", "123456", 15, cfg=smtp_cfg
+            )
+        )
+    assert exc_info.value.status_code == 502

@@ -31,5 +31,20 @@ services:
       mongodb:
         condition: service_healthy
 
+  # Optional containerized Flet Web server (run with: docker compose --profile full up -d --build)
+  frontend:
+    build:
+      context: ./frontend
+    container_name: habit_tracker_web
+    profiles: ["full"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      HABIT_API_URL: http://backend:8000
+    depends_on:
+      - backend
+
 volumes:
   mongo_data:

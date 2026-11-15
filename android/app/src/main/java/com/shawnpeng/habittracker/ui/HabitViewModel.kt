@@ -32,6 +32,12 @@ data class HabitUiState(
     val isAuthSubmitting: Boolean = false,
     val isRefreshing: Boolean = false,
     val authError: String? = null,
+    val authInfoMessage: String? = null,
+    val pendingVerificationEmail: String? = null,
+    val resetCodeSentEmail: String? = null,
+    val showChangePasswordDialog: Boolean = false,
+    val isChangingPassword: Boolean = false,
+    val changePasswordError: String? = null,
     val serverUrl: String = DEFAULT_EMULATOR_URL,
     val currentUser: UserPublic? = null,
     val selectedTab: Int = 0,
@@ -113,12 +119,18 @@ class HabitViewModel(
     fun login(serverUrl: String, email: String, password: String) {
         val cleanEmail = email.trim()
         if (cleanEmail.isEmpty() || password.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入邮箱和密码") }
+            _uiState.update { it.copy(authError = "请输入邮箱和密码", authInfoMessage = null) }
             return
         }
 
         viewModelScope.launch {
-            _uiState.update { it.copy(isAuthSubmitting = true, authError = null) }
+            _uiState.update {
+                it.copy(
+                    isAuthSubmitting = true,
+                    authError = null,
+                    authInfoMessage = null,
+                )
+            }
             try {
                 val normalizedUrl = api.setBaseUrl(serverUrl)
                 prefs.setServerUrl(normalizedUrl)
@@ -132,6 +144,114 @@ class HabitViewModel(
                         currentUser = tokenResp.user,
                         selectedTab = 0,
                         selectedDate = LocalDate.now(),
+                        authInfoMessage = null,
+                        pendingVerificationEmail = null,
+                        resetCodeSentEmail = null,
+                    )
+                }
+                loadTabData(0)
+            } catch (exc: ApiException) {
+                if (exc.statusCode == 403) {
+                    _uiState.update {
+                        it.copy(
+                            isAuthSubmitting = false,
+                            pendingVerificationEmail = cleanEmail,
+                            authInfoMessage = "该账号尚未完成邮箱验证，请输入 6 位验证码或点击重新发送验证码",
+                            authError = null,
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(isAuthSubmitting = false, authError = exc.message)
+                    }
+                }
+            }
+        }
+    }
+
+    fun register(serverUrl: String, name: String, email: String, password: String) {
+        val cleanName = name.trim()
+        val cleanEmail = email.trim()
+        if (cleanName.isEmpty()) {
+            _uiState.update { it.copy(authError = "请输入你的名字", authInfoMessage = null) }
+            return
+        }
+        if (cleanEmail.isEmpty() || password.length < 6) {
+            _uiState.update {
+                it.copy(authError = "请输入有效邮箱且密码至少 6 位", authInfoMessage = null)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isAuthSubmitting = true,
+                    authError = null,
+                    authInfoMessage = null,
+                )
+            }
+            try {
+                val normalizedUrl = api.setBaseUrl(serverUrl)
+                prefs.setServerUrl(normalizedUrl)
+                val resp = api.register(
+                    name = cleanName,
+                    email = cleanEmail,
+                    password = password,
+                )
+                val info = if (!resp.devVerificationCode.isNullOrBlank()) {
+                    "6 位验证码已发送至 $cleanEmail（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devVerificationCode}）"
+                } else {
+                    "6 位验证码已发送至 $cleanEmail，有效期 ${resp.expiresInMinutes} 分钟，请查收邮件"
+                }
+                _uiState.update {
+                    it.copy(
+                        isAuthSubmitting = false,
+                        serverUrl = normalizedUrl,
+                        pendingVerificationEmail = cleanEmail,
+                        authInfoMessage = info,
+                        resetCodeSentEmail = null,
+                    )
+                }
+            } catch (exc: ApiException) {
+                _uiState.update {
+                    it.copy(isAuthSubmitting = false, authError = exc.message)
+                }
+            }
+        }
+    }
+
+    fun verifyRegistrationEmail(serverUrl: String, email: String, code: String) {
+        val cleanEmail = email.trim()
+        val cleanCode = code.trim()
+        if (cleanEmail.isEmpty()) {
+            _uiState.update { it.copy(authError = "请输入注册邮箱") }
+            return
+        }
+        if (cleanCode.length != 6 || !cleanCode.all { it.isDigit() }) {
+            _uiState.update { it.copy(authError = "请输入 6 位数字验证码") }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isAuthSubmitting = true, authError = null) }
+            try {
+                val normalizedUrl = api.setBaseUrl(serverUrl)
+                prefs.setServerUrl(normalizedUrl)
+                val tokenResp = api.verifyEmail(email = cleanEmail, code = cleanCode)
+                prefs.setToken(tokenResp.accessToken)
+                _uiState.update {
+                    it.copy(
+                        isAuthSubmitting = false,
+                        isAuthenticated = true,
+                        serverUrl = normalizedUrl,
+                        currentUser = tokenResp.user,
+                        selectedTab = 0,
+                        selectedDate = LocalDate.now(),
+                        authInfoMessage = null,
+                        pendingVerificationEmail = null,
+                        resetCodeSentEmail = null,
+                        snackbarMessage = "邮箱验证成功，欢迎使用",
                     )
                 }
                 loadTabData(0)
@@ -143,15 +263,120 @@ class HabitViewModel(
         }
     }
 
-    fun register(serverUrl: String, name: String, email: String, password: String) {
-        val cleanName = name.trim()
+    fun resendVerificationCode(serverUrl: String, email: String) {
         val cleanEmail = email.trim()
-        if (cleanName.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入你的名字") }
+        if (cleanEmail.isEmpty()) {
+            _uiState.update { it.copy(authError = "请输入注册邮箱", authInfoMessage = null) }
             return
         }
-        if (cleanEmail.isEmpty() || password.length < 6) {
-            _uiState.update { it.copy(authError = "请输入有效邮箱且密码至少 6 位") }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isAuthSubmitting = true,
+                    authError = null,
+                    authInfoMessage = null,
+                )
+            }
+            try {
+                val normalizedUrl = api.setBaseUrl(serverUrl)
+                prefs.setServerUrl(normalizedUrl)
+                val resp = api.resendVerification(email = cleanEmail)
+                val info = if (!resp.devVerificationCode.isNullOrBlank()) {
+                    "新验证码已发送至 $cleanEmail（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devVerificationCode}）"
+                } else {
+                    "新验证码已发送至 $cleanEmail，有效期 ${resp.expiresInMinutes} 分钟，请查收邮件"
+                }
+                _uiState.update {
+                    it.copy(
+                        isAuthSubmitting = false,
+                        serverUrl = normalizedUrl,
+                        pendingVerificationEmail = cleanEmail,
+                        authInfoMessage = info,
+                    )
+                }
+            } catch (exc: ApiException) {
+                _uiState.update {
+                    it.copy(isAuthSubmitting = false, authError = exc.message)
+                }
+            }
+        }
+    }
+
+    fun clearAuthFeedback() {
+        _uiState.update {
+            it.copy(
+                authError = null,
+                authInfoMessage = null,
+                pendingVerificationEmail = null,
+                resetCodeSentEmail = null,
+            )
+        }
+    }
+
+    fun requestPasswordReset(serverUrl: String, email: String) {
+        val cleanEmail = email.trim()
+        if (cleanEmail.isEmpty()) {
+            _uiState.update { it.copy(authError = "请输入注册邮箱", authInfoMessage = null) }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isAuthSubmitting = true,
+                    authError = null,
+                    authInfoMessage = null,
+                )
+            }
+            try {
+                val normalizedUrl = api.setBaseUrl(serverUrl)
+                prefs.setServerUrl(normalizedUrl)
+                val resp = api.forgotPassword(email = cleanEmail)
+                val info = if (!resp.devResetCode.isNullOrBlank()) {
+                    "验证码已发送（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devResetCode}）"
+                } else {
+                    "验证码已发送（若该邮箱已注册），有效期 ${resp.expiresInMinutes} 分钟"
+                }
+                _uiState.update {
+                    it.copy(
+                        isAuthSubmitting = false,
+                        serverUrl = normalizedUrl,
+                        resetCodeSentEmail = cleanEmail,
+                        authInfoMessage = info,
+                    )
+                }
+            } catch (exc: ApiException) {
+                _uiState.update {
+                    it.copy(isAuthSubmitting = false, authError = exc.message)
+                }
+            }
+        }
+    }
+
+    fun confirmPasswordReset(
+        serverUrl: String,
+        email: String,
+        code: String,
+        newPassword: String,
+        confirmPassword: String,
+    ) {
+        val cleanEmail = email.trim()
+        val cleanCode = code.trim()
+        if (cleanEmail.isEmpty()) {
+            _uiState.update { it.copy(authError = "请输入注册邮箱") }
+            return
+        }
+        if (cleanCode.length != 6 || !cleanCode.all { it.isDigit() }) {
+            _uiState.update { it.copy(authError = "请输入 6 位数字验证码") }
+            return
+        }
+        if (newPassword.length < 6) {
+            _uiState.update { it.copy(authError = "新密码至少需要 6 位") }
+            return
+        }
+        if (newPassword != confirmPassword) {
+            _uiState.update { it.copy(authError = "两次输入的新密码不一致") }
             return
         }
 
@@ -160,10 +385,10 @@ class HabitViewModel(
             try {
                 val normalizedUrl = api.setBaseUrl(serverUrl)
                 prefs.setServerUrl(normalizedUrl)
-                val tokenResp = api.register(
-                    name = cleanName,
+                val tokenResp = api.resetPassword(
                     email = cleanEmail,
-                    password = password,
+                    code = cleanCode,
+                    newPassword = newPassword,
                 )
                 prefs.setToken(tokenResp.accessToken)
                 _uiState.update {
@@ -174,12 +399,99 @@ class HabitViewModel(
                         currentUser = tokenResp.user,
                         selectedTab = 0,
                         selectedDate = LocalDate.now(),
+                        authInfoMessage = null,
+                        pendingVerificationEmail = null,
+                        resetCodeSentEmail = null,
+                        snackbarMessage = "密码已重置，已自动登录",
                     )
                 }
                 loadTabData(0)
             } catch (exc: ApiException) {
                 _uiState.update {
                     it.copy(isAuthSubmitting = false, authError = exc.message)
+                }
+            }
+        }
+    }
+
+    fun openChangePasswordDialog() {
+        _uiState.update {
+            it.copy(
+                showChangePasswordDialog = true,
+                isChangingPassword = false,
+                changePasswordError = null,
+            )
+        }
+    }
+
+    fun dismissChangePasswordDialog() {
+        if (_uiState.value.isChangingPassword) return
+        _uiState.update {
+            it.copy(
+                showChangePasswordDialog = false,
+                changePasswordError = null,
+            )
+        }
+    }
+
+    fun changePassword(
+        currentPassword: String,
+        newPassword: String,
+        confirmPassword: String,
+    ) {
+        if (currentPassword.isEmpty()) {
+            _uiState.update { it.copy(changePasswordError = "请输入当前密码") }
+            return
+        }
+        if (newPassword.length < 6) {
+            _uiState.update { it.copy(changePasswordError = "新密码至少需要 6 位") }
+            return
+        }
+        if (newPassword != confirmPassword) {
+            _uiState.update { it.copy(changePasswordError = "两次输入的新密码不一致") }
+            return
+        }
+        if (newPassword == currentPassword) {
+            _uiState.update { it.copy(changePasswordError = "新密码不能与当前密码相同") }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(isChangingPassword = true, changePasswordError = null)
+            }
+            try {
+                val tokenResp = api.changePassword(
+                    currentPassword = currentPassword,
+                    newPassword = newPassword,
+                )
+                prefs.setToken(tokenResp.accessToken)
+                _uiState.update {
+                    it.copy(
+                        isChangingPassword = false,
+                        showChangePasswordDialog = false,
+                        changePasswordError = null,
+                        currentUser = tokenResp.user,
+                        snackbarMessage = "密码修改成功",
+                    )
+                }
+            } catch (exc: ApiException) {
+                if (exc.statusCode == 401) {
+                    _uiState.update {
+                        it.copy(
+                            isChangingPassword = false,
+                            showChangePasswordDialog = false,
+                            changePasswordError = null,
+                        )
+                    }
+                    handleAuthenticatedError(exc)
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isChangingPassword = false,
+                            changePasswordError = exc.message,
+                        )
+                    }
                 }
             }
         }
@@ -203,6 +515,12 @@ class HabitViewModel(
                     statsSummary = null,
                     sliDashboard = null,
                     authError = null,
+                    authInfoMessage = null,
+                    pendingVerificationEmail = null,
+                    resetCodeSentEmail = null,
+                    showChangePasswordDialog = false,
+                    isChangingPassword = false,
+                    changePasswordError = null,
                 )
             }
         }
@@ -458,7 +776,12 @@ class HabitViewModel(
                 it.copy(
                     isAuthenticated = false,
                     currentUser = null,
+                    showChangePasswordDialog = false,
+                    isChangingPassword = false,
+                    changePasswordError = null,
                     authError = "登录状态已过期，请重新登录",
+                    authInfoMessage = null,
+                    resetCodeSentEmail = null,
                 )
             }
         } else {

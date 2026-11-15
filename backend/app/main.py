@@ -10,8 +10,11 @@ from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import DuplicateKeyError
 
 from app.core import (
+    ChangePasswordRequest,
     CheckinRequest,
     DailyActivityPoint,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     HabitCreate,
     HabitOut,
     HabitStreakStat,
@@ -19,11 +22,18 @@ from app.core import (
     HabitUpdate,
     LoginRequest,
     PeriodScheduleOut,
+    RESET_MAX_ATTEMPTS,
+    RESET_MAX_REQUESTS_PER_WINDOW,
+    RESET_RATE_WINDOW_MINUTES,
     RegisterRequest,
+    RegisterResponse,
+    ResendVerificationRequest,
+    ResetPasswordRequest,
     SliDashboardOut,
     StatsSummaryOut,
     TokenResponse,
     UserPublic,
+    VerifyEmailRequest,
     build_period_schedule,
     build_sli_dashboard,
     compute_30d_completion_rate,
@@ -31,12 +41,20 @@ from app.core import (
     compute_streaks,
     create_access_token,
     ensure_indexes,
+    ensure_utc,
+    generate_reset_code,
     get_current_user,
     get_db,
     hash_password,
+    hash_reset_code,
+    hash_verification_code,
     is_scheduled_on,
+    send_password_reset_email,
+    send_registration_verification_email,
     settings,
     verify_password,
+    verify_reset_code,
+    verify_verification_code,
 )
 
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -44,7 +62,18 @@ WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with AsyncMongoClient(settings.mongodb_uri) as client:
+    # Tuned for scale-to-zero Cloud Run (max-instances=1, async I/O) + MongoDB Atlas M0:
+    # - maxPoolSize=10: sufficient async concurrency while staying well under M0's 500-conn limit
+    # - minPoolSize=0 & maxIdleTimeMS=60000: release idle sockets promptly before scale-down
+    # - connectTimeoutMS=10000 & serverSelectionTimeoutMS=10000: fail fast on network/TLS issues
+    async with AsyncMongoClient(
+        settings.mongodb_uri,
+        maxPoolSize=10,
+        minPoolSize=0,
+        maxIdleTimeMS=60000,
+        connectTimeoutMS=10000,
+        serverSelectionTimeoutMS=10000,
+    ) as client:
         db = client[settings.mongodb_db_name]
         await ensure_indexes(db)
         app.state.mongodb = db
@@ -73,6 +102,7 @@ def _serialize_user(user_doc: dict) -> UserPublic:
         id=str(user_doc["_id"]),
         name=user_doc["name"],
         email=user_doc["email"],
+        email_verified=bool(user_doc.get("email_verified", True)),
         created_at=user_doc["created_at"],
     )
 
@@ -121,34 +151,291 @@ async def health_check(db: AsyncDatabase = Depends(get_db)) -> dict:
 # ---------------------------------------------------------------------------
 # Auth Endpoints
 # ---------------------------------------------------------------------------
+def _check_code_rate_limit(
+    existing_record: dict | None,
+    now: datetime,
+    error_detail: str,
+) -> tuple[int, datetime]:
+    in_window = bool(
+        existing_record
+        and existing_record.get("window_started_at")
+        and ensure_utc(existing_record["window_started_at"])
+        > now - timedelta(minutes=RESET_RATE_WINDOW_MINUTES)
+    )
+    if (
+        in_window
+        and int(existing_record.get("send_count", 0)) >= RESET_MAX_REQUESTS_PER_WINDOW
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=error_detail,
+        )
+    send_count = (int(existing_record.get("send_count", 0)) + 1) if in_window else 1
+    window_started_at = existing_record["window_started_at"] if in_window else now
+    return send_count, window_started_at
+
+
+async def _verify_code_or_raise(
+    collection,
+    email_norm: str,
+    code: str,
+    now: datetime,
+    verifier,
+) -> None:
+    record = await collection.find_one({"email": email_norm})
+    if (
+        not record
+        or not record.get("code_hash")
+        or ensure_utc(record["expires_at"]) < now
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification code",
+        )
+
+    attempts = int(record.get("attempts", 0))
+    if attempts >= RESET_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many failed attempts. Please request a new verification code",
+        )
+
+    if record.get("used", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification code",
+        )
+
+    if not verifier(email_norm, code, record["code_hash"]):
+        new_attempts = attempts + 1
+        await collection.update_one(
+            {"email": email_norm},
+            {
+                "$set": {
+                    "attempts": new_attempts,
+                    "used": new_attempts >= RESET_MAX_ATTEMPTS,
+                }
+            },
+        )
+        detail = (
+            "Too many failed attempts. Please request a new verification code"
+            if new_attempts >= RESET_MAX_ATTEMPTS
+            else "Invalid or expired verification code"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=detail,
+        )
+
+
+def _issue_dev_code(code: str) -> str | None:
+    if not settings.smtp_host and settings.auth_dev_return_reset_code:
+        return code
+    return None
+
+
 @app.post(
     "/api/auth/register",
-    response_model=TokenResponse,
+    response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def register(
     payload: RegisterRequest,
     db: AsyncDatabase = Depends(get_db),
-) -> TokenResponse:
+) -> RegisterResponse:
     email_norm = payload.email.lower().strip()
+    clean_name = payload.name.strip()
     now = datetime.now(timezone.utc)
-    user_doc = {
-        "name": payload.name.strip(),
-        "email": email_norm,
-        "password_hash": hash_password(payload.password),
-        "created_at": now,
-    }
-    try:
-        res = await db.users.insert_one(user_doc)
-    except DuplicateKeyError as exc:
+
+    existing_user = await db.users.find_one({"email": email_norm})
+    if existing_user and existing_user.get("email_verified", True):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
-        ) from exc
+        )
 
-    user_doc["_id"] = res.inserted_id
-    token = create_access_token(str(res.inserted_id), email_norm)
-    return TokenResponse(access_token=token, user=_serialize_user(user_doc))
+    existing_verif = await db.email_verifications.find_one({"email": email_norm})
+    send_count, window_started_at = _check_code_rate_limit(
+        existing_verif,
+        now,
+        "Too many verification requests. Please wait 15 minutes before trying again.",
+    )
+
+    code = generate_reset_code()
+    code_hash = hash_verification_code(email_norm, code)
+    await send_registration_verification_email(
+        email_norm,
+        clean_name,
+        code,
+        settings.reset_code_expire_minutes,
+    )
+
+    password_hash = hash_password(payload.password)
+    if existing_user:
+        await db.users.update_one(
+            {"_id": existing_user["_id"]},
+            {
+                "$set": {
+                    "name": clean_name,
+                    "password_hash": password_hash,
+                    "updated_at": now,
+                }
+            },
+        )
+        user_id_str = str(existing_user["_id"])
+    else:
+        user_doc = {
+            "name": clean_name,
+            "email": email_norm,
+            "password_hash": password_hash,
+            "email_verified": False,
+            "token_version": 0,
+            "created_at": now,
+        }
+        try:
+            res = await db.users.insert_one(user_doc)
+        except DuplicateKeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email already exists",
+            ) from exc
+        user_id_str = str(res.inserted_id)
+
+    expires_at = now + timedelta(minutes=settings.reset_code_expire_minutes)
+    await db.email_verifications.update_one(
+        {"email": email_norm},
+        {
+            "$set": {
+                "email": email_norm,
+                "user_id": user_id_str,
+                "code_hash": code_hash,
+                "attempts": 0,
+                "used": False,
+                "send_count": send_count,
+                "window_started_at": window_started_at,
+                "created_at": now,
+                "expires_at": expires_at,
+            }
+        },
+        upsert=True,
+    )
+
+    return RegisterResponse(
+        message="A 6-digit verification code has been sent to your email.",
+        email=email_norm,
+        verification_required=True,
+        expires_in_minutes=settings.reset_code_expire_minutes,
+        dev_verification_code=_issue_dev_code(code),
+    )
+
+
+@app.post("/api/auth/verify-email", response_model=TokenResponse)
+async def verify_email(
+    payload: VerifyEmailRequest,
+    db: AsyncDatabase = Depends(get_db),
+) -> TokenResponse:
+    email_norm = payload.email.lower().strip()
+    now = datetime.now(timezone.utc)
+    await _verify_code_or_raise(
+        db.email_verifications,
+        email_norm,
+        payload.code,
+        now,
+        verify_verification_code,
+    )
+
+    user_doc = await db.users.find_one({"email": email_norm})
+    if not user_doc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification code",
+        )
+
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {
+            "$set": {
+                "email_verified": True,
+                "email_verified_at": now,
+            }
+        },
+    )
+    await db.email_verifications.delete_many({"email": email_norm})
+
+    verified_user_doc = {**user_doc, "email_verified": True}
+    token = create_access_token(
+        str(user_doc["_id"]),
+        email_norm,
+        token_version=int(user_doc.get("token_version", 0)),
+    )
+    return TokenResponse(
+        access_token=token,
+        user=_serialize_user(verified_user_doc),
+    )
+
+
+@app.post("/api/auth/resend-verification", response_model=RegisterResponse)
+async def resend_verification(
+    payload: ResendVerificationRequest,
+    db: AsyncDatabase = Depends(get_db),
+) -> RegisterResponse:
+    email_norm = payload.email.lower().strip()
+    now = datetime.now(timezone.utc)
+
+    user_doc = await db.users.find_one({"email": email_norm})
+    if not user_doc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending registration found for this email",
+        )
+    if user_doc.get("email_verified", True):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email is already verified, please sign in",
+        )
+
+    existing_verif = await db.email_verifications.find_one({"email": email_norm})
+    send_count, window_started_at = _check_code_rate_limit(
+        existing_verif,
+        now,
+        "Too many verification requests. Please wait 15 minutes before trying again.",
+    )
+
+    code = generate_reset_code()
+    code_hash = hash_verification_code(email_norm, code)
+    await send_registration_verification_email(
+        email_norm,
+        user_doc.get("name", "User"),
+        code,
+        settings.reset_code_expire_minutes,
+    )
+
+    expires_at = now + timedelta(minutes=settings.reset_code_expire_minutes)
+    await db.email_verifications.update_one(
+        {"email": email_norm},
+        {
+            "$set": {
+                "email": email_norm,
+                "user_id": str(user_doc["_id"]),
+                "code_hash": code_hash,
+                "attempts": 0,
+                "used": False,
+                "send_count": send_count,
+                "window_started_at": window_started_at,
+                "created_at": now,
+                "expires_at": expires_at,
+            }
+        },
+        upsert=True,
+    )
+
+    return RegisterResponse(
+        message="A new 6-digit verification code has been sent to your email.",
+        email=email_norm,
+        verification_required=True,
+        expires_in_minutes=settings.reset_code_expire_minutes,
+        dev_verification_code=_issue_dev_code(code),
+    )
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -163,9 +450,182 @@ async def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
         )
+    if not user_doc.get("email_verified", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email address with the 6-digit code before signing in",
+        )
 
-    token = create_access_token(str(user_doc["_id"]), email_norm)
+    token = create_access_token(
+        str(user_doc["_id"]),
+        email_norm,
+        token_version=int(user_doc.get("token_version", 0)),
+    )
     return TokenResponse(access_token=token, user=_serialize_user(user_doc))
+
+
+@app.post("/api/auth/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncDatabase = Depends(get_db),
+) -> ForgotPasswordResponse:
+    email_norm = payload.email.lower().strip()
+    now = datetime.now(timezone.utc)
+    existing_reset = await db.password_resets.find_one({"email": email_norm})
+    send_count, window_started_at = _check_code_rate_limit(
+        existing_reset,
+        now,
+        "Too many reset requests. Please wait 15 minutes before trying again.",
+    )
+
+    generic_msg = (
+        "If an account exists for this email, a 6-digit verification code has been sent."
+    )
+    expires_at = now + timedelta(minutes=settings.reset_code_expire_minutes)
+
+    user_doc = await db.users.find_one({"email": email_norm})
+    if not user_doc:
+        await db.password_resets.update_one(
+            {"email": email_norm},
+            {
+                "$set": {
+                    "email": email_norm,
+                    "user_id": "",
+                    "code_hash": "",
+                    "attempts": 0,
+                    "used": True,
+                    "send_count": send_count,
+                    "window_started_at": window_started_at,
+                    "created_at": now,
+                    "expires_at": expires_at,
+                }
+            },
+            upsert=True,
+        )
+        return ForgotPasswordResponse(
+            message=generic_msg,
+            expires_in_minutes=settings.reset_code_expire_minutes,
+        )
+
+    code = generate_reset_code()
+    code_hash = hash_reset_code(email_norm, code)
+
+    await send_password_reset_email(
+        email_norm,
+        user_doc.get("name", "User"),
+        code,
+        settings.reset_code_expire_minutes,
+    )
+
+    await db.password_resets.update_one(
+        {"email": email_norm},
+        {
+            "$set": {
+                "email": email_norm,
+                "user_id": str(user_doc["_id"]),
+                "code_hash": code_hash,
+                "attempts": 0,
+                "used": False,
+                "send_count": send_count,
+                "window_started_at": window_started_at,
+                "created_at": now,
+                "expires_at": expires_at,
+            }
+        },
+        upsert=True,
+    )
+
+    return ForgotPasswordResponse(
+        message=generic_msg,
+        expires_in_minutes=settings.reset_code_expire_minutes,
+        dev_reset_code=_issue_dev_code(code),
+    )
+
+
+@app.post("/api/auth/reset-password", response_model=TokenResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncDatabase = Depends(get_db),
+) -> TokenResponse:
+    email_norm = payload.email.lower().strip()
+    now = datetime.now(timezone.utc)
+    await _verify_code_or_raise(
+        db.password_resets,
+        email_norm,
+        payload.code,
+        now,
+        verify_reset_code,
+    )
+
+    user_doc = await db.users.find_one({"email": email_norm})
+    if not user_doc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification code",
+        )
+
+    new_ver = int(user_doc.get("token_version", 0)) + 1
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {
+            "$set": {
+                "password_hash": hash_password(payload.new_password),
+                "token_version": new_ver,
+                "email_verified": True,
+                "password_updated_at": now,
+            }
+        },
+    )
+    await db.password_resets.delete_many({"email": email_norm})
+    await db.email_verifications.delete_many({"email": email_norm})
+
+    verified_user_doc = {**user_doc, "email_verified": True}
+    token = create_access_token(
+        str(user_doc["_id"]),
+        email_norm,
+        token_version=new_ver,
+    )
+    return TokenResponse(access_token=token, user=_serialize_user(verified_user_doc))
+
+
+@app.post("/api/auth/change-password", response_model=TokenResponse)
+async def change_password(
+    payload: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncDatabase = Depends(get_db),
+) -> TokenResponse:
+    if not verify_password(payload.current_password, current_user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    if verify_password(payload.new_password, current_user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password",
+        )
+
+    new_ver = int(current_user.get("token_version", 0)) + 1
+    now = datetime.now(timezone.utc)
+    await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {
+            "$set": {
+                "password_hash": hash_password(payload.new_password),
+                "token_version": new_ver,
+                "password_updated_at": now,
+            }
+        },
+    )
+    await db.password_resets.delete_many({"email": current_user["email"]})
+
+    token = create_access_token(
+        str(current_user["_id"]),
+        current_user["email"],
+        token_version=new_ver,
+    )
+    return TokenResponse(access_token=token, user=_serialize_user(current_user))
 
 
 @app.get("/api/auth/me", response_model=UserPublic)

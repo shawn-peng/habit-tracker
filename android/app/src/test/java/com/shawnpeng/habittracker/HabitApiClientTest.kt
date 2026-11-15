@@ -643,4 +643,174 @@ class HabitApiClientTest {
         assertEquals("GET", monthReq.method)
         assertEquals("/api/habits/schedule?period=month", monthReq.path)
     }
+
+    @Test
+    fun forgotResetAndChangePasswordEndpointsSerializeAndRotateAuthToken() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "message": "If an account exists for this email, a 6-digit verification code has been sent.",
+                      "expires_in_minutes": 15,
+                      "dev_reset_code": "123456"
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "access_token": "jwt-reset-1",
+                      "token_type": "bearer",
+                      "user": {
+                        "id": "u1",
+                        "name": "Shawn",
+                        "email": "shawn@example.com",
+                        "created_at": "2026-11-14T00:00:00Z"
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "access_token": "jwt-changed-2",
+                      "token_type": "bearer",
+                      "user": {
+                        "id": "u1",
+                        "name": "Shawn",
+                        "email": "shawn@example.com",
+                        "created_at": "2026-11-14T00:00:00Z"
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+
+        val forgotResp = client.forgotPassword("shawn@example.com")
+        assertEquals(15, forgotResp.expiresInMinutes)
+        assertEquals("123456", forgotResp.devResetCode)
+
+        val resetResp = client.resetPassword("shawn@example.com", "123456", "newSecret123")
+        assertEquals("jwt-reset-1", resetResp.accessToken)
+        assertEquals("jwt-reset-1", client.authToken)
+
+        val changeResp = client.changePassword("newSecret123", "newerSecret456")
+        assertEquals("jwt-changed-2", changeResp.accessToken)
+        assertEquals("jwt-changed-2", client.authToken)
+
+        val forgotReq = server.takeRequest()
+        assertEquals("POST", forgotReq.method)
+        assertEquals("/api/auth/forgot-password", forgotReq.path)
+        assertTrue(forgotReq.body.readUtf8().contains("\"email\":\"shawn@example.com\""))
+
+        val resetReq = server.takeRequest()
+        assertEquals("POST", resetReq.method)
+        assertEquals("/api/auth/reset-password", resetReq.path)
+        val resetBody = resetReq.body.readUtf8()
+        assertTrue(resetBody.contains("\"code\":\"123456\""))
+        assertTrue(resetBody.contains("\"new_password\":\"newSecret123\""))
+
+        val changeReq = server.takeRequest()
+        assertEquals("POST", changeReq.method)
+        assertEquals("/api/auth/change-password", changeReq.path)
+        assertEquals("Bearer jwt-reset-1", changeReq.getHeader("Authorization"))
+        val changeBody = changeReq.body.readUtf8()
+        assertTrue(changeBody.contains("\"current_password\":\"newSecret123\""))
+        assertTrue(changeBody.contains("\"new_password\":\"newerSecret456\""))
+    }
+
+    @Test
+    fun registerVerifyAndResendEmailEndpointsSerializeAndStoreToken() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(201)
+                .setBody(
+                    """
+                    {
+                      "message": "A 6-digit verification code has been sent to your email.",
+                      "email": "newuser@example.com",
+                      "verification_required": true,
+                      "expires_in_minutes": 15,
+                      "dev_verification_code": "246810"
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "message": "A new 6-digit verification code has been sent to your email.",
+                      "email": "newuser@example.com",
+                      "verification_required": true,
+                      "expires_in_minutes": 15,
+                      "dev_verification_code": "135790"
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "access_token": "jwt-verified-1",
+                      "token_type": "bearer",
+                      "user": {
+                        "id": "u2",
+                        "name": "New User",
+                        "email": "newuser@example.com",
+                        "email_verified": true,
+                        "created_at": "2026-11-15T00:00:00Z"
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+
+        val regResp = client.register("New User", "newuser@example.com", "secret123")
+        assertTrue(regResp.verificationRequired)
+        assertEquals("newuser@example.com", regResp.email)
+        assertEquals("246810", regResp.devVerificationCode)
+        assertNull(client.authToken)
+
+        val resendResp = client.resendVerification("newuser@example.com")
+        assertEquals("135790", resendResp.devVerificationCode)
+        assertNull(client.authToken)
+
+        val verifyResp = client.verifyEmail("newuser@example.com", "135790")
+        assertEquals("jwt-verified-1", verifyResp.accessToken)
+        assertEquals("jwt-verified-1", client.authToken)
+        assertTrue(verifyResp.user.emailVerified)
+
+        val regReq = server.takeRequest()
+        assertEquals("POST", regReq.method)
+        assertEquals("/api/auth/register", regReq.path)
+        assertTrue(regReq.body.readUtf8().contains("\"email\":\"newuser@example.com\""))
+
+        val resendReq = server.takeRequest()
+        assertEquals("POST", resendReq.method)
+        assertEquals("/api/auth/resend-verification", resendReq.path)
+        assertTrue(resendReq.body.readUtf8().contains("\"email\":\"newuser@example.com\""))
+
+        val verifyReq = server.takeRequest()
+        assertEquals("POST", verifyReq.method)
+        assertEquals("/api/auth/verify-email", verifyReq.path)
+        val verifyBody = verifyReq.body.readUtf8()
+        assertTrue(verifyBody.contains("\"email\":\"newuser@example.com\""))
+        assertTrue(verifyBody.contains("\"code\":\"135790\""))
+    }
 }

@@ -1,7 +1,16 @@
+import asyncio
 import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
+import hashlib
+import hmac
+import logging
 import os
+import re
+import secrets
+import smtplib
+import ssl
 from typing import Literal
 
 from bson import ObjectId
@@ -16,7 +25,12 @@ from pymongo.asynchronous.database import AsyncDatabase
 
 load_dotenv()
 
+logger = logging.getLogger("habit_tracker.auth")
+
 WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+RESET_MAX_ATTEMPTS = 5
+RESET_RATE_WINDOW_MINUTES = 15
+RESET_MAX_REQUESTS_PER_WINDOW = 5
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +46,22 @@ class Settings:
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
     cors_origins_raw: str = os.getenv("CORS_ORIGINS", "*")
+    smtp_host: str = os.getenv("SMTP_HOST", "").strip()
+    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username: str = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password: str = os.getenv("SMTP_PASSWORD", "").strip()
+    smtp_from_email: str = os.getenv("SMTP_FROM_EMAIL", "").strip()
+    smtp_use_tls: bool = (
+        os.getenv("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes", "on")
+    )
+    smtp_use_ssl: bool = (
+        os.getenv("SMTP_USE_SSL", "false").strip().lower() in ("1", "true", "yes", "on")
+    )
+    reset_code_expire_minutes: int = int(os.getenv("RESET_CODE_EXPIRE_MINUTES", "15"))
+    auth_dev_return_reset_code: bool = (
+        os.getenv("AUTH_DEV_RETURN_RESET_CODE", "false").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
 
     @property
     def cors_origins(self) -> list[str]:
@@ -49,6 +79,14 @@ settings = Settings()
 # ---------------------------------------------------------------------------
 async def ensure_indexes(db: AsyncDatabase) -> None:
     await db.users.create_index([("email", ASCENDING)], unique=True)
+    await db.password_resets.create_index([("email", ASCENDING)], unique=True)
+    await db.password_resets.create_index(
+        [("expires_at", ASCENDING)], expireAfterSeconds=0
+    )
+    await db.email_verifications.create_index([("email", ASCENDING)], unique=True)
+    await db.email_verifications.create_index(
+        [("expires_at", ASCENDING)], expireAfterSeconds=0
+    )
     await db.habits.create_index([("user_id", ASCENDING), ("archived", ASCENDING)])
     await db.checkins.create_index(
         [("habit_id", ASCENDING), ("date", ASCENDING)],
@@ -68,6 +106,12 @@ password_hasher = PasswordHash.recommended()
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def hash_password(plain_password: str) -> str:
     return password_hasher.hash(plain_password)
 
@@ -76,15 +120,187 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return password_hasher.verify(plain_password, hashed_password)
 
 
-def create_access_token(user_id: str, email: str) -> str:
+def create_access_token(user_id: str, email: str, token_version: int = 0) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "email": email,
+        "ver": int(token_version),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.jwt_expire_minutes)).timestamp()),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def generate_reset_code() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _hmac_digest(msg_text: str) -> str:
+    return hmac.new(
+        settings.jwt_secret.encode("utf-8"),
+        msg_text.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def hash_reset_code(email: str, code: str) -> str:
+    return _hmac_digest(f"{email.lower().strip()}:{code.strip()}")
+
+
+def verify_reset_code(email: str, code: str, expected_hash: str) -> bool:
+    return hmac.compare_digest(hash_reset_code(email, code), expected_hash)
+
+
+def hash_verification_code(email: str, code: str) -> str:
+    """Hash a registration email verification code with domain separation."""
+    return _hmac_digest(f"verify:{email.lower().strip()}:{code.strip()}")
+
+
+def verify_verification_code(email: str, code: str, expected_hash: str) -> bool:
+    """Verify a registration email verification code in constant time."""
+    return hmac.compare_digest(hash_verification_code(email, code), expected_hash)
+
+
+def _send_smtp_sync(msg: EmailMessage, cfg: Settings) -> None:
+    context = ssl.create_default_context()
+    if cfg.smtp_use_ssl or cfg.smtp_port == 465:
+        with smtplib.SMTP_SSL(
+            cfg.smtp_host, cfg.smtp_port, timeout=10, context=context
+        ) as server:
+            if cfg.smtp_username:
+                server.login(cfg.smtp_username, cfg.smtp_password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=10) as server:
+            server.ehlo()
+            if cfg.smtp_use_tls:
+                server.starttls(context=context)
+                server.ehlo()
+            if cfg.smtp_username:
+                server.login(cfg.smtp_username, cfg.smtp_password)
+            server.send_message(msg)
+
+
+async def _send_code_email(
+    *,
+    to_email: str,
+    dev_tag: str,
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    code: str,
+    expire_minutes: int,
+    log_error_label: str,
+    cfg: Settings | None = None,
+) -> None:
+    active_cfg = cfg or settings
+    if not active_cfg.smtp_host:
+        logger.warning(
+            "[%s] SMTP_HOST not configured. Verification code for %s: %s (expires in %d min)",
+            dev_tag,
+            to_email,
+            code,
+            expire_minutes,
+        )
+        return
+
+    from_addr = (
+        active_cfg.smtp_from_email
+        or active_cfg.smtp_username
+        or "noreply@habittracker.local"
+    )
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        await asyncio.to_thread(_send_smtp_sync, msg, active_cfg)
+    except Exception as exc:
+        logger.exception("Failed to send %s to %s", log_error_label, to_email)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to send verification email. Please try again later.",
+        ) from exc
+
+
+async def send_password_reset_email(
+    to_email: str,
+    user_name: str,
+    code: str,
+    expire_minutes: int,
+    cfg: Settings | None = None,
+) -> None:
+    greeting = f"Hi {user_name}," if user_name else "Hi,"
+    plain_body = (
+        f"{greeting}\n\n"
+        f"Your Habit Tracker password reset verification code is: {code}\n\n"
+        f"This code expires in {expire_minutes} minutes. If you did not request a "
+        "password reset, you can safely ignore this email.\n"
+    )
+    html_body = f"""\
+<html>
+  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1E293B; line-height: 1.5;">
+    <p>{greeting}</p>
+    <p>Your Habit Tracker password reset verification code is:</p>
+    <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; color: #4F46E5; margin: 16px 0;">{code}</p>
+    <p>This code expires in <strong>{expire_minutes} minutes</strong>. If you did not request a password reset, you can safely ignore this email.</p>
+  </body>
+</html>
+"""
+    await _send_code_email(
+        to_email=to_email,
+        dev_tag="DEV PASSWORD RESET",
+        subject=f"Habit Tracker Password Reset Code: {code}",
+        plain_body=plain_body,
+        html_body=html_body,
+        code=code,
+        expire_minutes=expire_minutes,
+        log_error_label="password reset email",
+        cfg=cfg,
+    )
+
+
+async def send_registration_verification_email(
+    to_email: str,
+    user_name: str,
+    code: str,
+    expire_minutes: int,
+    cfg: Settings | None = None,
+) -> None:
+    """Send a 6-digit registration verification email or log in local dev."""
+    greeting = f"Hi {user_name}," if user_name else "Hi,"
+    plain_body = (
+        f"{greeting}\n\n"
+        "Welcome to Habit Tracker! Please verify your email address with the 6-digit code below:\n\n"
+        f"{code}\n\n"
+        f"This code expires in {expire_minutes} minutes. If you did not sign up for "
+        "Habit Tracker, you can safely ignore this email.\n"
+    )
+    html_body = f"""\
+<html>
+  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1E293B; line-height: 1.5;">
+    <p>{greeting}</p>
+    <p>Welcome to Habit Tracker! Please verify your email address with the 6-digit code below:</p>
+    <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; color: #4F46E5; margin: 16px 0;">{code}</p>
+    <p>This code expires in <strong>{expire_minutes} minutes</strong>. If you did not sign up for Habit Tracker, you can safely ignore this email.</p>
+  </body>
+</html>
+"""
+    await _send_code_email(
+        to_email=to_email,
+        dev_tag="DEV EMAIL VERIFICATION",
+        subject=f"Habit Tracker Email Verification Code: {code}",
+        plain_body=plain_body,
+        html_body=html_body,
+        code=code,
+        expire_minutes=expire_minutes,
+        log_error_label="registration verification email",
+        cfg=cfg,
+    )
 
 
 async def get_current_user(
@@ -126,6 +342,16 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account not found",
         )
+    if int(payload.get("ver", 0)) != int(user.get("token_version", 0)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired, please sign in again",
+        )
+    if not user.get("email_verified", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email address is not verified",
+        )
     return user
 
 
@@ -147,6 +373,7 @@ class UserPublic(BaseModel):
     id: str
     name: str
     email: EmailStr
+    email_verified: bool = True
     created_at: datetime
 
 
@@ -154,6 +381,60 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
+
+
+class RegisterResponse(BaseModel):
+    message: str
+    email: EmailStr
+    verification_required: bool = True
+    expires_in_minutes: int = 15
+    dev_verification_code: str | None = None
+
+
+def _strip_code_value(v: object) -> object:
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def strip_code(cls, v: object) -> object:
+        return _strip_code_value(v)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+    expires_in_minutes: int = 15
+    dev_reset_code: str | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=6, max_length=128)
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def strip_code(cls, v: object) -> object:
+        return _strip_code_value(v)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
 
 
 FrequencyType = Literal["daily", "weekdays", "monthly"]

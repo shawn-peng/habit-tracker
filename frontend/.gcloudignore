@@ -1,0 +1,13 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+src/.flet/
+*.ipa
+*.apk
+*.zip
+.env
+*.local

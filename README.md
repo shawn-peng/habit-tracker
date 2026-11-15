@@ -8,6 +8,26 @@ A full-stack cross-platform **Habit & Routine Tracker** powered by:
 
 ---
 
+### Quick Restart Script (Windows PowerShell)
+
+From the repository root, run `restart-app.ps1` to stop any running Habit Tracker processes, ensure MongoDB is up, start the FastAPI backend (`:8000`) and Flet client (`http://127.0.0.1:52131`), and verify readiness:
+
+```powershell
+# Restart MongoDB (if local), FastAPI (:8000), and Flet Web UI (http://127.0.0.1:52131)
+.\restart-app.ps1
+
+# Restart Web UI without auto-opening a browser tab
+.\restart-app.ps1 -NoBrowser
+
+# Restart with the native Flet Desktop window instead of Web
+.\restart-app.ps1 -Mode desktop
+
+# Stop all running Habit Tracker backend/frontend processes
+.\restart-app.ps1 -StopOnly
+```
+
+---
+
 ## 1. Start the Server (MongoDB + FastAPI)
 
 ### Option A: MongoDB Atlas (M0 Free on Google Cloud)
@@ -39,8 +59,15 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   - `MONGODB_DB_NAME=habit_tracker`
   - `JWT_SECRET` (a secure random secret, distinct from local dev)
   - `CORS_ORIGINS` (your deployed web origin or `*` for native/web token-based clients)
+  - Optional SMTP email verification & password-reset variables: `SMTP_HOST`, `SMTP_PORT=587`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS=true`, `SMTP_USE_SSL=false`, `RESET_CODE_EXPIRE_MINUTES=15`, `AUTH_DEV_RETURN_RESET_CODE=false` (when `SMTP_HOST` is omitted locally, 6-digit registration verification and password-reset codes are logged to the FastAPI server console)
 - Co-locate your Cloud Run service and Atlas M0 cluster in the **same GCP region** (e.g., `us-central1` / `CENTRAL_US` or `us-east1` / `EASTERN_US`) for single-digit ms database latency.
 - **Atlas M0 Network Access with Cloud Run:** VPC Peering and Private Service Connect require Atlas Dedicated `M10+`. For `M0`, either route Cloud Run egress through Cloud NAT with a static IP allowlisted in Atlas, or allow `0.0.0.0/0` in Atlas Network Access combined with strong SCRAM credentials and TLS (enforced automatically by `mongodb+srv://`).
+
+### Deploy Frontend Server to Google Cloud Run (Continuous Deployment)
+- **Live Service (`habit-tracker-web`, `us-central1`):** `https://habit-tracker-web-142205380680.us-central1.run.app` (alias: `https://habit-tracker-web-mcj2rjpeiq-uc.a.run.app`), served by `frontend/server.py` + `frontend/Dockerfile` (`uvicorn` + `flet_web` ASGI on `0.0.0.0:${PORT:-8080}` with `GET /health` health checks, `--max-instances=1`, `--session-affinity`, and `--timeout=3600` for Flet WebSockets).
+- **Automated CD Pipeline (`.github/workflows/deploy-frontend.yml`):** Every push to `main` touching `frontend/**` or `.github/workflows/deploy-frontend.yml` runs ASGI smoke tests (`verify-frontend`), authenticates via **keyless Google Cloud Workload Identity Federation (OIDC)** (no static service-account JSON keys stored in GitHub), pushes the container image to Artifact Registry (`us-central1-docker.pkg.dev/shawn-habit-tracker-2026/cloud-run-source-deploy/habit-tracker-web`), deploys to Cloud Run, and verifies `GET /health` and `GET /`.
+- **Manual Dispatch:** Under GitHub **Actions → Deploy Frontend Server to Cloud Run**, click **Run workflow** (optionally passing `habit_api_url` to override the backend API endpoint).
+- **Local Container Stack (MongoDB + Backend + Frontend Web):** Run `docker compose --profile full up -d --build` to serve the containerized frontend at `http://localhost:8080` pointing to `http://backend:8000`.
 
 ---
 

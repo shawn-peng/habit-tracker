@@ -5,7 +5,10 @@ import httpx
 
 STORAGE_TOKEN_KEY = "habit_tracker_jwt"
 STORAGE_API_URL_KEY = "habit_tracker_api_url"
-DEFAULT_API_URL = os.getenv("HABIT_API_URL", "http://localhost:8000")
+DEFAULT_API_URL = os.getenv(
+    "HABIT_API_URL",
+    "https://habit-tracker-api-142205380680.us-central1.run.app",
+)
 
 
 class ApiError(Exception):
@@ -137,16 +140,33 @@ class HabitApiClient:
 
         return resp.json()
 
-    async def register(self, name: str, email: str, password: str) -> dict[str, Any]:
-        data = await self._request(
-            "POST",
-            "/api/auth/register",
-            json_body={"name": name, "email": email, "password": password},
-        )
+    async def _save_session(self, data: dict[str, Any]) -> dict[str, Any]:
         self.token = data["access_token"]
         self.current_user = data["user"]
         await self.storage.set(STORAGE_TOKEN_KEY, self.token)
         return self.current_user
+
+    async def register(self, name: str, email: str, password: str) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/auth/register",
+            json_body={"name": name, "email": email, "password": password},
+        )
+
+    async def verify_email(self, email: str, code: str) -> dict[str, Any]:
+        data = await self._request(
+            "POST",
+            "/api/auth/verify-email",
+            json_body={"email": email, "code": code},
+        )
+        return await self._save_session(data)
+
+    async def resend_verification(self, email: str) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/auth/resend-verification",
+            json_body={"email": email},
+        )
 
     async def login(self, email: str, password: str) -> dict[str, Any]:
         data = await self._request(
@@ -154,10 +174,41 @@ class HabitApiClient:
             "/api/auth/login",
             json_body={"email": email, "password": password},
         )
-        self.token = data["access_token"]
-        self.current_user = data["user"]
-        await self.storage.set(STORAGE_TOKEN_KEY, self.token)
-        return self.current_user
+        return await self._save_session(data)
+
+    async def forgot_password(self, email: str) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/auth/forgot-password",
+            json_body={"email": email},
+        )
+
+    async def reset_password(
+        self, email: str, code: str, new_password: str
+    ) -> dict[str, Any]:
+        data = await self._request(
+            "POST",
+            "/api/auth/reset-password",
+            json_body={
+                "email": email,
+                "code": code,
+                "new_password": new_password,
+            },
+        )
+        return await self._save_session(data)
+
+    async def change_password(
+        self, current_password: str, new_password: str
+    ) -> dict[str, Any]:
+        data = await self._request(
+            "POST",
+            "/api/auth/change-password",
+            json_body={
+                "current_password": current_password,
+                "new_password": new_password,
+            },
+        )
+        return await self._save_session(data)
 
     async def get_me(self) -> dict[str, Any]:
         return await self._request("GET", "/api/auth/me")

@@ -22,6 +22,7 @@ data class UserPublic(
     val id: String,
     val name: String,
     val email: String,
+    @SerialName("email_verified") val emailVerified: Boolean = true,
     @SerialName("created_at") val createdAt: String = "",
 )
 
@@ -30,6 +31,51 @@ data class TokenResponse(
     @SerialName("access_token") val accessToken: String,
     @SerialName("token_type") val tokenType: String = "bearer",
     val user: UserPublic,
+)
+
+@Serializable
+data class RegisterResponse(
+    val message: String,
+    val email: String,
+    @SerialName("verification_required") val verificationRequired: Boolean = true,
+    @SerialName("expires_in_minutes") val expiresInMinutes: Int = 15,
+    @SerialName("dev_verification_code") val devVerificationCode: String? = null,
+)
+
+@Serializable
+data class VerifyEmailRequest(
+    val email: String,
+    val code: String,
+)
+
+@Serializable
+data class ResendVerificationRequest(
+    val email: String,
+)
+
+@Serializable
+data class ForgotPasswordRequest(
+    val email: String,
+)
+
+@Serializable
+data class ForgotPasswordResponse(
+    val message: String,
+    @SerialName("expires_in_minutes") val expiresInMinutes: Int = 15,
+    @SerialName("dev_reset_code") val devResetCode: String? = null,
+)
+
+@Serializable
+data class ResetPasswordRequest(
+    val email: String,
+    val code: String,
+    @SerialName("new_password") val newPassword: String,
+)
+
+@Serializable
+data class ChangePasswordRequest(
+    @SerialName("current_password") val currentPassword: String,
+    @SerialName("new_password") val newPassword: String,
 )
 
 @Serializable

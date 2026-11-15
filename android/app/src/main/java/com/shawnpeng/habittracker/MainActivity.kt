@@ -18,6 +18,7 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Insights
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Today
@@ -53,6 +54,7 @@ import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.ui.HabitUiState
 import com.shawnpeng.habittracker.ui.HabitViewModel
 import com.shawnpeng.habittracker.ui.HabitViewModelFactory
+import com.shawnpeng.habittracker.ui.components.ChangePasswordDialog
 import com.shawnpeng.habittracker.ui.components.HabitFormDialog
 import com.shawnpeng.habittracker.ui.screens.AuthScreen
 import com.shawnpeng.habittracker.ui.screens.HabitsScreen
@@ -79,8 +81,16 @@ class MainActivity : ComponentActivity() {
                         initialServerUrl = uiState.serverUrl,
                         isSubmitting = uiState.isAuthSubmitting,
                         errorMessage = uiState.authError,
+                        infoMessage = uiState.authInfoMessage,
+                        pendingVerificationEmail = uiState.pendingVerificationEmail,
+                        resetCodeSentEmail = uiState.resetCodeSentEmail,
                         onLogin = vm::login,
                         onRegister = vm::register,
+                        onVerifyEmail = vm::verifyRegistrationEmail,
+                        onResendVerification = vm::resendVerificationCode,
+                        onClearFeedback = vm::clearAuthFeedback,
+                        onRequestPasswordReset = vm::requestPasswordReset,
+                        onConfirmPasswordReset = vm::confirmPasswordReset,
                     )
                     else -> MainShell(uiState = uiState, vm = vm)
                 }
@@ -166,6 +176,12 @@ private fun MainShell(
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
                                 contentDescription = "刷新",
+                            )
+                        }
+                        IconButton(onClick = vm::openChangePasswordDialog) {
+                            Icon(
+                                imageVector = Icons.Rounded.Lock,
+                                contentDescription = "修改密码",
                             )
                         }
                         IconButton(onClick = vm::logout) {
@@ -295,6 +311,15 @@ private fun MainShell(
                 showCreateDialog = false
                 editingHabit = null
             },
+        )
+    }
+
+    if (uiState.showChangePasswordDialog) {
+        ChangePasswordDialog(
+            isSubmitting = uiState.isChangingPassword,
+            errorMessage = uiState.changePasswordError,
+            onDismiss = vm::dismissChangePasswordDialog,
+            onSubmit = vm::changePassword,
         )
     }
 }
