@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       ios_target:
-        description: "iPhone build mode (ipa-unsigned outputs sideloadable .ipa for SideStore/AltStore/Sideloadly; ios-simulator builds macOS Simulator .app; ipa-signed uses IOS_TEAM_ID)"
+        description: "iPhone build mode (default: ipa-unsigned sideloadable .ipa for SideStore/AltStore/Sideloadly)"
         required: false
         default: "ipa-unsigned"
         type: choice
@@ -16,8 +16,18 @@ on:
           - ipa-unsigned
           - ios-simulator
           - ipa-signed
-      ios_only:
-        description: "Only build the iPhone artifact (skip macOS desktop, Web, and Android builds for faster IPA turnaround)"
+      include_macos:
+        description: "Also build macOS desktop .app bundle"
+        required: false
+        default: false
+        type: boolean
+      include_web_and_flet_apk:
+        description: "Also build Flet static Web bundle and Flet Android .apk"
+        required: false
+        default: false
+        type: boolean
+      include_native_android:
+        description: "Also build Native Android APK on manual dispatch"
         required: false
         default: false
         type: boolean
@@ -55,7 +65,7 @@ jobs:
     name: Build Native Android App (Kotlin & Compose APK)
     runs-on: ubuntu-latest
     needs: backend-tests
-    if: github.event_name != 'workflow_dispatch' || !inputs.ios_only
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.include_native_android == true || inputs.include_native_android == 'true' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -87,7 +97,7 @@ jobs:
     name: Build Web & Android (.apk)
     runs-on: ubuntu-latest
     needs: backend-tests
-    if: github.event_name == 'workflow_dispatch' && !inputs.ios_only
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.include_web_and_flet_apk == true || inputs.include_web_and_flet_apk == 'true') }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -131,10 +141,9 @@ jobs:
           if-no-files-found: error
 
   build-macos-and-ios:
-    name: Build macOS (.app) & iPhone (iOS)
+    name: Build iPhone IPA (iOS) & Optional macOS
     runs-on: macos-latest
     needs: backend-tests
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -161,7 +170,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build macOS Desktop App (.app)
-        if: ${{ !inputs.ios_only }}
+        if: ${{ inputs.include_macos == true || inputs.include_macos == 'true' }}
         working-directory: frontend
         run: |
           flet build macos --yes --verbose
@@ -220,7 +229,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload macOS & iOS Simulator Bundles
-        if: ${{ !inputs.ios_only || inputs.ios_target == 'ios-simulator' }}
+        if: ${{ inputs.include_macos == true || inputs.include_macos == 'true' || inputs.ios_target == 'ios-simulator' }}
         uses: actions/upload-artifact@v4
         with:
           name: apple-macos-and-simulator-builds

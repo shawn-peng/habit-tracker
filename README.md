@@ -80,15 +80,15 @@ When signing in from an iPhone or Android device on the same Wi-Fi network, set 
 - **macOS `.app` (on a Mac):** `flet build macos`
 - **iPhone `.ipa` (on a Mac):** `flet build ipa`
 
-### Cloud Builds for Mac & iPhone (from Windows)
-Push to `https://github.com/shawn-peng/habit-tracker` and trigger the **Build Cross-Platform Clients & Test Backend** workflow under the GitHub **Actions** tab (`workflow_dispatch`) to compile iOS, macOS, Android, and Web artifacts on GitHub-hosted `macos-latest` and `ubuntu-latest` runners.
+### Cloud Builds for iPhone & Mac (from Windows)
+Every `push` or `pull_request` on `main` (as well as manual `workflow_dispatch` runs under the GitHub **Actions** tab) automatically runs **`build-macos-and-ios`** with **`ipa-unsigned`** as the default target to compile `HabitTracker-iOS-Unsigned.ipa` and upload the **`ios-ipa`** artifact.
 
-When dispatching the workflow manually:
+When dispatching the **Build Cross-Platform Clients & Test Backend** workflow manually (`workflow_dispatch`):
 - **`ios_target`:**
-  - **`ipa-unsigned`** *(default)* — Compiles an unsigned iOS archive and packages `Payload/<App>.app` into a sideload-ready `HabitTracker-iOS-Unsigned.ipa`, uploaded as the **`ios-ipa`** artifact (no paid Apple Developer account or certificates required).
+  - **`ipa-unsigned`** *(default)* — Compiles an unsigned iOS archive and packages `Payload/<App>.app` into a sideload-ready `HabitTracker-iOS-Unsigned.ipa`, uploaded as **`ios-ipa`** (no paid Apple Developer account or certificates required).
   - **`ios-simulator`** — Builds an unsigned `.app` bundle for the macOS iOS Simulator.
   - **`ipa-signed`** — Builds a signed `.ipa` using your `IOS_TEAM_ID` GitHub repository secret (and configured signing credentials).
-- **`ios_only`:** Check this option to skip the macOS desktop, Web, and Android builds when you only want a faster iPhone `.ipa` build.
+- **Optional extra targets** (unchecked by default for fast iOS IPA builds): **`include_macos`**, **`include_web_and_flet_apk`**, and **`include_native_android`**.
 
 #### Personal iPhone Sideloading from Windows (Free Apple ID)
 To install `HabitTracker-iOS-Unsigned.ipa` onto your own iPhone without publishing to the App Store (free Apple ID certificates remain valid for **7 days** and allow up to **3** sideloaded apps per device):
