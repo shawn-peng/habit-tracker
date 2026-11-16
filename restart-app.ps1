@@ -349,7 +349,7 @@ $actualFrontendPort = $FrontendPort
 
 if ($Mode -ne "backend-only") {
     $env:FLET_CLI_NO_RICH_OUTPUT = "1"
-    $env:HABIT_API_URL = "http://localhost:$BackendPort"
+    $env:HABIT_API_URL = "http://127.0.0.1:$BackendPort"
     Remove-Item -Path $FrontendOutLog, $FrontendErrLog -Force -ErrorAction SilentlyContinue
 
     if ($Mode -eq "web") {

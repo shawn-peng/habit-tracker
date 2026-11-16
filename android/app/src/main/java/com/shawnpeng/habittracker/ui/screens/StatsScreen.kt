@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.shawnpeng.habittracker.data.HABIT_MODE_OPTIONS
 import com.shawnpeng.habittracker.data.StatsSummary
 import com.shawnpeng.habittracker.data.parseHabitColor
 
@@ -74,7 +75,11 @@ fun StatsScreen(summary: StatsSummary?) {
                     modifier = Modifier.weight(1f),
                 )
                 KpiCard(
-                    title = "今日达成",
+                    title = if (stats.lateToday > 0 || stats.violatedToday > 0) {
+                        "今日达成 · 补卡${stats.lateToday}/违规${stats.violatedToday}"
+                    } else {
+                        "今日达成"
+                    },
                     value = "${stats.completedToday}/${stats.scheduledToday}",
                     icon = Icons.Rounded.CheckCircleOutline,
                     accent = MaterialTheme.colorScheme.primary,
@@ -131,7 +136,11 @@ fun StatsScreen(summary: StatsSummary?) {
                                     verticalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
                                     Text(
-                                        text = "${point.completedCount}/${point.scheduledCount}",
+                                        text = if (point.lateCount > 0) {
+                                            "${point.completedCount}/${point.scheduledCount}+${point.lateCount}补"
+                                        } else {
+                                            "${point.completedCount}/${point.scheduledCount}"
+                                        },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
@@ -224,8 +233,18 @@ fun StatsScreen(summary: StatsSummary?) {
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
+                                val modeTag = if (hs.mode != "free") {
+                                    (HABIT_MODE_OPTIONS.firstOrNull { it.key == hs.mode }?.shortLabel ?: hs.mode) + " · "
+                                } else {
+                                    ""
+                                }
+                                val lateTag = if (hs.lateCompletions > 0) {
+                                    " · 补卡 ${hs.lateCompletions} 次"
+                                } else {
+                                    ""
+                                }
                                 Text(
-                                    text = "30天完成率 ${hs.completionRate30d}% · 累计 ${hs.totalCompletions} 次",
+                                    text = "${modeTag}30天完成率 ${hs.completionRate30d}% · 准时 ${hs.totalCompletions} 次$lateTag",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )

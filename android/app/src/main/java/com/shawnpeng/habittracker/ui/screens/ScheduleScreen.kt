@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.DoneAll
+import androidx.compose.material.icons.rounded.PlayCircleOutline
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.Schedule
@@ -59,12 +60,16 @@ import com.shawnpeng.habittracker.data.PeriodSchedule
 import com.shawnpeng.habittracker.data.ScheduleDay
 import com.shawnpeng.habittracker.data.ScheduleHabitItem
 import com.shawnpeng.habittracker.data.formatFrequencySummary
+import com.shawnpeng.habittracker.data.formatHabitModeSummary
+import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.parseHabitColor
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 private val StatusDoneGreen = Color(0xFF15803D)
+private val StatusLateAmber = Color(0xFFB45309)
 private val StatusTodayBlue = Color(0xFF1D4ED8)
 private val StatusOverdueRed = Color(0xFFB91C1C)
 
@@ -497,6 +502,24 @@ private fun ScheduleHabitSummaryCard(summary: HabitPeriodSummary) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                val summaryReminderBadge = formatReminderBadge(
+                    enabled = summary.reminderEnabled,
+                    times = summary.reminderTimes,
+                    mode = summary.reminderMode,
+                )
+                if (summaryReminderBadge != null) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                    ) {
+                        Text(
+                            text = summaryReminderBadge,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
+                }
                 if (summary.description.isNotBlank()) {
                     Text(
                         text = summary.description,
@@ -636,12 +659,26 @@ private fun ScheduleDayHabitRow(
     onDecrementCheckin: () -> Unit,
 ) {
     val habitColor = parseHabitColor(item.color)
+    val nowTime = LocalTime.now()
+    val nowHhmm = "${nowTime.hour.toString().padStart(2, '0')}:${nowTime.minute.toString().padStart(2, '0')}"
+    val todayIso = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
+    val needsStrictStart = item.mode == "strict" &&
+        item.date == todayIso &&
+        !item.completed &&
+        !item.startedOnTime &&
+        (item.forceStartTime == null || nowHhmm <= item.forceStartTime)
+    val modeSummary = formatHabitModeSummary(
+        mode = item.mode,
+        remindTime = item.remindTime,
+        forceStartTime = item.forceStartTime,
+        forceEndTime = item.forceEndTime,
+    )
     val (statusLabel, statusBg, statusFg) = when (item.status) {
-        "completed" -> Triple(
-            "已完成",
-            StatusDoneGreen.copy(alpha = 0.14f),
-            StatusDoneGreen,
-        )
+        "completed" -> if (item.isLate) {
+            Triple("超时补卡", StatusLateAmber.copy(alpha = 0.14f), StatusLateAmber)
+        } else {
+            Triple("已完成", StatusDoneGreen.copy(alpha = 0.14f), StatusDoneGreen)
+        }
         "overdue" -> Triple(
             "漏卡",
             StatusOverdueRed.copy(alpha = 0.14f),
@@ -708,9 +745,13 @@ private fun ScheduleDayHabitRow(
                     )
                 }
             }
-            if (item.targetPerDay > 1 || item.note.isNotBlank()) {
+            if (modeSummary != null || item.targetPerDay > 1 || item.note.isNotBlank()) {
                 val detail = buildString {
+                    if (modeSummary != null) {
+                        append(modeSummary)
+                    }
                     if (item.targetPerDay > 1) {
+                        if (isNotEmpty()) append(" · ")
                         append("进度 ${item.count}/${item.targetPerDay}")
                     }
                     if (item.note.isNotBlank()) {
@@ -725,6 +766,24 @@ private fun ScheduleDayHabitRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
+            val itemReminderBadge = formatReminderBadge(
+                enabled = item.reminderEnabled,
+                times = item.reminderTimes,
+                mode = item.reminderMode,
+            )
+            if (itemReminderBadge != null) {
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                ) {
+                    Text(
+                        text = itemReminderBadge,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
             }
         }
         Spacer(modifier = Modifier.width(6.dp))
@@ -751,16 +810,25 @@ private fun ScheduleDayHabitRow(
                     )
                 }
             }
-        } else if (item.targetPerDay <= 1) {
+        } else if (needsStrictStart || item.targetPerDay <= 1) {
             IconButton(onClick = onPrimaryCheckin) {
                 Icon(
-                    imageVector = if (item.completed) {
-                        Icons.Rounded.CheckCircle
-                    } else {
-                        Icons.Rounded.RadioButtonUnchecked
+                    imageVector = when {
+                        needsStrictStart -> Icons.Rounded.PlayCircleOutline
+                        item.completed -> Icons.Rounded.CheckCircle
+                        else -> Icons.Rounded.RadioButtonUnchecked
                     },
-                    contentDescription = if (item.completed) "取消打卡" else "完成打卡",
-                    tint = if (item.completed) habitColor else MaterialTheme.colorScheme.outline,
+                    contentDescription = when {
+                        needsStrictStart -> "开始执行"
+                        item.completed -> "取消打卡"
+                        else -> "完成打卡"
+                    },
+                    tint = when {
+                        needsStrictStart -> MaterialTheme.colorScheme.primary
+                        item.isLate -> StatusLateAmber
+                        item.completed -> habitColor
+                        else -> MaterialTheme.colorScheme.outline
+                    },
                 )
             }
         } else {

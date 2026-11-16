@@ -22,15 +22,21 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.LocalFireDepartment
+import androidx.compose.material.icons.rounded.NotificationsActive
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.SelfImprovement
 import androidx.compose.material.icons.rounded.Today
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -54,9 +60,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.HabitToday
+import com.shawnpeng.habittracker.data.evaluateLocalHabitStatus
 import com.shawnpeng.habittracker.data.formatFrequencySummary
+import com.shawnpeng.habittracker.data.formatHabitModeSummary
+import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.parseHabitColor
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -66,15 +76,29 @@ fun TodayScreen(
     habits: List<HabitToday>,
     onShiftDate: (Long) -> Unit,
     onJumpToday: () -> Unit,
+    onStartExecution: (HabitToday) -> Unit,
     onPrimaryCheckin: (HabitToday) -> Unit,
     onDecrementCheckin: (HabitToday) -> Unit,
     onUpdateNote: (HabitToday, String) -> Unit,
 ) {
-    val isToday = selectedDate == LocalDate.now()
+    val todayDate = LocalDate.now()
+    val todayIso = todayDate.format(DateTimeFormatter.ISO_LOCAL_DATE)
+    val selectedIso = selectedDate.format(DateTimeFormatter.ISO_LOCAL_DATE)
+    val nowTime = LocalTime.now()
+    val nowHhmm = "${nowTime.hour.toString().padStart(2, '0')}:${nowTime.minute.toString().padStart(2, '0')}"
+
+    val isToday = selectedDate == todayDate
     val scheduledItems = remember(habits) { habits.filter { it.scheduledToday } }
     val extraItems = remember(habits) { habits.filter { !it.scheduledToday } }
 
-    val doneCount = scheduledItems.count { it.completed }
+    val evalById = remember(scheduledItems, selectedIso, todayIso, nowHhmm) {
+        scheduledItems.associate { it.id to evaluateLocalHabitStatus(it, selectedIso, todayIso, nowHhmm) }
+    }
+    val doneCount = scheduledItems.count { evalById[it.id]?.dayStatus == "on_time" }
+    val lateCount = scheduledItems.count { evalById[it.id]?.dayStatus == "late_makeup" }
+    val violationCount = scheduledItems.count { evalById[it.id]?.dayStatus == "violation" }
+    val remindingTitles = scheduledItems.filter { evalById[it.id]?.dayStatus == "reminding" }.map { it.title }
+    val violatedTitles = scheduledItems.filter { evalById[it.id]?.dayStatus == "violation" }.map { it.title }
     val totalScheduled = scheduledItems.size
     val progressFraction = if (totalScheduled > 0) doneCount.toFloat() / totalScheduled.toFloat() else 0f
 
@@ -176,6 +200,97 @@ fun TodayScreen(
                         trackColor = MaterialTheme.colorScheme.surface,
                         strokeCap = StrokeCap.Round,
                     )
+
+                    if (lateCount > 0 || violationCount > 0) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (lateCount > 0) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = Color(0xFFFEF3C7),
+                                ) {
+                                    Text(
+                                        text = "超时补卡 $lateCount 项（单独统计）",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFFB45309),
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                    )
+                                }
+                            }
+                            if (violationCount > 0) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.errorContainer,
+                                ) {
+                                    Text(
+                                        text = "超时违规 $violationCount 项",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (violatedTitles.isNotEmpty() || remindingTitles.isNotEmpty()) {
+            item {
+                val hasViolation = violatedTitles.isNotEmpty()
+                val bannerText = buildList {
+                    if (violatedTitles.isNotEmpty()) {
+                        add("⚠️ 超时违规（支持补卡）：${violatedTitles.take(3).joinToString("、")}")
+                    }
+                    if (remindingTitles.isNotEmpty()) {
+                        add("🔔 正在提醒：${remindingTitles.take(3).joinToString("、")}")
+                    }
+                }.joinToString("\n")
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (hasViolation) {
+                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                        } else {
+                            Color(0xFFFEF3C7)
+                        },
+                    ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (hasViolation) {
+                                Icons.Rounded.WarningAmber
+                            } else {
+                                Icons.Rounded.NotificationsActive
+                            },
+                            contentDescription = null,
+                            tint = if (hasViolation) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                Color(0xFFD97706)
+                            },
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Text(
+                            text = bannerText,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = if (hasViolation) {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            } else {
+                                Color(0xFF92400E)
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -215,6 +330,9 @@ fun TodayScreen(
             items(scheduledItems, key = { it.id }) { habit ->
                 TodayHabitCard(
                     habit = habit,
+                    todayIso = todayIso,
+                    nowHhmm = nowHhmm,
+                    onStartExecution = { onStartExecution(habit) },
                     onPrimaryCheckin = { onPrimaryCheckin(habit) },
                     onDecrementCheckin = { onDecrementCheckin(habit) },
                     onOpenNote = { noteTargetHabit = habit },
@@ -234,6 +352,9 @@ fun TodayScreen(
                 items(extraItems, key = { "extra_${it.id}" }) { habit ->
                     TodayHabitCard(
                         habit = habit,
+                        todayIso = todayIso,
+                        nowHhmm = nowHhmm,
+                        onStartExecution = { onStartExecution(habit) },
                         onPrimaryCheckin = { onPrimaryCheckin(habit) },
                         onDecrementCheckin = { onDecrementCheckin(habit) },
                         onOpenNote = { noteTargetHabit = habit },
@@ -258,14 +379,37 @@ fun TodayScreen(
 @Composable
 private fun TodayHabitCard(
     habit: HabitToday,
+    todayIso: String,
+    nowHhmm: String,
+    onStartExecution: () -> Unit,
     onPrimaryCheckin: () -> Unit,
     onDecrementCheckin: () -> Unit,
     onOpenNote: () -> Unit,
 ) {
     val accentColor = parseHabitColor(habit.color)
+    val localStatus = evaluateLocalHabitStatus(habit, habit.date, todayIso, nowHhmm)
+    val modeSummary = formatHabitModeSummary(
+        mode = habit.mode,
+        remindTime = habit.remindTime,
+        forceStartTime = habit.forceStartTime,
+        forceEndTime = habit.forceEndTime,
+    )
+    val reminderBadge = formatReminderBadge(
+        enabled = habit.reminderEnabled,
+        times = habit.reminderTimes,
+        mode = habit.reminderMode,
+    )
     val isMonthly = habit.frequencyType == "monthly"
     val streakUnit = if (isMonthly) "月" else "天"
     val subtitleParts = buildList {
+        if (modeSummary != null) {
+            add(modeSummary)
+        }
+        if (localStatus.dayStatus == "in_progress" && !habit.startedAtTime.isNullOrBlank()) {
+            add("已于 ${habit.startedAtTime} 开始")
+        } else if (localStatus.dayStatus == "violation") {
+            add(if (localStatus.violationReason == "missed_start") "未按时开始" else "未按时完成")
+        }
         if (isMonthly) {
             add(
                 formatFrequencySummary(
@@ -289,6 +433,21 @@ private fun TodayHabitCard(
         }
     }
     val subtitleText = if (subtitleParts.isEmpty()) "每日打卡" else subtitleParts.joinToString(" · ")
+
+    val statusChipSpec: Triple<String, Color, Color>? = if (
+        habit.mode != "free" || localStatus.dayStatus == "violation" || localStatus.dayStatus == "late_makeup"
+    ) {
+        when (localStatus.dayStatus) {
+            "reminding" -> Triple("开始提醒中", Color(0xFFDBEAFE), Color(0xFF1D4ED8))
+            "in_progress" -> Triple("执行中", Color(0xFFE0E7FF), Color(0xFF4338CA))
+            "on_time" -> Triple("准时完成", Color(0xFFDCFCE7), Color(0xFF15803D))
+            "violation" -> Triple("超时违规", Color(0xFFFEE2E2), Color(0xFFB91C1C))
+            "late_makeup" -> Triple("超时补卡", Color(0xFFFEF3C7), Color(0xFFB45309))
+            else -> Triple(if (habit.mode == "strict") "待开始" else "待打卡", Color(0xFFF1F5F9), Color(0xFF475569))
+        }
+    } else {
+        null
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -330,6 +489,38 @@ private fun TodayHabitCard(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (statusChipSpec != null || reminderBadge != null) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (statusChipSpec != null) {
+                                val (chipText, chipBg, chipFg) = statusChipSpec
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = chipBg,
+                                ) {
+                                    Text(
+                                        text = chipText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = chipFg,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                            if (reminderBadge != null) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                                ) {
+                                    Text(
+                                        text = reminderBadge,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -385,7 +576,7 @@ private fun TodayHabitCard(
                     )
                 }
 
-                if (habit.targetPerDay > 1 && habit.count > 0) {
+                if (habit.targetPerDay > 1 && habit.count > 0 && !localStatus.canStart) {
                     IconButton(onClick = onDecrementCheckin) {
                         Icon(
                             imageVector = Icons.Rounded.RemoveCircleOutline,
@@ -395,23 +586,67 @@ private fun TodayHabitCard(
                     }
                 }
 
-                IconButton(onClick = onPrimaryCheckin) {
-                    val icon = when {
-                        habit.completed -> Icons.Rounded.CheckCircle
-                        habit.targetPerDay > 1 -> Icons.Rounded.AddCircleOutline
-                        else -> Icons.Rounded.RadioButtonUnchecked
+                when {
+                    localStatus.canStart -> {
+                        FilledTonalButton(
+                            onClick = onStartExecution,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(2.dp))
+                            Text(
+                                text = "开始",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
                     }
-                    val tint: Color = if (habit.completed) {
-                        accentColor
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
+                    localStatus.dayStatus == "violation" -> {
+                        FilledTonalButton(
+                            onClick = onPrimaryCheckin,
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.History,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(2.dp))
+                            Text(
+                                text = "补卡",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
                     }
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = "打卡",
-                        tint = tint,
-                        modifier = Modifier.size(30.dp),
-                    )
+                    else -> {
+                        IconButton(onClick = onPrimaryCheckin) {
+                            val icon = when {
+                                habit.completed -> Icons.Rounded.CheckCircle
+                                habit.targetPerDay > 1 -> Icons.Rounded.AddCircleOutline
+                                else -> Icons.Rounded.RadioButtonUnchecked
+                            }
+                            val tint: Color = when {
+                                localStatus.isLate -> Color(0xFFD97706)
+                                habit.completed -> accentColor
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = "打卡",
+                                tint = tint,
+                                modifier = Modifier.size(30.dp),
+                            )
+                        }
+                    }
                 }
             }
         }

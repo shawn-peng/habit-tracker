@@ -149,11 +149,19 @@ class HabitApiClient(
         )
     }
 
-    suspend fun getTodayHabits(targetDate: String): List<HabitToday> {
+    suspend fun getTodayHabits(
+        targetDate: String,
+        clientToday: String? = null,
+        clientTime: String? = null,
+    ): List<HabitToday> {
         return executeJson(
             method = "GET",
             pathSegments = listOf("api", "habits", "today"),
-            queryParams = mapOf("target_date" to targetDate),
+            queryParams = buildMap {
+                put("target_date", targetDate)
+                if (!clientToday.isNullOrBlank()) put("client_today", clientToday)
+                if (!clientTime.isNullOrBlank()) put("client_time", clientTime)
+            },
         )
     }
 
@@ -163,6 +171,8 @@ class HabitApiClient(
             put("action", request.action)
             request.count?.let { put("count", it) }
             request.note?.let { put("note", it) }
+            if (!request.clientToday.isNullOrBlank()) put("client_today", request.clientToday)
+            if (!request.clientTime.isNullOrBlank()) put("client_time", request.clientTime)
         }.toString()
         return executeJson(
             method = "POST",
@@ -204,22 +214,30 @@ class HabitApiClient(
         )
     }
 
-    suspend fun getStatsSummary(today: String): StatsSummary {
+    suspend fun getStatsSummary(today: String, clientTime: String? = null): StatsSummary {
         return executeJson(
             method = "GET",
             pathSegments = listOf("api", "stats", "summary"),
-            queryParams = mapOf("today" to today),
+            queryParams = buildMap {
+                put("today", today)
+                if (!clientTime.isNullOrBlank()) put("client_time", clientTime)
+            },
         )
     }
 
-    suspend fun getSliDashboard(today: String, windowDays: Int = 30): SliDashboard {
+    suspend fun getSliDashboard(
+        today: String,
+        windowDays: Int = 30,
+        clientTime: String? = null,
+    ): SliDashboard {
         return executeJson(
             method = "GET",
             pathSegments = listOf("api", "stats", "sli"),
-            queryParams = mapOf(
-                "today" to today,
-                "window_days" to windowDays.toString(),
-            ),
+            queryParams = buildMap {
+                put("today", today)
+                put("window_days", windowDays.toString())
+                if (!clientTime.isNullOrBlank()) put("client_time", clientTime)
+            },
         )
     }
 
@@ -235,6 +253,20 @@ class HabitApiClient(
                 put("period", period)
                 anchorDate?.let { put("anchor_date", it) }
                 today?.let { put("today", it) }
+            },
+        )
+    }
+
+    suspend fun getRemindersOverview(
+        targetDate: String,
+        nowTime: String? = null,
+    ): RemindersOverview {
+        return executeJson(
+            method = "GET",
+            pathSegments = listOf("api", "habits", "reminders"),
+            queryParams = buildMap {
+                put("target_date", targetDate)
+                nowTime?.let { put("now_time", it) }
             },
         )
     }

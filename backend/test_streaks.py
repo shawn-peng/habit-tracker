@@ -14,11 +14,13 @@ from app.core import (
     HabitUpdate,
     Settings,
     build_period_schedule,
+    build_reminders_overview,
     build_sli_dashboard,
     compute_30d_completion_rate,
     compute_burn_rate,
     compute_error_budget,
     compute_habit_sli,
+    compute_next_reminder_occurrence,
     compute_period_bounds,
     compute_streaks,
     create_access_token,
@@ -27,6 +29,8 @@ from app.core import (
     hash_password,
     hash_reset_code,
     is_scheduled_on,
+    normalize_reminder_time,
+    normalize_reminder_times,
     scheduled_monthly_day,
     send_password_reset_email,
     send_registration_verification_email,
@@ -1619,3 +1623,231 @@ def test_send_registration_verification_email_dev_log_and_smtp_mock(monkeypatch,
             )
         )
     assert exc_info.value.status_code == 502
+
+
+def test_normalize_reminder_times_valid_and_invalid():
+    assert normalize_reminder_time("8:05") == "08:05"
+    assert normalize_reminder_time(" 23:59 ") == "23:59"
+    assert normalize_reminder_times(["21:00", "7:30", "07:30", "12:15"]) == [
+        "07:30",
+        "12:15",
+        "21:00",
+    ]
+
+    for bad in ("24:00", "08:60", "invalid", "0800", "-1:00"):
+        with pytest.raises(ValueError):
+            normalize_reminder_time(bad)
+
+    too_many = [f"{h:02d}:00" for h in range(13)]
+    with pytest.raises(ValueError):
+        normalize_reminder_times(too_many)
+
+
+def test_habit_create_and_update_reminder_validation_and_legacy_defaults():
+    # Enabled reminders must specify at least one time
+    with pytest.raises(ValidationError):
+        HabitCreate(title="Meditate", reminder_enabled=True, reminder_times=[])
+
+    created = HabitCreate(
+        title="Morning Alarm",
+        reminder_enabled=True,
+        reminder_times=["7:05", "20:00", "07:05"],
+        reminder_mode="alarm",
+        reminder_snooze_minutes=15,
+        reminder_message="  Get moving!  ",
+    )
+    assert created.reminder_enabled is True
+    assert created.reminder_times == ["07:05", "20:00"]
+    assert created.reminder_mode == "alarm"
+    assert created.reminder_snooze_minutes == 15
+    assert created.reminder_message == "Get moving!"
+
+    with pytest.raises(ValidationError):
+        HabitUpdate(reminder_enabled=True, reminder_times=[])
+    with pytest.raises(ValidationError):
+        HabitUpdate(reminder_mode="siren")
+    with pytest.raises(ValidationError):
+        HabitUpdate(reminder_snooze_minutes=0)
+
+    upd = HabitUpdate(reminder_times=["6:30"])
+    assert upd.reminder_times == ["06:30"]
+
+    # Legacy document without reminder fields serializes cleanly
+    legacy_doc = {
+        "_id": ObjectId(),
+        "title": "Legacy Habit",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+    serialized = _serialize_habit(legacy_doc)
+    assert serialized.reminder_enabled is False
+    assert serialized.reminder_times == []
+    assert serialized.reminder_mode == "notification"
+    assert serialized.reminder_snooze_minutes == 10
+    assert serialized.reminder_message == ""
+
+
+def test_compute_next_reminder_occurrence_daily_weekly_monthly():
+    daily_alarm = {
+        "_id": "h_daily",
+        "title": "Hydrate",
+        "frequency_type": "daily",
+        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+        "reminder_enabled": True,
+        "reminder_times": ["08:00", "20:00"],
+        "reminder_mode": "alarm",
+    }
+    # Same day with time remaining before 20:00
+    assert compute_next_reminder_occurrence(
+        daily_alarm, date(2026, 11, 16), now_hhmm="09:00", completed_today=False
+    ) == ("2026-11-16", "20:00")
+    # Same day past all times rolls to tomorrow 08:00
+    assert compute_next_reminder_occurrence(
+        daily_alarm, date(2026, 11, 16), now_hhmm="21:30", completed_today=False
+    ) == ("2026-11-17", "08:00")
+    # Completed today skips today even before 08:00
+    assert compute_next_reminder_occurrence(
+        daily_alarm, date(2026, 11, 16), now_hhmm="07:00", completed_today=True
+    ) == ("2026-11-17", "08:00")
+
+    # Weekday habit: Mon (0) and Wed (2); on Tuesday Nov 17 -> next is Wed Nov 18
+    weekday_habit = {
+        "_id": "h_wk",
+        "title": "Run",
+        "frequency_type": "weekdays",
+        "weekdays": [0, 2],
+        "reminder_enabled": True,
+        "reminder_times": ["18:30"],
+    }
+    assert compute_next_reminder_occurrence(
+        weekday_habit, date(2026, 11, 17), now_hhmm="08:00", completed_today=False
+    ) == ("2026-11-18", "18:30")
+
+    # Monthly 15th: on Nov 16 -> rolls to Dec 15
+    monthly_habit = {
+        "_id": "h_mo",
+        "title": "Pay Rent",
+        "frequency_type": "monthly",
+        "monthly_mode": "from_start",
+        "monthly_day": 15,
+        "reminder_enabled": True,
+        "reminder_times": ["09:00"],
+    }
+    assert compute_next_reminder_occurrence(
+        monthly_habit, date(2026, 11, 16), now_hhmm="08:00", completed_today=False
+    ) == ("2026-12-15", "09:00")
+
+
+def test_reminders_crud_schedule_and_overview_endpoint():
+    user_oid = ObjectId()
+    user_id = str(user_oid)
+    fake_db = _FakeDb()
+
+    app.dependency_overrides[get_db] = lambda: fake_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+    try:
+        client = TestClient(app)
+
+        # Create notification habit and alarm habit
+        r1 = client.post(
+            "/api/habits",
+            json={
+                "title": "Take Vitamins",
+                "frequency_type": "daily",
+                "reminder_enabled": True,
+                "reminder_times": ["8:30", "21:00"],
+                "reminder_mode": "notification",
+                "reminder_snooze_minutes": 10,
+                "reminder_message": "With water",
+            },
+        )
+        assert r1.status_code == 201
+        h1 = r1.json()
+        assert h1["reminder_enabled"] is True
+        assert h1["reminder_times"] == ["08:30", "21:00"]
+        assert h1["reminder_mode"] == "notification"
+
+        r2 = client.post(
+            "/api/habits",
+            json={
+                "title": "Stretch",
+                "frequency_type": "weekdays",
+                "weekdays": [0, 2, 4],  # Mon, Wed, Fri
+                "reminder_enabled": True,
+                "reminder_times": ["7:00"],
+                "reminder_mode": "alarm",
+                "reminder_snooze_minutes": 5,
+                "reminder_message": "Wake up!",
+            },
+        )
+        assert r2.status_code == 201
+        h2 = r2.json()
+        assert h2["reminder_mode"] == "alarm"
+        assert h2["reminder_times"] == ["07:00"]
+        assert h2["reminder_snooze_minutes"] == 5
+
+        # Partial PATCH without reminder fields must keep existing alarm settings
+        patch_title = client.patch(
+            f"/api/habits/{h2['id']}",
+            json={"title": "Morning Stretch"},
+        )
+        assert patch_title.status_code == 200
+        assert patch_title.json()["reminder_enabled"] is True
+        assert patch_title.json()["reminder_times"] == ["07:00"]
+        assert patch_title.json()["reminder_mode"] == "alarm"
+
+        # Enabling reminders on a legacy/unconfigured habit without times returns 422
+        r3 = client.post("/api/habits", json={"title": "No Times Yet"})
+        assert r3.status_code == 201
+        h3 = r3.json()
+        bad_enable = client.patch(
+            f"/api/habits/{h3['id']}",
+            json={"reminder_enabled": True},
+        )
+        assert bad_enable.status_code == 422
+
+        # Verify today & schedule endpoints carry reminder metadata
+        today_resp = client.get("/api/habits/today?target_date=2026-11-16")
+        assert today_resp.status_code == 200
+        today_by_id = {it["id"]: it for it in today_resp.json()}
+        assert today_by_id[h2["id"]]["reminder_mode"] == "alarm"
+        assert today_by_id[h2["id"]]["reminder_times"] == ["07:00"]
+
+        sched_resp = client.get(
+            "/api/habits/schedule?period=week&anchor_date=2026-11-16&today=2026-11-16"
+        )
+        assert sched_resp.status_code == 200
+        sched_summaries = {s["habit_id"]: s for s in sched_resp.json()["habit_summaries"]}
+        assert sched_summaries[h1["id"]]["reminder_enabled"] is True
+        assert sched_summaries[h1["id"]]["reminder_times"] == ["08:30", "21:00"]
+
+        # Verify /api/habits/reminders at 2026-11-16 (Monday) 09:00
+        ov_resp = client.get(
+            "/api/habits/reminders?target_date=2026-11-16&now_time=9:00"
+        )
+        assert ov_resp.status_code == 200
+        ov = ov_resp.json()
+        assert ov["now_time"] == "09:00"
+        assert ov["enabled_habits_count"] == 2
+        assert ov["alarm_habits_count"] == 1
+        assert ov["notification_habits_count"] == 1
+        assert ov["scheduled_today_count"] == 2
+        assert ov["pending_today_triggers"] == 1
+        by_hid = {it["habit_id"]: it for it in ov["items"]}
+        # Take Vitamins has 21:00 left today
+        assert by_hid[h1["id"]]["next_trigger_date"] == "2026-11-16"
+        assert by_hid[h1["id"]]["next_trigger_time"] == "21:00"
+        assert by_hid[h1["id"]]["due_today_times"] == ["21:00"]
+        # Morning Stretch (07:00 on Mon/Wed/Fri) already passed 09:00 -> Wed 2026-11-18
+        assert by_hid[h2["id"]]["next_trigger_date"] == "2026-11-18"
+        assert by_hid[h2["id"]]["next_trigger_time"] == "07:00"
+
+        # Invalid now_time returns 400
+        bad_time = client.get("/api/habits/reminders?now_time=99:99")
+        assert bad_time.status_code == 400
+    finally:
+        app.dependency_overrides.clear()

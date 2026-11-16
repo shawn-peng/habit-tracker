@@ -26,6 +26,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +44,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.formatFrequencySummary
+import com.shawnpeng.habittracker.data.formatHabitModeSummary
+import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.parseHabitColor
 
 @Composable
@@ -167,6 +170,13 @@ private fun ManageHabitCard(
     onDeleteRequest: () -> Unit,
 ) {
     val accentColor = parseHabitColor(habit.color)
+    val modeSummary = formatHabitModeSummary(
+        mode = habit.mode,
+        remindTime = habit.remindTime,
+        forceStartTime = habit.forceStartTime,
+        forceEndTime = habit.forceEndTime,
+    )
+    val reminderBadge = formatReminderBadge(habit)
     val freqText = formatFrequencySummary(
         frequencyType = habit.frequencyType,
         weekdays = habit.weekdays,
@@ -216,6 +226,32 @@ private fun ManageHabitCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    if (modeSummary != null) {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                        ) {
+                            Text(
+                                text = modeSummary,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
+                    if (reminderBadge != null) {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                        ) {
+                            Text(
+                                text = reminderBadge,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                    }
                     if (habit.description.isNotBlank()) {
                         Text(
                             text = habit.description,

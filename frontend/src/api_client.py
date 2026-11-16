@@ -1,14 +1,37 @@
+import asyncio
+from datetime import date, datetime
 import os
+import sys
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 import flet as ft
 import httpx
 
 STORAGE_TOKEN_KEY = "habit_tracker_jwt"
 STORAGE_API_URL_KEY = "habit_tracker_api_url"
+STORAGE_REMINDERS_MUTED_KEY = "habit_tracker_reminders_muted"
 DEFAULT_API_URL = os.getenv(
     "HABIT_API_URL",
     "https://habit-tracker-api-142205380680.us-central1.run.app",
 )
+
+
+def _resolve_transport_base_url(base_url: str) -> str:
+    """Map http://localhost to 127.0.0.1 off-browser to avoid Windows IPv6 fallback delays."""
+    if sys.platform == "emscripten":
+        return base_url
+    parsed = urlsplit(base_url)
+    if parsed.scheme.lower() != "http" or (parsed.hostname or "").lower() != "localhost":
+        return base_url
+    netloc = "127.0.0.1"
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username is not None:
+        auth = parsed.username
+        if parsed.password is not None:
+            auth = f"{auth}:{parsed.password}"
+        netloc = f"{auth}@{netloc}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 class ApiError(Exception):
@@ -73,6 +96,34 @@ class HabitApiClient:
         self.base_url: str = DEFAULT_API_URL.rstrip("/")
         self.token: str | None = None
         self.current_user: dict[str, Any] | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return a pooled AsyncClient bound to the active event loop."""
+        loop = asyncio.get_running_loop()
+        if (
+            self._client is None
+            or self._client.is_closed
+            or self._client_loop is not loop
+        ):
+            self._client = httpx.AsyncClient(timeout=12.0)
+            self._client_loop = loop
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client when bound to the current event loop."""
+        client = self._client
+        client_loop = self._client_loop
+        self._client = None
+        self._client_loop = None
+        if client is not None and not client.is_closed:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if client_loop is None or client_loop is running_loop:
+                await client.aclose()
 
     async def initialize(self) -> bool:
         saved_url = await self.storage.get(STORAGE_API_URL_KEY)
@@ -108,16 +159,17 @@ class HabitApiClient:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
-        url = f"{self.base_url}{path}"
+        transport_base = _resolve_transport_base_url(self.base_url).rstrip("/")
+        url = f"{transport_base}{path}"
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                resp = await client.request(
-                    method=method,
-                    url=url,
-                    json=json_body,
-                    params=params,
-                    headers=headers,
-                )
+            client = self._get_client()
+            resp = await client.request(
+                method=method,
+                url=url,
+                json=json_body,
+                params=params,
+                headers=headers,
+            )
         except Exception as exc:
             raise ApiError(
                 f"Cannot reach server at {self.base_url} ({exc})"
@@ -218,9 +270,21 @@ class HabitApiClient:
         self.current_user = None
         await self.storage.remove(STORAGE_TOKEN_KEY)
 
-    async def get_today_habits(self, target_date: str) -> list[dict[str, Any]]:
+    async def get_today_habits(
+        self,
+        target_date: str,
+        client_today: str | None = None,
+        client_time: str | None = None,
+    ) -> list[dict[str, Any]]:
+        now_dt = datetime.now()
         return await self._request(
-            "GET", "/api/habits/today", params={"target_date": target_date}
+            "GET",
+            "/api/habits/today",
+            params={
+                "target_date": target_date,
+                "client_today": client_today or now_dt.date().isoformat(),
+                "client_time": client_time or now_dt.strftime("%H:%M"),
+            },
         )
 
     async def get_period_schedule(
@@ -260,27 +324,57 @@ class HabitApiClient:
         target_date: str,
         action: str = "increment",
         count: int | None = None,
+        note: str | None = None,
+        client_today: str | None = None,
+        client_time: str | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"date": target_date, "action": action}
+        now_dt = datetime.now()
+        body: dict[str, Any] = {
+            "date": target_date,
+            "action": action,
+            "client_today": client_today or now_dt.date().isoformat(),
+            "client_time": client_time or now_dt.strftime("%H:%M"),
+        }
         if count is not None:
             body["count"] = count
+        if note is not None:
+            body["note"] = note
         return await self._request(
             "POST", f"/api/habits/{habit_id}/checkin", json_body=body
         )
 
-    async def get_stats_summary(self, today: str) -> dict[str, Any]:
+    async def get_stats_summary(
+        self, today: str, client_time: str | None = None
+    ) -> dict[str, Any]:
         return await self._request(
-            "GET", "/api/stats/summary", params={"today": today}
+            "GET",
+            "/api/stats/summary",
+            params={
+                "today": today,
+                "client_time": client_time or datetime.now().strftime("%H:%M"),
+            },
         )
 
     async def get_sli_dashboard(
-        self, today: str, window_days: int = 30
+        self, today: str, window_days: int = 30, client_time: str | None = None
     ) -> dict[str, Any]:
         return await self._request(
             "GET",
             "/api/stats/sli",
-            params={"today": today, "window_days": window_days},
+            params={
+                "today": today,
+                "window_days": window_days,
+                "client_time": client_time or datetime.now().strftime("%H:%M"),
+            },
         )
+
+    async def get_reminders_overview(
+        self, target_date: str, now_time: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"target_date": target_date}
+        if now_time:
+            params["now_time"] = now_time
+        return await self._request("GET", "/api/habits/reminders", params=params)
 
 
 def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:

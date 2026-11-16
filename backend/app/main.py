@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
@@ -27,6 +28,7 @@ from app.core import (
     RESET_RATE_WINDOW_MINUTES,
     RegisterRequest,
     RegisterResponse,
+    RemindersOverviewOut,
     ResendVerificationRequest,
     ResetPasswordRequest,
     SliDashboardOut,
@@ -35,6 +37,7 @@ from app.core import (
     UserPublic,
     VerifyEmailRequest,
     build_period_schedule,
+    build_reminders_overview,
     build_sli_dashboard,
     compute_30d_completion_rate,
     compute_period_bounds,
@@ -42,6 +45,9 @@ from app.core import (
     create_access_token,
     ensure_indexes,
     ensure_utc,
+    evaluate_habit_day_status,
+    extract_habit_mode_fields,
+    extract_reminder_fields,
     generate_reset_code,
     get_current_user,
     get_db,
@@ -49,9 +55,12 @@ from app.core import (
     hash_reset_code,
     hash_verification_code,
     is_scheduled_on,
+    normalize_reminder_time,
+    resolve_client_clock,
     send_password_reset_email,
     send_registration_verification_email,
     settings,
+    validate_and_normalize_mode_times,
     verify_password,
     verify_reset_code,
     verify_verification_code,
@@ -108,6 +117,16 @@ def _serialize_user(user_doc: dict) -> UserPublic:
 
 
 def _serialize_habit(habit_doc: dict) -> HabitOut:
+    (
+        reminder_enabled,
+        reminder_times,
+        reminder_mode,
+        reminder_snooze_minutes,
+        reminder_message,
+    ) = extract_reminder_fields(habit_doc)
+    mode, remind_time, force_start_time, force_end_time = extract_habit_mode_fields(
+        habit_doc
+    )
     return HabitOut(
         id=str(habit_doc["_id"]),
         title=habit_doc["title"],
@@ -122,6 +141,15 @@ def _serialize_habit(habit_doc: dict) -> HabitOut:
         monthly_weekday=habit_doc.get("monthly_weekday", 0),
         target_per_day=habit_doc.get("target_per_day", 1),
         target_slo=round(float(habit_doc.get("target_slo", 85.0)), 1),
+        mode=mode,
+        remind_time=remind_time,
+        force_start_time=force_start_time,
+        force_end_time=force_end_time,
+        reminder_enabled=reminder_enabled,
+        reminder_times=reminder_times,
+        reminder_mode=reminder_mode,
+        reminder_snooze_minutes=reminder_snooze_minutes,
+        reminder_message=reminder_message,
         archived=habit_doc.get("archived", False),
         created_at=habit_doc["created_at"],
     )
@@ -680,6 +708,15 @@ async def create_habit(
         "monthly_weekday": payload.monthly_weekday,
         "target_per_day": payload.target_per_day,
         "target_slo": round(float(payload.target_slo), 1),
+        "mode": payload.mode,
+        "remind_time": payload.remind_time,
+        "force_start_time": payload.force_start_time,
+        "force_end_time": payload.force_end_time,
+        "reminder_enabled": payload.reminder_enabled,
+        "reminder_times": payload.reminder_times,
+        "reminder_mode": payload.reminder_mode,
+        "reminder_snooze_minutes": payload.reminder_snooze_minutes,
+        "reminder_message": payload.reminder_message,
         "archived": False,
         "created_at": datetime.now(timezone.utc),
     }
@@ -699,6 +736,10 @@ async def update_habit(
         raise HTTPException(status_code=400, detail="Invalid habit ID")
 
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "title" in updates:
+        updates["title"] = updates["title"].strip()
+    if "description" in updates:
+        updates["description"] = updates["description"].strip()
     if "target_slo" in updates:
         updates["target_slo"] = round(float(updates["target_slo"]), 1)
     if updates.get("frequency_type") == "daily":
@@ -706,13 +747,73 @@ async def update_habit(
     elif updates.get("frequency_type") == "monthly" and "weekdays" not in updates:
         updates["weekdays"] = [0, 1, 2, 3, 4, 5, 6]
 
-    if not updates:
+    mode_fields_touched = bool(
+        {"mode", "remind_time", "force_start_time", "force_end_time"}
+        & payload.model_fields_set
+    )
+    needs_existing = (
+        not updates
+        or mode_fields_touched
+        or (updates.get("reminder_enabled") is True and "reminder_times" not in updates)
+        or (
+            "reminder_times" in updates
+            and len(updates["reminder_times"]) == 0
+            and updates.get("reminder_enabled") is not False
+        )
+    )
+    if needs_existing:
         existing = await db.habits.find_one(
             {"_id": ObjectId(habit_id), "user_id": str(current_user["_id"])}
         )
         if not existing:
             raise HTTPException(status_code=404, detail="Habit not found")
-        return _serialize_habit(existing)
+        if not updates and not mode_fields_touched:
+            return _serialize_habit(existing)
+        if (
+            updates.get("reminder_enabled") is True
+            and "reminder_times" not in updates
+            and not existing.get("reminder_times")
+        ) or (
+            "reminder_times" in updates
+            and len(updates["reminder_times"]) == 0
+            and updates.get("reminder_enabled") is not False
+            and existing.get("reminder_enabled", False)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="At least one reminder time (HH:MM) is required when reminders are enabled",
+            )
+        if mode_fields_touched:
+            merged_mode = (
+                payload.mode
+                if "mode" in payload.model_fields_set and payload.mode is not None
+                else existing.get("mode", "free")
+            )
+            merged_remind = (
+                payload.remind_time
+                if "remind_time" in payload.model_fields_set
+                else existing.get("remind_time")
+            )
+            merged_start = (
+                payload.force_start_time
+                if "force_start_time" in payload.model_fields_set
+                else existing.get("force_start_time")
+            )
+            merged_end = (
+                payload.force_end_time
+                if "force_end_time" in payload.model_fields_set
+                else existing.get("force_end_time")
+            )
+            try:
+                norm_remind, norm_start, norm_end = validate_and_normalize_mode_times(
+                    merged_mode, merged_remind, merged_start, merged_end
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            updates["mode"] = merged_mode
+            updates["remind_time"] = norm_remind
+            updates["force_start_time"] = norm_start
+            updates["force_end_time"] = norm_end
 
     res = await db.habits.find_one_and_update(
         {"_id": ObjectId(habit_id), "user_id": str(current_user["_id"])},
@@ -743,11 +844,24 @@ async def delete_habit(
 @app.get("/api/habits/today", response_model=list[HabitTodayOut])
 async def list_habits_for_date(
     target_date: str | None = Query(default=None),
+    client_today: str | None = Query(default=None),
+    client_time: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
     db: AsyncDatabase = Depends(get_db),
 ) -> list[HabitTodayOut]:
-    parsed_date = _parse_iso_date(target_date)
+    try:
+        client_today_date, resolved_time = resolve_client_clock(
+            client_today, client_time
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client_today or client_time format",
+        ) from exc
+
+    parsed_date = _parse_iso_date(target_date) if target_date else client_today_date
     iso_date = parsed_date.isoformat()
+    client_today_iso = client_today_date.isoformat()
     user_id = str(current_user["_id"])
 
     habits = [
@@ -761,38 +875,72 @@ async def list_habits_for_date(
 
     habit_ids = [str(h["_id"]) for h in habits]
 
-    # Fetch check-ins on target_date + all completed dates for streak calculation
-    day_checkins: dict[str, dict] = {}
-    async for chk in db.checkins.find(
-        {"user_id": user_id, "habit_id": {"$in": habit_ids}, "date": iso_date}
-    ):
-        day_checkins[chk["habit_id"]] = chk
+    # Fetch check-ins on target_date + all on-time completed dates concurrently
+    async def _fetch_day_checkins() -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": {"$in": habit_ids}, "date": iso_date}
+        ):
+            result[chk["habit_id"]] = chk
+        return result
 
-    completed_by_habit: dict[str, set[str]] = {hid: set() for hid in habit_ids}
-    async for chk in db.checkins.find(
-        {"user_id": user_id, "habit_id": {"$in": habit_ids}, "completed": True},
-        {"habit_id": 1, "date": 1},
-    ):
-        completed_by_habit[chk["habit_id"]].add(chk["date"])
+    async def _fetch_completed_by_habit() -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {hid: set() for hid in habit_ids}
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": {"$in": habit_ids}, "completed": True},
+            {"_id": 0, "habit_id": 1, "date": 1, "is_late": 1},
+        ):
+            if chk.get("is_late", False):
+                continue
+            result[chk["habit_id"]].add(chk["date"])
+        return result
+
+    day_checkins, completed_by_habit = await asyncio.gather(
+        _fetch_day_checkins(),
+        _fetch_completed_by_habit(),
+    )
 
     results: list[HabitTodayOut] = []
     for h in habits:
         hid = str(h["_id"])
         chk = day_checkins.get(hid)
+        scheduled = is_scheduled_on(h, parsed_date)
+        ev = evaluate_habit_day_status(
+            habit=h,
+            checkin=chk,
+            target_date_str=iso_date,
+            client_today_str=client_today_iso,
+            client_time=resolved_time,
+            scheduled=scheduled,
+        )
+        today_violated = (
+            scheduled
+            and iso_date <= client_today_iso
+            and ev.day_status in ("violation", "late_makeup")
+        )
         curr_streak, best_streak = compute_streaks(
-            h, completed_by_habit[hid], parsed_date
+            h,
+            completed_by_habit[hid],
+            parsed_date,
+            today_violated=today_violated,
         )
         base = _serialize_habit(h)
         results.append(
             HabitTodayOut(
                 **base.model_dump(),
                 date=iso_date,
-                scheduled_today=is_scheduled_on(h, parsed_date),
+                scheduled_today=scheduled,
                 count=chk["count"] if chk else 0,
                 completed=chk["completed"] if chk else False,
                 note=chk.get("note", "") if chk else "",
                 current_streak=curr_streak,
                 best_streak=best_streak,
+                day_status=ev.day_status,
+                violation_reason=ev.violation_reason,
+                started_at_time=ev.started_at_time,
+                started_on_time=ev.started_on_time,
+                is_late=ev.is_late,
+                can_start=ev.can_start,
             )
         )
     return results
@@ -841,6 +989,51 @@ async def get_habits_schedule(
     )
 
 
+@app.get("/api/habits/reminders", response_model=RemindersOverviewOut)
+async def get_habits_reminders(
+    target_date: str | None = Query(default=None),
+    now_time: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncDatabase = Depends(get_db),
+) -> RemindersOverviewOut:
+    parsed_date = _parse_iso_date(target_date)
+    normalized_now: str | None = None
+    if now_time is not None and now_time.strip():
+        try:
+            normalized_now = normalize_reminder_time(now_time)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    user_id = str(current_user["_id"])
+    habits = [
+        doc
+        async for doc in db.habits.find({"user_id": user_id, "archived": False}).sort(
+            "created_at", 1
+        )
+    ]
+    habit_ids = [str(h["_id"]) for h in habits if h.get("reminder_enabled", False)]
+    day_checkins: dict[str, dict] = {}
+    if habit_ids:
+        async for chk in db.checkins.find(
+            {
+                "user_id": user_id,
+                "habit_id": {"$in": habit_ids},
+                "date": parsed_date.isoformat(),
+            }
+        ):
+            day_checkins[chk["habit_id"]] = chk
+
+    return build_reminders_overview(
+        habits=habits,
+        day_checkins=day_checkins,
+        target_date=parsed_date,
+        now_time=normalized_now,
+    )
+
+
 @app.post("/api/habits/{habit_id}/checkin", response_model=HabitTodayOut)
 async def checkin_habit(
     habit_id: str,
@@ -853,30 +1046,127 @@ async def checkin_habit(
 
     parsed_date = _parse_iso_date(payload.date)
     iso_date = parsed_date.isoformat()
+    try:
+        client_today_date, resolved_time = resolve_client_clock(
+            payload.client_today, payload.client_time
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client_today or client_time format",
+        ) from exc
+    client_today_iso = client_today_date.isoformat()
+    if iso_date > client_today_iso:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot check in for a future date",
+        )
+
     user_id = str(current_user["_id"])
 
     habit = await db.habits.find_one({"_id": ObjectId(habit_id), "user_id": user_id})
     if not habit:
         raise HTTPException(status_code=404, detail="Habit not found")
 
+    mode, _, force_start_time, force_end_time = extract_habit_mode_fields(habit)
+    scheduled = is_scheduled_on(habit, parsed_date)
     target = habit.get("target_per_day", 1)
     existing = await db.checkins.find_one(
         {"habit_id": habit_id, "user_id": user_id, "date": iso_date}
     )
     prev_count = existing["count"] if existing else 0
+    prev_completed = bool(existing.get("completed", False)) if existing else prev_count >= target
     prev_note = existing.get("note", "") if existing else ""
+    prev_started_on_time = bool(existing.get("started_on_time", False)) if existing else False
+    prev_started_at_time = existing.get("started_at_time") if existing else None
+    prev_is_late = bool(existing.get("is_late", False)) if existing else False
+    prev_violation_reason = existing.get("violation_reason") if existing else None
 
-    if payload.action == "increment":
-        new_count = prev_count + 1
-    elif payload.action == "decrement":
-        new_count = max(0, prev_count - 1)
-    elif payload.action == "toggle":
-        new_count = 0 if prev_count >= target else target
-    else:  # "set"
-        new_count = payload.count if payload.count is not None else target
-
-    completed = new_count >= target
     note = payload.note if payload.note is not None else prev_note
+
+    if payload.action == "start":
+        if mode != "strict":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="只有模式1（严格管控）需要点击「开始执行」",
+            )
+        if prev_completed or prev_count >= target:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="该习惯今日已完成，无需重复开始执行",
+            )
+        if iso_date != client_today_iso or (
+            force_start_time is not None and resolved_time > force_start_time
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="已超过强制执行时间，当前已违规，请直接点击「超时补卡」",
+            )
+        new_count = prev_count
+        completed = False
+        started_on_time = True
+        started_at_time = prev_started_at_time or resolved_time
+        is_late = False
+        violation_reason = None
+    else:
+        if payload.action == "increment":
+            new_count = prev_count + 1
+        elif payload.action == "decrement":
+            new_count = max(0, prev_count - 1)
+        elif payload.action == "toggle":
+            new_count = 0 if prev_count >= target else target
+        else:  # "set"
+            new_count = payload.count if payload.count is not None else target
+
+        if (
+            mode == "strict"
+            and scheduled
+            and new_count > prev_count
+            and not prev_started_on_time
+            and iso_date == client_today_iso
+            and force_start_time is not None
+            and resolved_time <= force_start_time
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="模式1（严格管控）请先点击「开始执行」，再进行完成打卡",
+            )
+
+        completed = new_count >= target
+        started_on_time = prev_started_on_time
+        started_at_time = prev_started_at_time
+
+        if prev_completed and completed:
+            is_late = prev_is_late
+            violation_reason = prev_violation_reason
+        elif completed:
+            if not scheduled or mode in ("free", "reminder"):
+                is_late = False
+                violation_reason = None
+            elif mode == "window":
+                if iso_date < client_today_iso or (
+                    force_end_time is not None and resolved_time > force_end_time
+                ):
+                    is_late = True
+                    violation_reason = "missed_end"
+                else:
+                    is_late = False
+                    violation_reason = None
+            else:  # mode == "strict"
+                if not prev_started_on_time:
+                    is_late = True
+                    violation_reason = "missed_start"
+                elif iso_date < client_today_iso or (
+                    force_end_time is not None and resolved_time > force_end_time
+                ):
+                    is_late = True
+                    violation_reason = "missed_end"
+                else:
+                    is_late = False
+                    violation_reason = None
+        else:
+            is_late = False
+            violation_reason = None
 
     await db.checkins.update_one(
         {"habit_id": habit_id, "date": iso_date},
@@ -888,6 +1178,10 @@ async def checkin_habit(
                 "count": new_count,
                 "completed": completed,
                 "note": note,
+                "started_on_time": started_on_time,
+                "started_at_time": started_at_time,
+                "is_late": is_late,
+                "violation_reason": violation_reason,
                 "updated_at": datetime.now(timezone.utc),
             }
         },
@@ -897,21 +1191,53 @@ async def checkin_habit(
     completed_dates: set[str] = set()
     async for chk in db.checkins.find(
         {"user_id": user_id, "habit_id": habit_id, "completed": True},
-        {"date": 1},
+        {"_id": 0, "date": 1, "is_late": 1},
     ):
+        if chk.get("is_late", False):
+            continue
         completed_dates.add(chk["date"])
 
-    curr_streak, best_streak = compute_streaks(habit, completed_dates, parsed_date)
+    chk_doc = {
+        "count": new_count,
+        "completed": completed,
+        "note": note,
+        "started_on_time": started_on_time,
+        "started_at_time": started_at_time,
+        "is_late": is_late,
+        "violation_reason": violation_reason,
+    }
+    ev = evaluate_habit_day_status(
+        habit=habit,
+        checkin=chk_doc,
+        target_date_str=iso_date,
+        client_today_str=client_today_iso,
+        client_time=resolved_time,
+        scheduled=scheduled,
+    )
+    today_violated = (
+        scheduled
+        and iso_date <= client_today_iso
+        and ev.day_status in ("violation", "late_makeup")
+    )
+    curr_streak, best_streak = compute_streaks(
+        habit, completed_dates, parsed_date, today_violated=today_violated
+    )
     base = _serialize_habit(habit)
     return HabitTodayOut(
         **base.model_dump(),
         date=iso_date,
-        scheduled_today=is_scheduled_on(habit, parsed_date),
+        scheduled_today=scheduled,
         count=new_count,
         completed=completed,
         note=note,
         current_streak=curr_streak,
         best_streak=best_streak,
+        day_status=ev.day_status,
+        violation_reason=ev.violation_reason,
+        started_at_time=ev.started_at_time,
+        started_on_time=ev.started_on_time,
+        is_late=ev.is_late,
+        can_start=ev.can_start,
     )
 
 
@@ -921,10 +1247,22 @@ async def checkin_habit(
 @app.get("/api/stats/summary", response_model=StatsSummaryOut)
 async def get_stats_summary(
     today: str | None = Query(default=None),
+    client_time: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
     db: AsyncDatabase = Depends(get_db),
 ) -> StatsSummaryOut:
     ref_date = _parse_iso_date(today)
+    ref_iso = ref_date.isoformat()
+    try:
+        _, resolved_time = resolve_client_clock(
+            None, client_time, fallback_today=ref_date
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client_time format",
+        ) from exc
+
     user_id = str(current_user["_id"])
 
     habits = [
@@ -935,13 +1273,24 @@ async def get_stats_summary(
     ]
     habit_ids = [str(h["_id"]) for h in habits]
     completed_by_habit: dict[str, set[str]] = {hid: set() for hid in habit_ids}
+    late_by_habit: dict[str, set[str]] = {hid: set() for hid in habit_ids}
+    ref_day_checkins: dict[str, dict] = {}
 
     if habit_ids:
         async for chk in db.checkins.find(
             {"user_id": user_id, "habit_id": {"$in": habit_ids}, "completed": True},
-            {"habit_id": 1, "date": 1},
+            {"_id": 0, "habit_id": 1, "date": 1, "is_late": 1},
         ):
-            completed_by_habit[chk["habit_id"]].add(chk["date"])
+            hid = chk["habit_id"]
+            if chk.get("is_late", False):
+                late_by_habit[hid].add(chk["date"])
+            else:
+                completed_by_habit[hid].add(chk["date"])
+
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": {"$in": habit_ids}, "date": ref_iso}
+        ):
+            ref_day_checkins[chk["habit_id"]] = chk
 
     # 7-day bar chart activity
     last_7_days: list[DailyActivityPoint] = []
@@ -950,20 +1299,46 @@ async def get_stats_summary(
         d_iso = d.isoformat()
         sched_cnt = 0
         comp_cnt = 0
+        late_cnt = 0
         for h in habits:
             hid = str(h["_id"])
             if is_scheduled_on(h, d):
                 sched_cnt += 1
                 if d_iso in completed_by_habit[hid]:
                     comp_cnt += 1
+                elif d_iso in late_by_habit[hid]:
+                    late_cnt += 1
         last_7_days.append(
             DailyActivityPoint(
                 date=d_iso,
                 weekday_label=WEEKDAY_NAMES[d.weekday()],
                 scheduled_count=sched_cnt,
                 completed_count=comp_cnt,
+                late_count=late_cnt,
             )
         )
+
+    violated_today = 0
+    late_today = 0
+    violated_habit_ids: set[str] = set()
+    for h in habits:
+        hid = str(h["_id"])
+        if not is_scheduled_on(h, ref_date):
+            continue
+        ev = evaluate_habit_day_status(
+            habit=h,
+            checkin=ref_day_checkins.get(hid),
+            target_date_str=ref_iso,
+            client_today_str=ref_iso,
+            client_time=resolved_time,
+            scheduled=True,
+        )
+        if ev.day_status == "violation":
+            violated_today += 1
+            violated_habit_ids.add(hid)
+        elif ev.day_status == "late_makeup":
+            late_today += 1
+            violated_habit_ids.add(hid)
 
     habit_stats: list[HabitStreakStat] = []
     best_active_streak = 0
@@ -972,7 +1347,11 @@ async def get_stats_summary(
     for h in habits:
         hid = str(h["_id"])
         c_dates = completed_by_habit[hid]
-        curr_s, best_s = compute_streaks(h, c_dates, ref_date)
+        l_dates = late_by_habit[hid]
+        h_mode, _, _, _ = extract_habit_mode_fields(h)
+        curr_s, best_s = compute_streaks(
+            h, c_dates, ref_date, today_violated=(hid in violated_habit_ids)
+        )
         rate_30d = compute_30d_completion_rate(h, c_dates, ref_date)
         if curr_s > best_active_streak:
             best_active_streak = curr_s
@@ -983,10 +1362,12 @@ async def get_stats_summary(
                 title=h["title"],
                 color=h.get("color", "#6366F1"),
                 frequency_type=h.get("frequency_type", "daily"),
+                mode=h_mode,
                 current_streak=curr_s,
                 best_streak=best_s,
                 completion_rate_30d=rate_30d,
                 total_completions=len(c_dates),
+                late_completions=len(l_dates),
             )
         )
 
@@ -998,6 +1379,8 @@ async def get_stats_summary(
         active_habits_count=len(habits),
         completed_today=today_point.completed_count,
         scheduled_today=today_point.scheduled_count,
+        late_today=late_today,
+        violated_today=violated_today,
         best_active_streak=best_active_streak,
         overall_completion_rate_30d=overall_rate,
         last_7_days=last_7_days,
@@ -1009,10 +1392,22 @@ async def get_stats_summary(
 async def get_sli_dashboard(
     window_days: int = Query(default=30, ge=7, le=365),
     today: str | None = Query(default=None),
+    client_time: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
     db: AsyncDatabase = Depends(get_db),
 ) -> SliDashboardOut:
     ref_date = _parse_iso_date(today)
+    ref_iso = ref_date.isoformat()
+    try:
+        _, resolved_time = resolve_client_clock(
+            None, client_time, fallback_today=ref_date
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client_time format",
+        ) from exc
+
     user_id = str(current_user["_id"])
 
     habits = [
@@ -1023,17 +1418,42 @@ async def get_sli_dashboard(
     ]
     habit_ids = [str(h["_id"]) for h in habits]
     completed_by_habit: dict[str, set[str]] = {hid: set() for hid in habit_ids}
+    ref_day_checkins: dict[str, dict] = {}
 
     if habit_ids:
         async for chk in db.checkins.find(
             {"user_id": user_id, "habit_id": {"$in": habit_ids}, "completed": True},
-            {"habit_id": 1, "date": 1},
+            {"_id": 0, "habit_id": 1, "date": 1, "is_late": 1},
         ):
+            if chk.get("is_late", False):
+                continue
             completed_by_habit[chk["habit_id"]].add(chk["date"])
+
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": {"$in": habit_ids}, "date": ref_iso}
+        ):
+            ref_day_checkins[chk["habit_id"]] = chk
+
+    violated_habit_ids: set[str] = set()
+    for h in habits:
+        hid = str(h["_id"])
+        if not is_scheduled_on(h, ref_date):
+            continue
+        ev = evaluate_habit_day_status(
+            habit=h,
+            checkin=ref_day_checkins.get(hid),
+            target_date_str=ref_iso,
+            client_today_str=ref_iso,
+            client_time=resolved_time,
+            scheduled=True,
+        )
+        if ev.day_status in ("violation", "late_makeup"):
+            violated_habit_ids.add(hid)
 
     return build_sli_dashboard(
         habits,
         completed_by_habit,
         ref_date,
         window_days=window_days,
+        violated_habit_ids=violated_habit_ids,
     )

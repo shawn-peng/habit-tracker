@@ -1,10 +1,14 @@
+import asyncio
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
+import re
+import time
 from typing import Any
 import flet as ft
 
 from api_client import (
     DEFAULT_API_URL,
+    STORAGE_REMINDERS_MUTED_KEY,
     ApiError,
     HabitApiClient,
     StorageHelper,
@@ -12,6 +16,30 @@ from api_client import (
     open_dialog,
     show_toast,
 )
+
+MAX_REMINDER_TIMES = 12
+_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+REMINDER_TIME_PRESETS = ["07:30", "09:00", "12:30", "18:00", "21:30"]
+REMINDER_SNOOZE_OPTIONS = [5, 10, 15, 30, 60]
+
+HABIT_MODE_OPTIONS = [
+    ("free", "自由打卡（默认）"),
+    ("strict", "模式1：严格管控（提醒→强制开始→强制完成）"),
+    ("window", "模式2：弹性时间窗（提醒→强制完成）"),
+    ("reminder", "模式3：定时提醒（开始提醒时间）"),
+]
+HABIT_MODE_SHORT_LABELS = {
+    "free": "自由模式",
+    "strict": "模式1·严格管控",
+    "window": "模式2·弹性时间窗",
+    "reminder": "模式3·定时提醒",
+}
+HABIT_MODE_HINTS = {
+    "free": "无时间限制，当天随时打卡均计为准时完成。",
+    "strict": "需严格按 提醒时间 < 强制执行时间 < 强制完成时间 顺序；开始前不可直接完成。",
+    "window": "到开始提醒时间提示打卡，在强制完成时间前完成即算准时。",
+    "reminder": "到达开始提醒时间触发提示，不设超时违规，任意完成均算准时。",
+}
 
 COLOR_SWATCHES = [
     ("#6366F1", "Indigo"),
@@ -64,6 +92,263 @@ def format_habit_schedule(habit: dict[str, Any]) -> str:
     )
 
 
+def normalize_hhmm(raw: str) -> str | None:
+    """Validate and normalize a 24-hour time string (H:MM or HH:MM) to HH:MM."""
+    match = _REMINDER_TIME_RE.match((raw or "").strip())
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def validate_habit_mode_times(
+    mode: str,
+    remind_raw: str | None,
+    start_raw: str | None,
+    end_raw: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Validate habit mode time inputs and return (remind, start, end, error_message)."""
+    if mode == "free":
+        return None, None, None, None
+
+    def _parse(val: str | None, label: str) -> tuple[str | None, str | None]:
+        cleaned = (val or "").strip()
+        if not cleaned:
+            return None, f"{label} 不能为空"
+        norm = normalize_hhmm(cleaned)
+        if norm is None:
+            return None, f"{label} 格式必须为 24 小时制 HH:MM"
+        return norm, None
+
+    remind, err = _parse(remind_raw, "开始提醒时间")
+    if err:
+        return None, None, None, err
+    if mode == "reminder":
+        return remind, None, None, None
+
+    end, err = _parse(end_raw, "强制完成时间")
+    if err:
+        return None, None, None, err
+    if mode == "window":
+        if remind >= end:  # type: ignore[operator]
+            return None, None, None, "开始提醒时间必须早于强制完成时间"
+        return remind, None, end, None
+
+    if mode == "strict":
+        start, err = _parse(start_raw, "强制执行时间")
+        if err:
+            return None, None, None, err
+        if not (remind < start < end):  # type: ignore[operator]
+            return (
+                None,
+                None,
+                None,
+                "模式1需满足：开始提醒时间 < 强制执行时间 < 强制完成时间",
+            )
+        return remind, start, end, None
+
+    return None, None, None, f"不支持的模式: {mode}"
+
+
+def format_habit_mode_summary(habit: dict[str, Any]) -> str:
+    mode = habit.get("mode") or "free"
+    if mode == "free":
+        return ""
+    label = HABIT_MODE_SHORT_LABELS.get(mode, mode)
+    parts: list[str] = []
+    if habit.get("remind_time"):
+        parts.append(f"提醒 {habit['remind_time']}")
+    if mode == "strict" and habit.get("force_start_time"):
+        parts.append(f"开始 {habit['force_start_time']}")
+    if mode in ("strict", "window") and habit.get("force_end_time"):
+        parts.append(f"完成 {habit['force_end_time']}")
+    return f"{label}（{' · '.join(parts)}）" if parts else label
+
+
+def evaluate_local_habit_status(
+    habit: dict[str, Any],
+    target_date_iso: str,
+    today_iso: str,
+    now_hhmm: str,
+) -> tuple[str, str | None, bool, bool]:
+    """Evaluate (day_status, violation_reason, can_start, is_late) locally for live clock parity."""
+    mode = habit.get("mode") or "free"
+    remind_time = habit.get("remind_time")
+    force_start_time = habit.get("force_start_time")
+    force_end_time = habit.get("force_end_time")
+
+    target = max(1, int(habit.get("target_per_day", 1)))
+    count = int(habit.get("count", 0))
+    completed = bool(habit.get("completed", False)) or count >= target
+    started_on_time = bool(habit.get("started_on_time", False))
+    is_late = bool(habit.get("is_late", False))
+    violation_reason = habit.get("violation_reason")
+    scheduled = bool(habit.get("scheduled_today", True))
+
+    if completed:
+        if mode in ("strict", "window") and is_late:
+            return ("late_makeup", violation_reason, False, True)
+        return ("on_time", None, False, False)
+
+    if not scheduled or target_date_iso > today_iso:
+        return (
+            ("in_progress" if (mode == "strict" and started_on_time) else "pending"),
+            None,
+            False,
+            False,
+        )
+
+    is_past = target_date_iso < today_iso
+
+    if mode == "free":
+        return ("pending", None, False, False)
+
+    if mode == "reminder":
+        status = (
+            "reminding"
+            if (not is_past and remind_time and now_hhmm >= remind_time)
+            else "pending"
+        )
+        return (status, None, False, False)
+
+    if mode == "window":
+        if is_past or (force_end_time and now_hhmm > force_end_time):
+            return ("violation", "missed_end", False, False)
+        status = "reminding" if (remind_time and now_hhmm >= remind_time) else "pending"
+        return (status, None, False, False)
+
+    # mode == "strict"
+    if not started_on_time:
+        if is_past or (force_start_time and now_hhmm > force_start_time):
+            return ("violation", "missed_start", False, False)
+        status = "reminding" if (remind_time and now_hhmm >= remind_time) else "pending"
+        return (status, None, True, False)
+
+    if is_past or (force_end_time and now_hhmm > force_end_time):
+        return ("violation", "missed_end", False, False)
+
+    return ("in_progress", None, False, False)
+
+
+def _scheduled_monthly_day(year: int, month: int, habit: dict[str, Any]) -> int:
+    first_weekday, days_in_month = calendar.monthrange(year, month)
+    mode = habit.get("monthly_mode", "from_start")
+    if mode == "from_end":
+        offset = max(1, min(31, int(habit.get("monthly_day", 1))))
+        return max(1, days_in_month - offset + 1)
+    if mode == "nth_weekday":
+        target_weekday = int(habit.get("monthly_weekday", 0)) % 7
+        nth_week = int(habit.get("monthly_week", 1))
+        if nth_week == -1:
+            last_weekday = (first_weekday + days_in_month - 1) % 7
+            back = (last_weekday - target_weekday) % 7
+            return days_in_month - back
+        nth_week = max(1, min(5, nth_week))
+        first_occ = 1 + ((target_weekday - first_weekday) % 7)
+        day = first_occ + (nth_week - 1) * 7
+        if day > days_in_month:
+            day -= 7
+        return day
+    day = max(1, min(31, int(habit.get("monthly_day", 1))))
+    return min(day, days_in_month)
+
+
+def is_habit_scheduled_on_date(habit: dict[str, Any], target: date) -> bool:
+    """Return True if habit is scheduled on target date."""
+    freq = habit.get("frequency_type", "daily")
+    if freq == "daily":
+        return True
+    if freq == "monthly":
+        return target.day == _scheduled_monthly_day(target.year, target.month, habit)
+    weekdays = habit.get("weekdays") or [0, 1, 2, 3, 4, 5, 6]
+    return target.weekday() in weekdays
+
+
+def format_reminder_badge(habit: dict[str, Any]) -> str | None:
+    """Return a compact display label for a habit's reminders/alarms, or None."""
+    if not habit.get("reminder_enabled", False):
+        return None
+    raw_times = habit.get("reminder_times") or []
+    times = [t for t in (normalize_hhmm(str(x)) for x in raw_times) if t is not None]
+    if not times:
+        return None
+    prefix = "⏰" if habit.get("reminder_mode") == "alarm" else "🔔"
+    if len(times) <= 2:
+        return f"{prefix} {', '.join(times)}"
+    return f"{prefix} {times[0]}, {times[1]} (+{len(times) - 2})"
+
+
+def find_due_habit_reminders(
+    habits: list[dict[str, Any]],
+    completed_ids: set[str],
+    snoozed_until: dict[str, tuple[datetime, dict[str, Any]]],
+    fired_keys: set[str],
+    now_dt: datetime,
+) -> list[dict[str, Any]]:
+    """Return due scheduled or snoozed reminders/alarms at now_dt."""
+    due: list[dict[str, Any]] = []
+    seen_habit_ids: set[str] = set()
+
+    for hid, (wake_dt, habit_snapshot) in list(snoozed_until.items()):
+        if hid in completed_ids or now_dt < wake_dt:
+            continue
+        fire_key = f"snooze|{hid}|{wake_dt.strftime('%Y-%m-%dT%H:%M')}"
+        if fire_key in fired_keys:
+            continue
+        mode = (
+            "alarm"
+            if habit_snapshot.get("reminder_mode") == "alarm"
+            else "notification"
+        )
+        due.append(
+            {
+                "habit": habit_snapshot,
+                "mode": mode,
+                "time_label": wake_dt.strftime("%H:%M"),
+                "fire_key": fire_key,
+                "is_snooze": True,
+            }
+        )
+        seen_habit_ids.add(hid)
+
+    today_date = now_dt.date()
+    today_iso = today_date.isoformat()
+    now_hhmm = now_dt.strftime("%H:%M")
+
+    for habit in habits:
+        if habit.get("archived", False) or not habit.get("reminder_enabled", False):
+            continue
+        hid = str(habit.get("id") or habit.get("habit_id") or "")
+        if not hid or hid in completed_ids or hid in seen_habit_ids:
+            continue
+        if not is_habit_scheduled_on_date(habit, today_date):
+            continue
+        times = habit.get("reminder_times") or []
+        if now_hhmm not in times:
+            continue
+        fire_key = f"{today_iso}|{hid}|{now_hhmm}"
+        if fire_key in fired_keys:
+            continue
+        mode = "alarm" if habit.get("reminder_mode") == "alarm" else "notification"
+        due.append(
+            {
+                "habit": habit,
+                "mode": mode,
+                "time_label": now_hhmm,
+                "fire_key": fire_key,
+                "is_snooze": False,
+            }
+        )
+
+    return due
+
+
+TAB_CACHE_TTL_SECONDS = 45.0
+
+
 class HabitTrackerApp:
     def __init__(self, page: ft.Page):
         self.page = page
@@ -84,6 +369,33 @@ class HabitTrackerApp:
         self.schedule_group_by: str = "day"  # "day" | "habit"
         self.period_schedule: dict[str, Any] | None = None
 
+        self.reminders_muted: bool = False
+        self._fired_reminder_keys: set[str] = set()
+        self._snoozed_alarms: dict[str, tuple[datetime, dict[str, Any]]] = {}
+        self._notified_mode_phases: dict[str, str] = {}
+        self._reminder_task: Any | None = None
+        self._active_alarm_dialog: ft.AlertDialog | None = None
+        self._active_alarm_habit_id: str | None = None
+        self._haptic: Any | None = None
+
+        self._cache_ttl_seconds: float = TAB_CACHE_TTL_SECONDS
+        self._tab_cache: dict[
+            tuple[int, tuple[Any, ...]], tuple[Any, float, int]
+        ] = {}
+        self._tab_dirty: set[int] = set(range(5))
+        self._tab_generations: dict[int, int] = {i: 0 for i in range(5)}
+        self._loading_keys: set[tuple[int, tuple[Any, ...]]] = set()
+        self._bg_refresh_task: Any | None = None
+        self._bg_refresh_key: tuple[int, tuple[Any, ...]] | None = None
+        self._bg_req_id: int = 0
+
+        self._shell_mounted: bool = False
+        self._shell_wide: bool | None = None
+        self._shell_user_name: str | None = None
+        self._shell_reminders_muted: bool | None = None
+        self._shell_nav: ft.NavigationRail | ft.NavigationBar | None = None
+        self._shell_root: ft.Control | None = None
+
         self.content_area = ft.Container(expand=True, padding=20)
 
     async def start(self) -> None:
@@ -92,8 +404,15 @@ class HabitTrackerApp:
         self.page.bgcolor = "#F8FAFC"
         self.page.padding = 0
         self.page.on_resize = self._handle_resize
+        self.page.on_disconnect = self._handle_disconnect
 
         # Initial loading indicator while checking saved session
+        self._cancel_reminder_loop()
+        self._cancel_bg_refresh()
+        self._unmount_shell()
+        saved_mute = await self.storage.get(STORAGE_REMINDERS_MUTED_KEY)
+        self.reminders_muted = saved_mute == "true"
+
         self.page.controls.clear()
         self.page.add(
             ft.Container(
@@ -114,8 +433,10 @@ class HabitTrackerApp:
 
         logged_in = await self.api.initialize()
         if logged_in:
-            await self.refresh_current_tab()
+            self._clear_tab_cache()
+            await self.refresh_current_tab(force=True)
             self.render_shell()
+            self._start_reminder_loop()
         else:
             self.render_auth_screen()
 
@@ -124,8 +445,24 @@ class HabitTrackerApp:
         return width >= 760
 
     def _handle_resize(self, _e: Any) -> None:
-        if self.api.current_user is not None:
-            self.render_shell()
+        if self.api.current_user is not None and self._shell_mounted:
+            new_wide = self._is_wide()
+            if self._shell_wide is None or new_wide != self._shell_wide:
+                self.render_shell(force_rebuild=True)
+
+    async def _handle_disconnect(self, _e: Any) -> None:
+        self._cancel_reminder_loop()
+        self._cancel_bg_refresh()
+        self._unmount_shell()
+        await self.api.aclose()
+
+    def _unmount_shell(self) -> None:
+        self._shell_mounted = False
+        self._shell_wide = None
+        self._shell_user_name = None
+        self._shell_reminders_muted = None
+        self._shell_nav = None
+        self._shell_root = None
 
     # -----------------------------------------------------------------------
     # Authentication Screen (Login / Register / Verify Email / Forgot Password)
@@ -137,6 +474,9 @@ class HabitTrackerApp:
         prefill_email: str = "",
         initial_info: str = "",
     ) -> None:
+        self._cancel_reminder_loop()
+        self._cancel_bg_refresh()
+        self._unmount_shell()
         self.page.navigation_bar = None
         self.page.controls.clear()
 
@@ -311,8 +651,10 @@ class HabitTrackerApp:
                     await self.api.verify_email(email=email, code=code)
                     screen_replaced = True
                     self.selected_tab = 0
-                    await self.refresh_current_tab()
+                    self._clear_tab_cache()
+                    await self.refresh_current_tab(force=True)
                     self.render_shell()
+                    self._start_reminder_loop()
                     show_toast(self.page, "Email verified! Welcome to Habit Tracker.")
                     return
                 elif mode == "forgot":
@@ -335,8 +677,10 @@ class HabitTrackerApp:
                     )
                     screen_replaced = True
                     self.selected_tab = 0
-                    await self.refresh_current_tab()
+                    self._clear_tab_cache()
+                    await self.refresh_current_tab(force=True)
                     self.render_shell()
+                    self._start_reminder_loop()
                     show_toast(self.page, "Password reset successfully!")
                     return
                 else:
@@ -344,8 +688,10 @@ class HabitTrackerApp:
 
                 screen_replaced = True
                 self.selected_tab = 0
-                await self.refresh_current_tab()
+                self._clear_tab_cache()
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
+                self._start_reminder_loop()
                 return
             except ApiError as err:
                 if mode == "login" and err.status_code == 403:
@@ -601,62 +947,313 @@ class HabitTrackerApp:
     # Responsive Cross-Platform Navigation Shell
     # -----------------------------------------------------------------------
     async def _on_nav_change(self, e: Any) -> None:
-        self.selected_tab = int(e.control.selected_index)
-        await self.refresh_current_tab()
-        self.render_shell()
+        new_tab = int(e.control.selected_index)
+        if new_tab == self.selected_tab and self._shell_mounted:
+            return
+        self.selected_tab = new_tab
+        self._activate_current_view()
 
     async def _handle_logout(self, _e: Any) -> None:
+        self._cancel_reminder_loop()
+        self._fired_reminder_keys.clear()
+        self._snoozed_alarms.clear()
+        self._notified_mode_phases.clear()
+        self._active_alarm_dialog = None
+        self._active_alarm_habit_id = None
+        self._clear_tab_cache()
         await self.api.logout()
-        self.period_schedule = None
         self.schedule_period = "week"
         self.schedule_anchor_date = date.today()
         self.render_auth_screen()
 
-    async def refresh_current_tab(self) -> None:
+    async def _handle_manual_refresh(self, _e: Any) -> None:
+        await self.refresh_current_tab(force=True)
+        self.render_shell()
+
+    def _is_attached(self, control: ft.Control) -> bool:
         try:
-            if self.selected_tab == 0:
-                self.today_habits = await self.api.get_today_habits(
-                    self.selected_date.isoformat()
-                )
-            elif self.selected_tab == 1:
-                self.period_schedule = await self.api.get_period_schedule(
-                    period=self.schedule_period,
-                    anchor_date=self.schedule_anchor_date.isoformat(),
-                    today=date.today().isoformat(),
-                )
-            elif self.selected_tab == 2:
-                self.all_habits = await self.api.list_habits(
-                    include_archived=self.show_archived
-                )
-            elif self.selected_tab == 3:
-                self.stats_summary = await self.api.get_stats_summary(
-                    date.today().isoformat()
-                )
-            elif self.selected_tab == 4:
-                self.sli_dashboard = await self.api.get_sli_dashboard(
+            return control.page is self.page
+        except Exception:
+            return False
+
+    def _safe_update(self, *controls: ft.Control) -> None:
+        if controls and all(self._is_attached(c) for c in controls):
+            try:
+                self.page.update(*controls)
+                return
+            except Exception:
+                pass
+        self.page.update()
+
+    def _current_tab_key(
+        self, tab: int | None = None
+    ) -> tuple[int, tuple[Any, ...]]:
+        t = self.selected_tab if tab is None else tab
+        if t == 0:
+            return (0, (self.selected_date.isoformat(),))
+        if t == 1:
+            return (
+                1,
+                (
+                    self.schedule_period,
+                    self.schedule_anchor_date.isoformat(),
                     date.today().isoformat(),
-                    window_days=self.sli_window_days,
-                )
+                ),
+            )
+        if t == 2:
+            return (2, (self.show_archived,))
+        if t == 3:
+            return (3, (date.today().isoformat(),))
+        return (4, (date.today().isoformat(), self.sli_window_days))
+
+    def _apply_tab_data(self, tab: int, data: Any) -> None:
+        if tab == 0:
+            self.today_habits = data
+        elif tab == 1:
+            self.period_schedule = data
+        elif tab == 2:
+            self.all_habits = data
+        elif tab == 3:
+            self.stats_summary = data
+        else:
+            self.sli_dashboard = data
+
+    def _store_cache_entry(
+        self,
+        key: tuple[int, tuple[Any, ...]],
+        data: Any,
+        generation: int,
+    ) -> bool:
+        tab = key[0]
+        if generation != self._tab_generations.get(tab, 0):
+            return False
+        self._tab_cache[key] = (data, time.monotonic(), generation)
+        self._tab_dirty.discard(tab)
+        return True
+
+    def _is_cache_fresh(self, key: tuple[int, tuple[Any, ...]]) -> bool:
+        tab = key[0]
+        if tab in self._tab_dirty:
+            return False
+        entry = self._tab_cache.get(key)
+        if entry is None:
+            return False
+        _, fetched_at, generation = entry
+        if generation != self._tab_generations.get(tab, 0):
+            return False
+        return (time.monotonic() - fetched_at) < self._cache_ttl_seconds
+
+    def _invalidate_tabs(self, tabs: Any) -> None:
+        for tab in tabs:
+            self._tab_dirty.add(tab)
+            self._tab_generations[tab] = self._tab_generations.get(tab, 0) + 1
+
+    def _clear_tab_cache(self) -> None:
+        self._cancel_bg_refresh()
+        self._tab_cache.clear()
+        self._loading_keys.clear()
+        self._tab_dirty = set(range(5))
+        for tab in range(5):
+            self._tab_generations[tab] = self._tab_generations.get(tab, 0) + 1
+        self.today_habits = []
+        self.all_habits = []
+        self.stats_summary = None
+        self.sli_dashboard = None
+        self.period_schedule = None
+
+    async def _fetch_tab_data(self, key: tuple[int, tuple[Any, ...]]) -> Any:
+        tab, params = key
+        if tab == 0:
+            (iso_date,) = params
+            return await self.api.get_today_habits(iso_date)
+        if tab == 1:
+            period, anchor_iso, today_iso = params
+            return await self.api.get_period_schedule(
+                period=period,
+                anchor_date=anchor_iso,
+                today=today_iso,
+            )
+        if tab == 2:
+            (include_archived,) = params
+            return await self.api.list_habits(include_archived=include_archived)
+        if tab == 3:
+            (today_iso,) = params
+            return await self.api.get_stats_summary(today_iso)
+        today_iso, window_days = params
+        return await self.api.get_sli_dashboard(today_iso, window_days=window_days)
+
+    def _cancel_bg_refresh(self) -> None:
+        task = self._bg_refresh_task
+        key = self._bg_refresh_key
+        self._bg_refresh_task = None
+        self._bg_refresh_key = None
+        if key is not None:
+            self._loading_keys.discard(key)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _activate_current_view(self, force_refresh: bool = False) -> None:
+        key = self._current_tab_key()
+        self._cancel_bg_refresh()
+        entry = self._tab_cache.get(key)
+        if entry is not None:
+            self._apply_tab_data(key[0], entry[0])
+            self._loading_keys.discard(key)
+            self.render_shell()
+            if force_refresh or not self._is_cache_fresh(key):
+                self._start_bg_refresh(key)
+            return
+
+        self._loading_keys.add(key)
+        self.render_shell()
+        self._start_bg_refresh(key)
+
+    def _start_bg_refresh(self, key: tuple[int, tuple[Any, ...]]) -> None:
+        self._cancel_bg_refresh()
+        self._bg_req_id += 1
+        req_id = self._bg_req_id
+        self._bg_refresh_key = key
+        expected_gen = self._tab_generations.get(key[0], 0)
+        run_task = getattr(self.page, "run_task", None)
+        if callable(run_task):
+            self._bg_refresh_task = run_task(
+                self._run_bg_refresh, key, expected_gen, req_id
+            )
+        else:
+            self._bg_refresh_task = asyncio.create_task(
+                self._run_bg_refresh(key, expected_gen, req_id)
+            )
+
+    async def _run_bg_refresh(
+        self,
+        key: tuple[int, tuple[Any, ...]],
+        expected_gen: int,
+        req_id: int,
+    ) -> None:
+        tab = key[0]
+        try:
+            data = await self._fetch_tab_data(key)
+        except asyncio.CancelledError:
+            if self._bg_req_id == req_id:
+                self._loading_keys.discard(key)
+            raise
         except ApiError as err:
+            if self._bg_req_id == req_id:
+                self._loading_keys.discard(key)
+                if self._bg_refresh_key == key:
+                    self._bg_refresh_task = None
+                    self._bg_refresh_key = None
+            if expected_gen != self._tab_generations.get(tab, 0):
+                return
             if err.status_code == 401:
                 await self.api.logout()
+                self._clear_tab_cache()
+                self.render_auth_screen()
+                return
+            if self._current_tab_key() == key:
+                self.render_shell()
+            show_toast(self.page, err.message, is_error=True)
+            return
+
+        if self._bg_refresh_key == key and self._bg_req_id == req_id:
+            self._bg_refresh_task = None
+            self._bg_refresh_key = None
+
+        if expected_gen != self._tab_generations.get(tab, 0):
+            self._loading_keys.discard(key)
+            return
+
+        was_loading = key in self._loading_keys
+        self._loading_keys.discard(key)
+        prev_entry = self._tab_cache.get(key)
+        had_prev = prev_entry is not None
+        prev_data = prev_entry[0] if prev_entry is not None else None
+
+        if not self._store_cache_entry(key, data, expected_gen):
+            return
+
+        if self.api.current_user is None or self._current_tab_key() != key:
+            return
+
+        if not was_loading and had_prev and data == prev_data:
+            return
+
+        self._apply_tab_data(tab, data)
+        self.render_shell()
+
+    def _build_loading_view(self) -> ft.Control:
+        return ft.Container(
+            expand=True,
+            alignment=ft.Alignment.CENTER,
+            content=ft.Column(
+                [
+                    ft.ProgressRing(),
+                    ft.Text("Loading...", color=ft.Colors.BLUE_GREY_600),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=12,
+            ),
+        )
+
+    def _build_active_tab_view(self) -> ft.Control:
+        if self._current_tab_key() in self._loading_keys:
+            return self._build_loading_view()
+        if self.selected_tab == 0:
+            return self._build_today_view()
+        if self.selected_tab == 1:
+            return self._build_schedule_view()
+        if self.selected_tab == 2:
+            return self._build_habits_view()
+        if self.selected_tab == 3:
+            return self._build_stats_view()
+        return self._build_sli_view()
+
+    async def refresh_current_tab(self, force: bool = True) -> None:
+        self._cancel_bg_refresh()
+        key = self._current_tab_key()
+        tab = key[0]
+        if not force and self._is_cache_fresh(key):
+            self._apply_tab_data(tab, self._tab_cache[key][0])
+            self._loading_keys.discard(key)
+            return
+        expected_gen = self._tab_generations.get(tab, 0)
+        try:
+            data = await self._fetch_tab_data(key)
+            self._loading_keys.discard(key)
+            if self._store_cache_entry(key, data, expected_gen):
+                self._apply_tab_data(tab, data)
+        except ApiError as err:
+            self._loading_keys.discard(key)
+            if err.status_code == 401:
+                await self.api.logout()
+                self._clear_tab_cache()
                 self.render_auth_screen()
                 return
             show_toast(self.page, err.message, is_error=True)
 
-    def render_shell(self) -> None:
-        if self.selected_tab == 0:
-            self.content_area.content = self._build_today_view()
-        elif self.selected_tab == 1:
-            self.content_area.content = self._build_schedule_view()
-        elif self.selected_tab == 2:
-            self.content_area.content = self._build_habits_view()
-        elif self.selected_tab == 3:
-            self.content_area.content = self._build_stats_view()
-        else:
-            self.content_area.content = self._build_sli_view()
-
+    def render_shell(self, force_rebuild: bool = False) -> None:
         user_name = (self.api.current_user or {}).get("name", "User")
+        wide = self._is_wide()
+        self.content_area.content = self._build_active_tab_view()
+
+        if (
+            not force_rebuild
+            and self._shell_mounted
+            and self._shell_root is not None
+            and self._shell_nav is not None
+            and self._shell_root in self.page.controls
+            and self._shell_wide == wide
+            and self._shell_user_name == user_name
+            and self._shell_reminders_muted == self.reminders_muted
+        ):
+            nav_changed = self._shell_nav.selected_index != self.selected_tab
+            if nav_changed:
+                self._shell_nav.selected_index = self.selected_tab
+                self._safe_update(self.content_area, self._shell_nav)
+            else:
+                self._safe_update(self.content_area)
+            return
 
         top_bar = ft.Container(
             bgcolor=ft.Colors.WHITE,
@@ -685,6 +1282,25 @@ class HabitTrackerApp:
                                         color=ft.Colors.BLUE_GREY_700,
                                     ),
                                     ft.IconButton(
+                                        icon=(
+                                            ft.Icons.NOTIFICATIONS_OFF_OUTLINED
+                                            if self.reminders_muted
+                                            else ft.Icons.ALARM_ROUNDED
+                                        ),
+                                        icon_color=(
+                                            "#94A3B8"
+                                            if self.reminders_muted
+                                            else "#4F46E5"
+                                        ),
+                                        tooltip="Reminders & Alarms",
+                                        on_click=self._handle_open_reminders_center,
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.REFRESH_ROUNDED,
+                                        tooltip="Refresh",
+                                        on_click=self._handle_manual_refresh,
+                                    ),
+                                    ft.IconButton(
                                         icon=ft.Icons.KEY_ROUNDED,
                                         tooltip="Change Password",
                                         on_click=lambda _e: self._open_change_password_dialog(),
@@ -705,10 +1321,10 @@ class HabitTrackerApp:
         )
 
         self.page.controls.clear()
-        if self._is_wide():
+        if wide:
             # Mac / Desktop / Wide Web layout: Left NavigationRail
             self.page.navigation_bar = None
-            rail = ft.NavigationRail(
+            nav_control: ft.NavigationRail | ft.NavigationBar = ft.NavigationRail(
                 selected_index=self.selected_tab,
                 label_type=ft.NavigationRailLabelType.ALL,
                 min_width=92,
@@ -742,24 +1358,22 @@ class HabitTrackerApp:
                     ),
                 ],
             )
-            self.page.add(
-                ft.Column(
-                    [
-                        top_bar,
-                        ft.Divider(height=1),
-                        ft.Row(
-                            [rail, ft.VerticalDivider(width=1), self.content_area],
-                            expand=True,
-                            spacing=0,
-                        ),
-                    ],
-                    expand=True,
-                    spacing=0,
-                )
+            shell_root: ft.Control = ft.Column(
+                [
+                    top_bar,
+                    ft.Divider(height=1),
+                    ft.Row(
+                        [nav_control, ft.VerticalDivider(width=1), self.content_area],
+                        expand=True,
+                        spacing=0,
+                    ),
+                ],
+                expand=True,
+                spacing=0,
             )
         else:
             # iPhone / Android / Mobile Web layout: Bottom NavigationBar
-            self.page.navigation_bar = ft.NavigationBar(
+            nav_control = ft.NavigationBar(
                 selected_index=self.selected_tab,
                 bgcolor=ft.Colors.WHITE,
                 on_change=self._on_nav_change,
@@ -791,14 +1405,546 @@ class HabitTrackerApp:
                     ),
                 ],
             )
-            self.page.add(
+            self.page.navigation_bar = nav_control
+            shell_root = ft.Column(
+                [top_bar, ft.Divider(height=1), self.content_area],
+                expand=True,
+                spacing=0,
+            )
+
+        self._shell_nav = nav_control
+        self._shell_root = shell_root
+        self._shell_wide = wide
+        self._shell_user_name = user_name
+        self._shell_reminders_muted = self.reminders_muted
+        self._shell_mounted = True
+        self.page.add(shell_root)
+        self.page.update()
+
+    # -----------------------------------------------------------------------
+    # Reminders & Alarms Runtime Engine + Center Dialog
+    # -----------------------------------------------------------------------
+    def _build_reminder_badge_chip(self, habit: dict[str, Any]) -> ft.Control | None:
+        badge_text = format_reminder_badge(habit)
+        if not badge_text:
+            return None
+        is_alarm = habit.get("reminder_mode") == "alarm"
+        bg = "#FEF3C7" if is_alarm else "#EEF2FF"
+        fg = "#B45309" if is_alarm else "#4F46E5"
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+            border_radius=8,
+            bgcolor=bg,
+            content=ft.Text(
+                badge_text,
+                size=11,
+                weight=ft.FontWeight.BOLD,
+                color=fg,
+            ),
+        )
+
+    def _start_reminder_loop(self) -> None:
+        if self.api.current_user is None:
+            return
+        if self._reminder_task is not None and not self._reminder_task.done():
+            return
+        run_task = getattr(self.page, "run_task", None)
+        if callable(run_task):
+            self._reminder_task = run_task(self._reminder_loop_worker)
+        else:
+            self._reminder_task = asyncio.create_task(self._reminder_loop_worker())
+
+    def _cancel_reminder_loop(self) -> None:
+        task = self._reminder_task
+        self._reminder_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _reminder_loop_worker(self) -> None:
+        while self.api.current_user is not None:
+            now_dt = datetime.now()
+            await self._evaluate_due_reminders(now_dt, fetch_if_empty=False)
+            await self._check_mode_phase_transitions(now_dt)
+            await asyncio.sleep(15.0)
+
+    async def _check_mode_phase_transitions(self, now_dt: datetime) -> None:
+        if self.api.current_user is None:
+            return
+        today_date = now_dt.date()
+        today_iso = today_date.isoformat()
+        now_hhmm = now_dt.strftime("%H:%M")
+
+        self._notified_mode_phases = {
+            k: v
+            for k, v in self._notified_mode_phases.items()
+            if k.startswith(f"{today_iso}|")
+        }
+
+        today_key = (0, (today_iso,))
+        today_cache = self._tab_cache.get(today_key)
+        items = (
+            today_cache[0]
+            if (today_cache is not None and isinstance(today_cache[0], list))
+            else (self.today_habits if self.selected_date == today_date else [])
+        )
+        if not items:
+            return
+
+        changed_to_notify: list[tuple[str, bool]] = []
+        for item in items:
+            mode = item.get("mode") or "free"
+            if mode == "free" or not item.get("scheduled_today", True):
+                continue
+            hid = str(item.get("id") or "")
+            if not hid:
+                continue
+            day_status, reason, _, _ = evaluate_local_habit_status(
+                item, today_iso, today_iso, now_hhmm
+            )
+            phase_key = f"{today_iso}|{hid}"
+            prev_phase = self._notified_mode_phases.get(phase_key)
+            if day_status != prev_phase:
+                self._notified_mode_phases[phase_key] = day_status
+                if day_status == "reminding" and not self.reminders_muted:
+                    if mode == "strict":
+                        msg = f"🔔「{item['title']}」已到开始提醒时间，请在 {item.get('force_start_time', '')} 前点击开始执行"
+                    elif mode == "window":
+                        msg = f"🔔「{item['title']}」已进入弹性打卡窗口，请在 {item.get('force_end_time', '')} 前完成"
+                    else:
+                        msg = f"🔔「{item['title']}」已到提醒时间（{item.get('remind_time', '')}）"
+                    changed_to_notify.append((msg, False))
+                elif day_status == "violation":
+                    why = "未在强制执行时间前开始" if reason == "missed_start" else "未在强制完成时间前完成"
+                    changed_to_notify.append(
+                        (f"⚠️「{item['title']}」{why}，已记为超时违规（支持补卡）", True)
+                    )
+
+        for msg, is_err in changed_to_notify:
+            show_toast(self.page, msg, is_error=is_err)
+
+        if (
+            changed_to_notify
+            and self.selected_tab == 0
+            and self.selected_date == today_date
+            and self._shell_mounted
+        ):
+            self.render_shell()
+
+    async def _trigger_haptic(self, heavy: bool = False) -> None:
+        if not hasattr(ft, "HapticFeedback"):
+            return
+        services = getattr(self.page, "services", None)
+        if not isinstance(services, list):
+            return
+        try:
+            if self._haptic is None:
+                self._haptic = ft.HapticFeedback()
+            if self._haptic not in services:
+                services.append(self._haptic)
+            if heavy:
+                await self._haptic.heavy_impact()
+            else:
+                await self._haptic.light_impact()
+        except Exception:
+            pass
+
+    async def _evaluate_due_reminders(
+        self,
+        now_dt: datetime,
+        fetch_if_empty: bool = True,
+    ) -> list[dict[str, Any]]:
+        today_iso = now_dt.date().isoformat()
+        # Keep fired keys bounded to current day + snoozes
+        self._fired_reminder_keys = {
+            k
+            for k in self._fired_reminder_keys
+            if k.startswith(f"{today_iso}|") or k.startswith("snooze|")
+        }
+
+        if self.reminders_muted or self.api.current_user is None:
+            return []
+
+        today_key = (0, (today_iso,))
+        today_cache = self._tab_cache.get(today_key)
+        all_key = (2, (False,))
+        all_cache = self._tab_cache.get(all_key)
+
+        habits: list[dict[str, Any]] = []
+        completed_ids: set[str] = set()
+
+        if today_cache is not None and isinstance(today_cache[0], list):
+            habits = today_cache[0]
+        elif self.selected_date == now_dt.date() and self.today_habits:
+            habits = self.today_habits
+        elif all_cache is not None and isinstance(all_cache[0], list):
+            habits = all_cache[0]
+        elif self.all_habits:
+            habits = self.all_habits
+        elif fetch_if_empty:
+            try:
+                habits = await self.api.get_today_habits(today_iso)
+                gen = self._tab_generations.get(0, 0)
+                self._store_cache_entry(today_key, habits, gen)
+                if self.selected_date == now_dt.date():
+                    self.today_habits = habits
+            except ApiError:
+                return []
+
+        completed_source = (
+            today_cache[0]
+            if (today_cache is not None and isinstance(today_cache[0], list))
+            else (self.today_habits if self.selected_date == now_dt.date() else [])
+        )
+        for item in completed_source:
+            if item.get("completed"):
+                hid = str(item.get("id") or item.get("habit_id") or "")
+                if hid:
+                    completed_ids.add(hid)
+
+        due = find_due_habit_reminders(
+            habits=habits,
+            completed_ids=completed_ids,
+            snoozed_until=self._snoozed_alarms,
+            fired_keys=self._fired_reminder_keys,
+            now_dt=now_dt,
+        )
+        for trigger in due:
+            self._fired_reminder_keys.add(trigger["fire_key"])
+            habit = trigger["habit"]
+            hid = str(habit.get("id") or habit.get("habit_id") or "")
+            if trigger["is_snooze"]:
+                self._snoozed_alarms.pop(hid, None)
+            if trigger["mode"] == "alarm":
+                await self._trigger_haptic(heavy=True)
+                self._open_ringing_alarm_dialog(habit, trigger["time_label"])
+            else:
+                await self._trigger_haptic(heavy=False)
+                note = (habit.get("reminder_message") or "").strip()
+                suffix = f" — {note}" if note else ""
+                show_toast(
+                    self.page,
+                    f"🔔 Reminder ({trigger['time_label']}): {habit.get('title', 'Habit')}{suffix}",
+                )
+        return due
+
+    def _open_ringing_alarm_dialog(
+        self,
+        habit: dict[str, Any],
+        time_label: str,
+    ) -> None:
+        hid = str(habit.get("id") or habit.get("habit_id") or "")
+        title = habit.get("title", "Habit Alarm")
+        color = habit.get("color", "#6366F1")
+        snooze_minutes = max(1, int(habit.get("reminder_snooze_minutes", 10)))
+        target = int(habit.get("target_per_day", 1))
+        message = (habit.get("reminder_message") or "").strip() or (
+            habit.get("description") or ""
+        ).strip() or "Time to complete your scheduled habit!"
+
+        if self._active_alarm_dialog is not None:
+            close_dialog(self.page, self._active_alarm_dialog)
+            self._active_alarm_dialog = None
+
+        dialog = ft.AlertDialog(modal=True)
+        self._active_alarm_dialog = dialog
+        self._active_alarm_habit_id = hid
+
+        def _clear_active() -> None:
+            if self._active_alarm_dialog is dialog:
+                self._active_alarm_dialog = None
+                self._active_alarm_habit_id = None
+
+        async def handle_checkin_now(_e: Any = None) -> None:
+            _clear_active()
+            self._snoozed_alarms.pop(hid, None)
+            close_dialog(self.page, dialog)
+            if not hid or hid == "__test__":
+                show_toast(self.page, f"Checked in! Alarm dismissed for {title}.")
+                return
+            try:
+                now_dt = datetime.now()
+                today_iso = now_dt.date().isoformat()
+                now_hhmm = now_dt.strftime("%H:%M")
+                _, _, can_start, _ = evaluate_local_habit_status(
+                    habit, today_iso, today_iso, now_hhmm
+                )
+                if habit.get("mode") == "strict" and can_start:
+                    action = "start"
+                    toast_msg = f"Started execution: {title}"
+                else:
+                    action = "toggle" if target <= 1 else "increment"
+                    toast_msg = f"Checked in: {title}"
+                await self.api.checkin_habit(
+                    habit_id=hid,
+                    target_date=today_iso,
+                    action=action,
+                )
+                self._invalidate_tabs({0, 1, 3, 4})
+                await self.refresh_current_tab(force=True)
+                self.render_shell()
+                show_toast(self.page, toast_msg)
+            except ApiError as err:
+                show_toast(self.page, err.message, is_error=True)
+
+        async def handle_snooze(_e: Any = None) -> None:
+            _clear_active()
+            wake_dt = datetime.now() + timedelta(minutes=snooze_minutes)
+            self._snoozed_alarms[hid] = (wake_dt, habit)
+            close_dialog(self.page, dialog)
+            show_toast(
+                self.page,
+                f"⏰ Snoozed {title} for {snooze_minutes} min (until {wake_dt.strftime('%H:%M')})",
+            )
+
+        def handle_dismiss(_e: Any = None) -> None:
+            _clear_active()
+            close_dialog(self.page, dialog)
+
+        dialog.title = ft.Row(
+            [
+                ft.Icon(ft.Icons.ALARM_ON_ROUNDED, color=color, size=28),
                 ft.Column(
-                    [top_bar, ft.Divider(height=1), self.content_area],
-                    expand=True,
-                    spacing=0,
+                    [
+                        ft.Text("Habit Alarm", size=18, weight=ft.FontWeight.BOLD),
+                        ft.Text(
+                            f"Scheduled for {time_label}",
+                            size=12,
+                            color=ft.Colors.BLUE_GREY_500,
+                        ),
+                    ],
+                    spacing=1,
+                    tight=True,
+                ),
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        dialog.content = ft.Container(
+            width=360,
+            padding=16,
+            border_radius=12,
+            bgcolor="#FFFBEB",
+            border=ft.Border.all(1.5, color),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        title,
+                        size=20,
+                        weight=ft.FontWeight.BOLD,
+                        color=ft.Colors.BLUE_GREY_900,
+                    ),
+                    ft.Text(
+                        message,
+                        size=14,
+                        color=ft.Colors.BLUE_GREY_700,
+                    ),
+                ],
+                tight=True,
+                spacing=8,
+            ),
+        )
+        dialog.actions = [
+            ft.TextButton(
+                content=ft.Text("Dismiss"),
+                on_click=handle_dismiss,
+            ),
+            ft.OutlinedButton(
+                content=ft.Text(f"Snooze {snooze_minutes}m"),
+                on_click=handle_snooze,
+            ),
+            ft.FilledButton(
+                content=ft.Text("Check In Now"),
+                on_click=handle_checkin_now,
+            ),
+        ]
+        open_dialog(self.page, dialog)
+
+    async def _handle_open_reminders_center(self, _e: Any = None) -> None:
+        await self._open_reminders_center_dialog()
+
+    async def _open_reminders_center_dialog(self) -> None:
+        source_habits = self.all_habits or self.today_habits
+        if not source_habits and self.api.current_user is not None:
+            try:
+                source_habits = await self.api.list_habits(include_archived=False)
+                self.all_habits = source_habits
+            except ApiError:
+                source_habits = []
+
+        reminder_habits = [
+            h
+            for h in source_habits
+            if not h.get("archived", False) and h.get("reminder_enabled", False)
+        ]
+        dialog = ft.AlertDialog(modal=True)
+
+        async def on_mute_change(e: Any) -> None:
+            self.reminders_muted = bool(e.control.value)
+            await self.storage.set(
+                STORAGE_REMINDERS_MUTED_KEY,
+                "true" if self.reminders_muted else "false",
+            )
+            self.render_shell(force_rebuild=True)
+            show_toast(
+                self.page,
+                "Reminders & alarms muted on this device"
+                if self.reminders_muted
+                else "Reminders & alarms active on this device",
+            )
+
+        def test_notification(_e: Any) -> None:
+            close_dialog(self.page, dialog)
+            show_toast(
+                self.page,
+                "🔔 Reminder preview: Stay consistent with your daily routine!",
+            )
+
+        def test_alarm(_e: Any) -> None:
+            close_dialog(self.page, dialog)
+            sample = (
+                reminder_habits[0]
+                if reminder_habits
+                else {
+                    "id": "__test__",
+                    "title": "Sample Habit Alarm",
+                    "color": "#6366F1",
+                    "target_per_day": 1,
+                    "reminder_mode": "alarm",
+                    "reminder_snooze_minutes": 10,
+                    "reminder_message": "This is how a ringing habit alarm looks and behaves.",
+                }
+            )
+            self._open_ringing_alarm_dialog(sample, datetime.now().strftime("%H:%M"))
+
+        def cancel_snooze(hid: str) -> None:
+            self._snoozed_alarms.pop(hid, None)
+            close_dialog(self.page, dialog)
+            show_toast(self.page, "Snoozed alarm cancelled")
+
+        def open_edit(h: dict[str, Any]) -> None:
+            close_dialog(self.page, dialog)
+            self._open_habit_dialog(h)
+
+        rows: list[ft.Control] = [
+            ft.Switch(
+                label="Mute Reminders & Alarms on this device",
+                value=self.reminders_muted,
+                on_change=on_mute_change,
+            ),
+            ft.Row(
+                [
+                    ft.OutlinedButton(
+                        content=ft.Text("Test Notification"),
+                        on_click=test_notification,
+                    ),
+                    ft.OutlinedButton(
+                        content=ft.Text("Test Ringing Alarm"),
+                        on_click=test_alarm,
+                    ),
+                ],
+                wrap=True,
+                spacing=8,
+            ),
+            ft.Divider(height=1),
+        ]
+
+        if self._snoozed_alarms:
+            rows.append(
+                ft.Text("Snoozed Alarms", size=14, weight=ft.FontWeight.BOLD)
+            )
+            for s_hid, (wake_dt, s_habit) in list(self._snoozed_alarms.items()):
+                rows.append(
+                    ft.Row(
+                        [
+                            ft.Text(
+                                f"⏰ {s_habit.get('title', '')} → {wake_dt.strftime('%H:%M')}",
+                                size=13,
+                            ),
+                            ft.TextButton(
+                                content=ft.Text("Cancel"),
+                                on_click=lambda _e, target_id=s_hid: cancel_snooze(
+                                    target_id
+                                ),
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    )
+                )
+            rows.append(ft.Divider(height=1))
+
+        rows.append(
+            ft.Text(
+                f"Configured Habit Alerts ({len(reminder_habits)})",
+                size=14,
+                weight=ft.FontWeight.BOLD,
+            )
+        )
+        if not reminder_habits:
+            rows.append(
+                ft.Text(
+                    "No habit reminders or alarms configured yet. Edit any habit to set reminder times and alert mode.",
+                    size=13,
+                    color=ft.Colors.BLUE_GREY_500,
                 )
             )
-        self.page.update()
+        else:
+            for h in reminder_habits:
+                mode_label = (
+                    "Alarm" if h.get("reminder_mode") == "alarm" else "Notification"
+                )
+                times_str = ", ".join(h.get("reminder_times") or [])
+                snooze_mins = h.get("reminder_snooze_minutes", 10)
+                rows.append(
+                    ft.Container(
+                        padding=10,
+                        border_radius=10,
+                        bgcolor="#F8FAFC",
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text(
+                                            h.get("title", ""),
+                                            size=14,
+                                            weight=ft.FontWeight.BOLD,
+                                        ),
+                                        ft.Text(
+                                            f"{mode_label} • {times_str} • Snooze {snooze_mins}m",
+                                            size=12,
+                                            color=ft.Colors.BLUE_GREY_600,
+                                        ),
+                                    ],
+                                    spacing=2,
+                                    expand=True,
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.EDIT_OUTLINED,
+                                    tooltip="Edit reminder settings",
+                                    on_click=lambda _e, target_h=h: open_edit(target_h),
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                    )
+                )
+
+        dialog.title = ft.Text("Reminders & Alarms")
+        dialog.content = ft.Container(
+            width=400,
+            content=ft.Column(
+                rows,
+                tight=True,
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+        )
+        dialog.actions = [
+            ft.TextButton(
+                content=ft.Text("Close"),
+                on_click=lambda _e: close_dialog(self.page, dialog),
+            )
+        ]
+        open_dialog(self.page, dialog)
 
     # -----------------------------------------------------------------------
     # Tab 1: Today's Routine & Check-ins
@@ -815,8 +1961,7 @@ class HabitTrackerApp:
             new_date = self.selected_date + timedelta(days=delta)
             if new_date <= date.today():
                 self.selected_date = new_date
-                await self.refresh_current_tab()
-                self.render_shell()
+                self._activate_current_view()
 
         async def prev_day(_e: Any) -> None:
             await shift_date(-1)
@@ -824,9 +1969,44 @@ class HabitTrackerApp:
         async def next_day(_e: Any) -> None:
             await shift_date(1)
 
+        now_dt = datetime.now()
+        today_iso = now_dt.date().isoformat()
+        now_hhmm = now_dt.strftime("%H:%M")
+        selected_iso = self.selected_date.isoformat()
+
         scheduled_items = [h for h in self.today_habits if h.get("scheduled_today")]
         extra_items = [h for h in self.today_habits if not h.get("scheduled_today")]
-        done_count = sum(1 for h in scheduled_items if h.get("completed"))
+        eval_by_id: dict[str, tuple[str, str | None, bool, bool]] = {
+            str(h["id"]): evaluate_local_habit_status(
+                h, selected_iso, today_iso, now_hhmm
+            )
+            for h in self.today_habits
+        }
+        done_count = sum(
+            1
+            for h in scheduled_items
+            if eval_by_id[str(h["id"])][0] == "on_time"
+        )
+        late_count = sum(
+            1
+            for h in scheduled_items
+            if eval_by_id[str(h["id"])][0] == "late_makeup"
+        )
+        violation_count = sum(
+            1
+            for h in scheduled_items
+            if eval_by_id[str(h["id"])][0] == "violation"
+        )
+        reminding_items = [
+            h
+            for h in scheduled_items
+            if eval_by_id[str(h["id"])][0] == "reminding"
+        ]
+        violated_items = [
+            h
+            for h in scheduled_items
+            if eval_by_id[str(h["id"])][0] == "violation"
+        ]
         total_sched = len(scheduled_items)
         progress_val = (done_count / total_sched) if total_sched > 0 else 0.0
 
@@ -873,40 +2053,115 @@ class HabitTrackerApp:
             wrap=True,
         )
 
+        progress_chips: list[ft.Control] = []
+        if late_count > 0:
+            progress_chips.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+                    border_radius=8,
+                    bgcolor="#FEF3C7",
+                    content=ft.Text(
+                        f"超时补卡 {late_count} 项（不计入连胜/准时率）",
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color="#B45309",
+                    ),
+                )
+            )
+        if violation_count > 0:
+            progress_chips.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+                    border_radius=8,
+                    bgcolor="#FEE2E2",
+                    content=ft.Text(
+                        f"超时违规 {violation_count} 项",
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color="#B91C1C",
+                    ),
+                )
+            )
+
+        progress_col_controls: list[ft.Control] = [
+            ft.Row(
+                [
+                    ft.Text(
+                        "Daily Routine Progress",
+                        weight=ft.FontWeight.BOLD,
+                        size=15,
+                    ),
+                    ft.Text(
+                        f"{done_count} / {total_sched} completed",
+                        weight=ft.FontWeight.BOLD,
+                        color="#4F46E5",
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            ft.ProgressBar(
+                value=progress_val,
+                color="#4F46E5",
+                bgcolor=ft.Colors.WHITE,
+                height=10,
+                border_radius=5,
+            ),
+        ]
+        if progress_chips:
+            progress_col_controls.append(
+                ft.Row(progress_chips, spacing=8, wrap=True)
+            )
+
         progress_card = ft.Container(
             padding=18,
             border_radius=14,
             bgcolor="#EEF2FF",
             content=ft.Column(
-                [
-                    ft.Row(
-                        [
-                            ft.Text(
-                                "Daily Routine Progress",
-                                weight=ft.FontWeight.BOLD,
-                                size=15,
-                            ),
-                            ft.Text(
-                                f"{done_count} / {total_sched} completed",
-                                weight=ft.FontWeight.BOLD,
-                                color="#4F46E5",
-                            ),
-                        ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    ),
-                    ft.ProgressBar(
-                        value=progress_val,
-                        color="#4F46E5",
-                        bgcolor=ft.Colors.WHITE,
-                        height=10,
-                        border_radius=5,
-                    ),
-                ],
+                progress_col_controls,
                 spacing=10,
             ),
         )
 
         cards: list[ft.Control] = [header_row, progress_card]
+
+        if violated_items or reminding_items:
+            banner_parts: list[str] = []
+            if violated_items:
+                names = "、".join(h["title"] for h in violated_items[:3])
+                banner_parts.append(f"⚠️ 超时违规（可一键补卡）：{names}")
+            if reminding_items:
+                names = "、".join(h["title"] for h in reminding_items[:3])
+                banner_parts.append(f"🔔 正在提醒：{names}")
+            is_violation_banner = bool(violated_items)
+            cards.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+                    border_radius=12,
+                    bgcolor="#FEF2F2" if is_violation_banner else "#FFFBEB",
+                    border=ft.Border.all(
+                        1, "#FECACA" if is_violation_banner else "#FDE68A"
+                    ),
+                    content=ft.Row(
+                        [
+                            ft.Icon(
+                                ft.Icons.WARNING_AMBER_ROUNDED
+                                if is_violation_banner
+                                else ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED,
+                                color="#DC2626" if is_violation_banner else "#D97706",
+                                size=20,
+                            ),
+                            ft.Text(
+                                "  |  ".join(banner_parts),
+                                size=12,
+                                weight=ft.FontWeight.W_600,
+                                color="#991B1B" if is_violation_banner else "#92400E",
+                                expand=True,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                )
+            )
 
         if not scheduled_items and not extra_items:
             cards.append(
@@ -958,18 +2213,46 @@ class HabitTrackerApp:
         streak = item.get("current_streak", 0)
         is_monthly = item.get("frequency_type") == "monthly"
         streak_unit = "mo" if is_monthly else "d"
+        mode = item.get("mode") or "free"
+
+        now_dt = datetime.now()
+        today_iso = now_dt.date().isoformat()
+        now_hhmm = now_dt.strftime("%H:%M")
+        target_iso = item.get("date") or self.selected_date.isoformat()
+        day_status, violation_reason, can_start, is_late = (
+            evaluate_local_habit_status(item, target_iso, today_iso, now_hhmm)
+        )
 
         async def do_checkin(action: str) -> None:
             try:
-                await self.api.checkin_habit(
+                updated = await self.api.checkin_habit(
                     habit_id=hid,
                     target_date=self.selected_date.isoformat(),
                     action=action,
                 )
-                await self.refresh_current_tab()
-                self.render_shell()
+                key = self._current_tab_key(0)
+                if isinstance(updated, dict) and updated.get("id"):
+                    self.today_habits = [
+                        updated if h.get("id") == updated.get("id") else h
+                        for h in self.today_habits
+                    ]
+                    self._invalidate_tabs({1, 3, 4})
+                    self._tab_generations[0] = self._tab_generations.get(0, 0) + 1
+                    self._store_cache_entry(
+                        key,
+                        self.today_habits,
+                        self._tab_generations[0],
+                    )
+                    self.render_shell()
+                else:
+                    self._invalidate_tabs({0, 1, 3, 4})
+                    await self.refresh_current_tab(force=True)
+                    self.render_shell()
             except ApiError as err:
                 show_toast(self.page, err.message, is_error=True)
+
+        async def on_start_tap(_e: Any) -> None:
+            await do_checkin("start")
 
         async def on_primary_tap(_e: Any) -> None:
             if target == 1:
@@ -1005,7 +2288,7 @@ class HabitTrackerApp:
             )
         ]
 
-        if target > 1 and count > 0:
+        if target > 1 and count > 0 and not can_start:
             controls_right.append(
                 ft.IconButton(
                     icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
@@ -1015,25 +2298,57 @@ class HabitTrackerApp:
                 )
             )
 
-        controls_right.append(
-            ft.IconButton(
-                icon=(
-                    ft.Icons.CHECK_CIRCLE_ROUNDED
-                    if completed
-                    else (
-                        ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
-                        if target > 1
-                        else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
-                    )
-                ),
-                icon_color=color if completed else ft.Colors.BLUE_GREY_400,
-                icon_size=30,
-                tooltip="Check in",
-                on_click=on_primary_tap,
+        if can_start:
+            controls_right.append(
+                ft.FilledButton(
+                    content=ft.Text("开始执行"),
+                    icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                    on_click=on_start_tap,
+                )
             )
-        )
+        elif day_status == "violation":
+            controls_right.append(
+                ft.FilledButton(
+                    content=ft.Text("超时补卡"),
+                    icon=ft.Icons.HISTORY_ROUNDED,
+                    style=ft.ButtonStyle(bgcolor="#DC2626", color=ft.Colors.WHITE),
+                    on_click=on_primary_tap,
+                )
+            )
+        else:
+            controls_right.append(
+                ft.IconButton(
+                    icon=(
+                        ft.Icons.CHECK_CIRCLE_ROUNDED
+                        if completed
+                        else (
+                            ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
+                            if target > 1
+                            else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
+                        )
+                    ),
+                    icon_color=(
+                        "#D97706"
+                        if is_late
+                        else (color if completed else ft.Colors.BLUE_GREY_400)
+                    ),
+                    icon_size=30,
+                    tooltip="Check in",
+                    on_click=on_primary_tap,
+                )
+            )
 
         subtitle_parts = []
+        mode_summary = format_habit_mode_summary(item)
+        if mode_summary:
+            subtitle_parts.append(mode_summary)
+        if day_status == "in_progress" and item.get("started_at_time"):
+            subtitle_parts.append(f"已于 {item['started_at_time']} 开始")
+        elif day_status == "violation":
+            reason_label = (
+                "未按时开始" if violation_reason == "missed_start" else "未按时完成"
+            )
+            subtitle_parts.append(reason_label)
         if is_monthly:
             subtitle_parts.append(format_habit_schedule(item))
         if target > 1:
@@ -1041,6 +2356,42 @@ class HabitTrackerApp:
         if item.get("description"):
             subtitle_parts.append(item["description"])
         subtitle = " • ".join(subtitle_parts)
+        reminder_badge = self._build_reminder_badge_chip(item)
+        title_controls: list[ft.Control] = [
+            ft.Text(
+                item["title"],
+                size=16,
+                weight=ft.FontWeight.BOLD,
+            )
+        ]
+
+        status_badge_styles = {
+            "reminding": ("开始提醒中", "#DBEAFE", "#1D4ED8"),
+            "in_progress": ("执行中", "#E0E7FF", "#4338CA"),
+            "on_time": ("准时完成", "#DCFCE7", "#15803D"),
+            "violation": ("超时违规", "#FEE2E2", "#B91C1C"),
+            "late_makeup": ("超时补卡", "#FEF3C7", "#B45309"),
+            "pending": ("待开始" if mode == "strict" else "待打卡", "#F1F5F9", "#475569"),
+        }
+        if mode != "free" or day_status in ("violation", "late_makeup"):
+            st_label, st_bg, st_fg = status_badge_styles.get(
+                day_status, ("待打卡", "#F1F5F9", "#475569")
+            )
+            title_controls.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+                    border_radius=8,
+                    bgcolor=st_bg,
+                    content=ft.Text(
+                        st_label,
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color=st_fg,
+                    ),
+                )
+            )
+        if reminder_badge is not None:
+            title_controls.append(reminder_badge)
 
         return ft.Container(
             padding=16,
@@ -1058,10 +2409,11 @@ class HabitTrackerApp:
                             ),
                             ft.Column(
                                 [
-                                    ft.Text(
-                                        item["title"],
-                                        size=16,
-                                        weight=ft.FontWeight.BOLD,
+                                    ft.Row(
+                                        title_controls,
+                                        spacing=8,
+                                        wrap=True,
+                                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                                     ),
                                     ft.Text(
                                         subtitle if subtitle else "Daily goal",
@@ -1127,8 +2479,7 @@ class HabitTrackerApp:
                 return
             self.schedule_period = new_period
             self.schedule_anchor_date = date.today()
-            await self.refresh_current_tab()
-            self.render_shell()
+            self._activate_current_view()
 
         async def shift_period(delta: int) -> None:
             if self.schedule_period == "week":
@@ -1139,13 +2490,11 @@ class HabitTrackerApp:
                 self.schedule_anchor_date = self._shift_month(
                     self.schedule_anchor_date, delta
                 )
-            await self.refresh_current_tab()
-            self.render_shell()
+            self._activate_current_view()
 
         async def jump_current(_e: Any) -> None:
             self.schedule_anchor_date = date.today()
-            await self.refresh_current_tab()
-            self.render_shell()
+            self._activate_current_view()
 
         week_btn = (
             ft.FilledButton(
@@ -1480,6 +2829,10 @@ class HabitTrackerApp:
             right_color = "#059669"
 
         sub_right = f"Next: {next_due}" if next_due else f"{comp}/{sched} done"
+        rem_badge = format_reminder_badge(summary)
+        summary_meta = f"{sched_desc} • Goal: {summary.get('target_per_day', 1)}/day"
+        if rem_badge:
+            summary_meta += f" • {rem_badge}"
 
         return ft.Container(
             padding=16,
@@ -1503,7 +2856,7 @@ class HabitTrackerApp:
                                         weight=ft.FontWeight.BOLD,
                                     ),
                                     ft.Text(
-                                        f"{sched_desc} • Goal: {summary.get('target_per_day', 1)}/day",
+                                        summary_meta,
                                         size=12,
                                         color=ft.Colors.BLUE_GREY_500,
                                     ),
@@ -1556,6 +2909,21 @@ class HabitTrackerApp:
         target = int(item.get("target_per_day", 1))
         color = item.get("color", "#6366F1")
         status_val = item.get("status", "today")
+        mode = item.get("mode", "free")
+        force_start_time = item.get("force_start_time")
+        started_on_time = bool(item.get("started_on_time", False))
+        is_late = bool(item.get("is_late", False))
+
+        now_dt = datetime.now()
+        today_iso = now_dt.date().isoformat()
+        now_hhmm = now_dt.strftime("%H:%M")
+        needs_strict_start = (
+            mode == "strict"
+            and target_date == today_iso
+            and not completed
+            and not started_on_time
+            and (not force_start_time or now_hhmm <= force_start_time)
+        )
 
         async def do_checkin(action: str) -> None:
             try:
@@ -1564,26 +2932,36 @@ class HabitTrackerApp:
                     target_date=target_date,
                     action=action,
                 )
-                await self.refresh_current_tab()
+                self._invalidate_tabs({0, 1, 3, 4})
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
             except ApiError as err:
                 show_toast(self.page, err.message, is_error=True)
 
         async def on_primary_tap(_e: Any) -> None:
-            await do_checkin("toggle" if target == 1 else "increment")
+            if needs_strict_start:
+                await do_checkin("start")
+            else:
+                await do_checkin("toggle" if target == 1 else "increment")
 
         async def on_decrement(_e: Any) -> None:
             await do_checkin("decrement")
 
         status_labels = {
-            "completed": "Done",
+            "completed": "超时补卡" if is_late else "Done",
             "today": "Due today",
             "upcoming": "Upcoming",
             "overdue": "Missed",
         }
         subtitle_parts = [status_labels.get(status_val, "")]
+        mode_summary = format_habit_mode_summary(item)
+        if mode_summary:
+            subtitle_parts.append(mode_summary)
         if target > 1:
             subtitle_parts.append(f"{count} / {target}")
+        rem_badge = format_reminder_badge(item)
+        if rem_badge:
+            subtitle_parts.append(rem_badge)
         if item.get("description"):
             subtitle_parts.append(item["description"])
         subtitle = " • ".join(p for p in subtitle_parts if p)
@@ -1615,7 +2993,7 @@ class HabitTrackerApp:
                 )
             )
         else:
-            if target > 1 and count > 0:
+            if target > 1 and count > 0 and not needs_strict_start:
                 right_controls.append(
                     ft.IconButton(
                         icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
@@ -1627,19 +3005,37 @@ class HabitTrackerApp:
             right_controls.append(
                 ft.IconButton(
                     icon=(
-                        ft.Icons.CHECK_CIRCLE_ROUNDED
-                        if completed
+                        ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED
+                        if needs_strict_start
                         else (
-                            ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
-                            if target > 1
-                            else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
+                            ft.Icons.CHECK_CIRCLE_ROUNDED
+                            if completed
+                            else (
+                                ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
+                                if target > 1
+                                else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
+                            )
                         )
                     ),
-                    icon_color=color if completed else (
-                        "#DC2626" if status_val == "overdue" else ft.Colors.BLUE_GREY_400
+                    icon_color=(
+                        "#D97706"
+                        if is_late
+                        else (
+                            color
+                            if completed
+                            else (
+                                "#4F46E5"
+                                if needs_strict_start
+                                else (
+                                    "#DC2626"
+                                    if status_val == "overdue"
+                                    else ft.Colors.BLUE_GREY_400
+                                )
+                            )
+                        )
                     ),
                     icon_size=26,
-                    tooltip="Check in",
+                    tooltip="开始执行" if needs_strict_start else "Check in",
                     on_click=on_primary_tap,
                 )
             )
@@ -1688,8 +3084,7 @@ class HabitTrackerApp:
     def _build_habits_view(self) -> ft.Control:
         async def toggle_archived(e: Any) -> None:
             self.show_archived = bool(e.control.value)
-            await self.refresh_current_tab()
-            self.render_shell()
+            self._activate_current_view()
 
         header = ft.Row(
             [
@@ -1751,7 +3146,8 @@ class HabitTrackerApp:
         async def toggle_archive_state(_e: Any) -> None:
             try:
                 await self.api.update_habit(hid, {"archived": not is_archived})
-                await self.refresh_current_tab()
+                self._invalidate_tabs(range(5))
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
             except ApiError as err:
                 show_toast(self.page, err.message, is_error=True)
@@ -1759,11 +3155,23 @@ class HabitTrackerApp:
         async def remove_habit(_e: Any) -> None:
             try:
                 await self.api.delete_habit(hid)
-                await self.refresh_current_tab()
+                self._invalidate_tabs(range(5))
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
                 show_toast(self.page, "Habit deleted")
             except ApiError as err:
                 show_toast(self.page, err.message, is_error=True)
+
+        rem_badge = format_reminder_badge(habit)
+        mode_summary = format_habit_mode_summary(habit)
+        manage_meta = (
+            f"{freq} • Goal: {habit.get('target_per_day', 1)}/{goal_unit} "
+            f"• SLO: {habit.get('target_slo', 85.0)}%"
+        )
+        if mode_summary:
+            manage_meta += f" • {mode_summary}"
+        if rem_badge:
+            manage_meta += f" • {rem_badge}"
 
         return ft.Container(
             padding=16,
@@ -1788,7 +3196,7 @@ class HabitTrackerApp:
                                         weight=ft.FontWeight.BOLD,
                                     ),
                                     ft.Text(
-                                        f"{freq} • Goal: {habit.get('target_per_day', 1)}/{goal_unit} • SLO: {habit.get('target_slo', 85.0)}%",
+                                        manage_meta,
                                         size=12,
                                         color=ft.Colors.BLUE_GREY_500,
                                     ),
@@ -1842,6 +3250,22 @@ class HabitTrackerApp:
         initial_monthly_week = int(existing.get("monthly_week", 1)) if existing else 1
         initial_monthly_weekday = (
             int(existing.get("monthly_weekday", 0)) if existing else 0
+        )
+        initial_habit_mode = (
+            str(existing.get("mode") or "free") if existing else "free"
+        )
+        if initial_habit_mode not in ("free", "strict", "window", "reminder"):
+            initial_habit_mode = "free"
+        initial_mode_remind = (
+            str(existing.get("remind_time") or "09:00")
+            if (existing and existing.get("remind_time"))
+            else ("09:00" if initial_habit_mode != "free" else "")
+        )
+        initial_mode_start = (
+            str(existing.get("force_start_time") or "") if existing else ""
+        )
+        initial_mode_end = (
+            str(existing.get("force_end_time") or "") if existing else ""
         )
 
         title_field = ft.TextField(
@@ -1995,6 +3419,283 @@ class HabitTrackerApp:
             on_select=on_schedule_change,
         )
 
+        remind_time_field = ft.TextField(
+            label="Remind Time (HH:MM)",
+            value=initial_mode_remind,
+            hint_text="例如 09:00",
+        )
+        force_start_time_field = ft.TextField(
+            label="Force Start Time (HH:MM)",
+            value=initial_mode_start,
+            hint_text="例如 09:15",
+            visible=(initial_habit_mode == "strict"),
+        )
+        force_end_time_field = ft.TextField(
+            label="Force End Time (HH:MM)",
+            value=initial_mode_end,
+            hint_text="例如 10:30",
+            visible=(initial_habit_mode in ("strict", "window")),
+        )
+        mode_hint_text = ft.Text(
+            HABIT_MODE_HINTS.get(initial_habit_mode, ""),
+            size=11,
+            color=ft.Colors.ON_SURFACE_VARIANT,
+        )
+        mode_times_section = ft.Column(
+            [
+                mode_hint_text,
+                remind_time_field,
+                force_start_time_field,
+                force_end_time_field,
+            ],
+            tight=True,
+            spacing=8,
+            visible=(initial_habit_mode != "free"),
+        )
+
+        def on_habit_mode_change(_e: Any) -> None:
+            m = habit_mode_dropdown.value or "free"
+            mode_hint_text.value = HABIT_MODE_HINTS.get(m, "")
+            mode_times_section.visible = m != "free"
+            force_start_time_field.visible = m == "strict"
+            force_end_time_field.visible = m in ("strict", "window")
+            if m != "free" and not (remind_time_field.value or "").strip():
+                remind_time_field.value = "09:00"
+            if m == "strict":
+                if not (force_start_time_field.value or "").strip():
+                    force_start_time_field.value = "09:15"
+                if not (force_end_time_field.value or "").strip():
+                    force_end_time_field.value = "10:30"
+            elif m == "window" and not (force_end_time_field.value or "").strip():
+                force_end_time_field.value = "21:00"
+            err_label.visible = False
+            self.page.update()
+
+        habit_mode_dropdown = ft.Dropdown(
+            label="Habit Mode",
+            value=initial_habit_mode,
+            options=[
+                ft.dropdown.Option(key=k, text=label)
+                for k, label in HABIT_MODE_OPTIONS
+            ],
+            on_select=on_habit_mode_change,
+        )
+
+        from datetime import time as dt_time
+
+        initial_reminder_enabled = (
+            bool(existing.get("reminder_enabled", False)) if existing else False
+        )
+        raw_existing_times = (existing.get("reminder_times") or []) if existing else []
+        reminder_times_state: list[str] = []
+        for raw_item in raw_existing_times:
+            norm = normalize_hhmm(str(raw_item))
+            if norm and norm not in reminder_times_state:
+                reminder_times_state.append(norm)
+        reminder_times_state.sort()
+
+        initial_reminder_mode = (
+            str(existing.get("reminder_mode") or "notification")
+            if existing
+            else "notification"
+        )
+        if initial_reminder_mode not in ("notification", "alarm"):
+            initial_reminder_mode = "notification"
+
+        try:
+            initial_snooze = (
+                int(existing.get("reminder_snooze_minutes") or 10)
+                if existing
+                else 10
+            )
+        except (TypeError, ValueError):
+            initial_snooze = 10
+        if not (1 <= initial_snooze <= 120):
+            initial_snooze = 10
+        snooze_choices = sorted(set(REMINDER_SNOOZE_OPTIONS) | {initial_snooze})
+
+        initial_reminder_msg = (
+            str(existing.get("reminder_message") or "") if existing else ""
+        )
+
+        reminder_times_row = ft.Row([], wrap=True, spacing=6, run_spacing=6)
+        preset_chips_row = ft.Row([], wrap=True, spacing=6, run_spacing=6)
+        custom_time_input = ft.TextField(
+            label="Add Time (HH:MM)",
+            hint_text="e.g. 08:30",
+            expand=True,
+        )
+        reminder_mode_dropdown = ft.Dropdown(
+            label="Reminder Style",
+            value=initial_reminder_mode,
+            options=[
+                ft.dropdown.Option(key="notification", text="Notification Banner"),
+                ft.dropdown.Option(key="alarm", text="Alarm Ring (Dialog + Sound)"),
+            ],
+        )
+        snooze_dropdown = ft.Dropdown(
+            label="Snooze Duration",
+            value=str(initial_snooze),
+            options=[
+                ft.dropdown.Option(key=str(m), text=f"{m} minutes")
+                for m in snooze_choices
+            ],
+        )
+        reminder_msg_field = ft.TextField(
+            label="Custom Reminder Message (optional)",
+            value=initial_reminder_msg,
+            max_length=160,
+        )
+
+        def rebuild_reminder_chips() -> None:
+            if reminder_times_state:
+                reminder_times_row.controls = [
+                    ft.Chip(
+                        label=ft.Text(hhmm),
+                        on_delete=lambda _e, t=hhmm: remove_reminder_time(t),
+                    )
+                    for hhmm in reminder_times_state
+                ]
+            else:
+                reminder_times_row.controls = [
+                    ft.Text(
+                        "No reminder times configured yet",
+                        size=12,
+                        color=ft.Colors.ON_SURFACE_VARIANT,
+                    )
+                ]
+            preset_chips_row.controls = [
+                ft.Chip(
+                    label=ft.Text(preset),
+                    selected=(preset in reminder_times_state),
+                    on_click=(
+                        lambda _e, t=preset: remove_reminder_time(t)
+                        if t in reminder_times_state
+                        else add_reminder_time(t)
+                    ),
+                )
+                for preset in REMINDER_TIME_PRESETS
+            ]
+
+        def add_reminder_time(raw_val: str) -> bool:
+            norm = normalize_hhmm(raw_val)
+            if norm is None:
+                err_label.value = "Reminder time must be HH:MM (00:00-23:59)"
+                err_label.visible = True
+                self.page.update()
+                return False
+            if norm in reminder_times_state:
+                err_label.visible = False
+                rebuild_reminder_chips()
+                self.page.update()
+                return True
+            if len(reminder_times_state) >= MAX_REMINDER_TIMES:
+                err_label.value = (
+                    f"At most {MAX_REMINDER_TIMES} reminder times are allowed"
+                )
+                err_label.visible = True
+                self.page.update()
+                return False
+            reminder_times_state.append(norm)
+            reminder_times_state.sort()
+            err_label.visible = False
+            rebuild_reminder_chips()
+            self.page.update()
+            return True
+
+        def remove_reminder_time(hhmm: str) -> None:
+            if hhmm in reminder_times_state:
+                reminder_times_state.remove(hhmm)
+            err_label.visible = False
+            rebuild_reminder_chips()
+            self.page.update()
+
+        def on_add_custom_time(_e: Any) -> None:
+            raw_val = (custom_time_input.value or "").strip()
+            if not raw_val:
+                err_label.value = "Enter a reminder time in HH:MM format"
+                err_label.visible = True
+                self.page.update()
+                return
+            if add_reminder_time(raw_val):
+                custom_time_input.value = ""
+                self.page.update()
+
+        def on_pick_clock_time(_e: Any) -> None:
+            if reminder_times_state:
+                parts = reminder_times_state[0].split(":")
+                init_time = dt_time(int(parts[0]), int(parts[1]))
+            else:
+                init_time = dt_time(9, 0)
+
+            def on_picker_change(ev: Any) -> None:
+                picked = getattr(ev.control, "value", None)
+                if picked is not None:
+                    add_reminder_time(f"{picked.hour:02d}:{picked.minute:02d}")
+
+            picker = ft.TimePicker(
+                value=init_time,
+                help_text="Pick reminder time",
+                on_change=on_picker_change,
+            )
+            open_dialog(self.page, picker)
+
+        reminder_details_section = ft.Column(
+            [
+                ft.Text(
+                    "Reminder Times",
+                    size=12,
+                    weight=ft.FontWeight.W_600,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                reminder_times_row,
+                ft.Text(
+                    "Quick Presets",
+                    size=11,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                preset_chips_row,
+                ft.Row(
+                    [
+                        custom_time_input,
+                        ft.OutlinedButton(
+                            content=ft.Text("Add"),
+                            on_click=on_add_custom_time,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                            tooltip="Pick Clock Time",
+                            on_click=on_pick_clock_time,
+                        ),
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                reminder_mode_dropdown,
+                snooze_dropdown,
+                reminder_msg_field,
+            ],
+            tight=True,
+            spacing=8,
+            visible=initial_reminder_enabled,
+        )
+
+        def on_reminder_toggle(_e: Any) -> None:
+            enabled = bool(reminder_switch.value)
+            if enabled and not reminder_times_state:
+                reminder_times_state.append("09:00")
+            rebuild_reminder_chips()
+            reminder_details_section.visible = enabled
+            err_label.visible = False
+            self.page.update()
+
+        reminder_switch = ft.Switch(
+            label="Enable Reminders & Alarms",
+            value=initial_reminder_enabled,
+            on_change=on_reminder_toggle,
+        )
+        rebuild_reminder_chips()
+
         err_label = ft.Text("", color=ft.Colors.RED_600, size=12, visible=False)
         dialog = ft.AlertDialog(modal=True)
 
@@ -2048,6 +3749,58 @@ class HabitTrackerApp:
                 self.page.update()
                 return
 
+            reminder_enabled = bool(reminder_switch.value)
+            pending_time_raw = (custom_time_input.value or "").strip()
+            if pending_time_raw:
+                norm_pending = normalize_hhmm(pending_time_raw)
+                if norm_pending is None:
+                    err_label.value = "Reminder time must be HH:MM (00:00-23:59)"
+                    err_label.visible = True
+                    self.page.update()
+                    return
+                if norm_pending not in reminder_times_state:
+                    if len(reminder_times_state) >= MAX_REMINDER_TIMES:
+                        err_label.value = (
+                            f"At most {MAX_REMINDER_TIMES} reminder times are allowed"
+                        )
+                        err_label.visible = True
+                        self.page.update()
+                        return
+                    reminder_times_state.append(norm_pending)
+                    reminder_times_state.sort()
+                    custom_time_input.value = ""
+                    rebuild_reminder_chips()
+
+            if reminder_enabled and not reminder_times_state:
+                err_label.value = "Add at least one reminder time (HH:MM)"
+                err_label.visible = True
+                self.page.update()
+                return
+
+            reminder_mode = reminder_mode_dropdown.value or "notification"
+            if reminder_mode not in ("notification", "alarm"):
+                reminder_mode = "notification"
+
+            try:
+                snooze_val = int(snooze_dropdown.value or "10")
+            except ValueError:
+                snooze_val = 10
+            if not (1 <= snooze_val <= 120):
+                snooze_val = 10
+
+            chosen_habit_mode = habit_mode_dropdown.value or "free"
+            m_remind, m_start, m_end, mode_err = validate_habit_mode_times(
+                chosen_habit_mode,
+                remind_time_field.value,
+                force_start_time_field.value,
+                force_end_time_field.value,
+            )
+            if mode_err:
+                err_label.value = mode_err
+                err_label.visible = True
+                self.page.update()
+                return
+
             payload = {
                 "title": title,
                 "description": (desc_field.value or "").strip(),
@@ -2060,15 +3813,26 @@ class HabitTrackerApp:
                 "monthly_weekday": monthly_weekday,
                 "target_per_day": target_int,
                 "target_slo": round(slo_val, 1),
+                "mode": chosen_habit_mode,
+                "remind_time": m_remind,
+                "force_start_time": m_start,
+                "force_end_time": m_end,
+                "reminder_enabled": reminder_enabled,
+                "reminder_times": list(reminder_times_state),
+                "reminder_mode": reminder_mode,
+                "reminder_snooze_minutes": snooze_val,
+                "reminder_message": (reminder_msg_field.value or "").strip(),
             }
 
             try:
                 if is_edit and existing:
                     await self.api.update_habit(existing["id"], payload)
+                    self._snoozed_alarms.pop(existing["id"], None)
                 else:
                     await self.api.create_habit(payload)
                 close_dialog(self.page, dialog)
-                await self.refresh_current_tab()
+                self._invalidate_tabs(range(5))
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
             except ApiError as err:
                 err_label.value = err.message
@@ -2088,6 +3852,12 @@ class HabitTrackerApp:
                     schedule_dropdown,
                     weekdays_section,
                     monthly_section,
+                    ft.Divider(height=1),
+                    habit_mode_dropdown,
+                    mode_times_section,
+                    ft.Divider(height=1),
+                    reminder_switch,
+                    reminder_details_section,
                     err_label,
                 ],
                 tight=True,
@@ -2116,6 +3886,13 @@ class HabitTrackerApp:
         rate_30d = summary.get("overall_completion_rate_30d", 0.0)
         done_today = summary.get("completed_today", 0)
         sched_today = summary.get("scheduled_today", 0)
+        late_today = summary.get("late_today", 0)
+        violated_today = summary.get("violated_today", 0)
+        score_subtext = (
+            f"补卡 {late_today} · 违规 {violated_today}"
+            if (late_today > 0 or violated_today > 0)
+            else None
+        )
 
         kpi_row = ft.Row(
             [
@@ -2136,6 +3913,7 @@ class HabitTrackerApp:
                     f"{done_today} / {sched_today}",
                     ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED,
                     "#6366F1",
+                    subtext=score_subtext,
                 ),
             ],
             wrap=True,
@@ -2147,33 +3925,43 @@ class HabitTrackerApp:
         for pt in summary.get("last_7_days", []):
             sched = pt.get("scheduled_count", 0)
             comp = pt.get("completed_count", 0)
+            late_cnt = pt.get("late_count", 0)
             ratio = (comp / sched) if sched > 0 else 0.0
             bar_height = max(8, int(ratio * 100))
+            bar_col_items: list[ft.Control] = [
+                ft.Text(f"{comp}/{sched}", size=11, color=ft.Colors.BLUE_GREY_600),
+            ]
+            if late_cnt > 0:
+                bar_col_items.append(
+                    ft.Text(f"+{late_cnt}补", size=10, color="#D97706")
+                )
+            bar_col_items.extend(
+                [
+                    ft.Container(
+                        width=32,
+                        height=100,
+                        bgcolor="#E2E8F0",
+                        border_radius=8,
+                        alignment=ft.Alignment.BOTTOM_CENTER,
+                        content=ft.Container(
+                            width=32,
+                            height=bar_height,
+                            bgcolor="#6366F1" if ratio >= 1.0 else "#818CF8",
+                            border_radius=8,
+                        ),
+                    ),
+                    ft.Text(
+                        pt.get("weekday_label", ""),
+                        size=12,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                ]
+            )
             bars.append(
                 ft.Column(
-                    [
-                        ft.Text(f"{comp}/{sched}", size=11, color=ft.Colors.BLUE_GREY_600),
-                        ft.Container(
-                            width=32,
-                            height=100,
-                            bgcolor="#E2E8F0",
-                            border_radius=8,
-                            alignment=ft.Alignment.BOTTOM_CENTER,
-                            content=ft.Container(
-                                width=32,
-                                height=bar_height,
-                                bgcolor="#6366F1" if ratio >= 1.0 else "#818CF8",
-                                border_radius=8,
-                            ),
-                        ),
-                        ft.Text(
-                            pt.get("weekday_label", ""),
-                            size=12,
-                            weight=ft.FontWeight.BOLD,
-                        ),
-                    ],
+                    bar_col_items,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=6,
+                    spacing=4,
                 )
             )
 
@@ -2198,6 +3986,13 @@ class HabitTrackerApp:
         ]
         for hs in summary.get("habit_stats", []):
             unit = "mo" if hs.get("frequency_type") == "monthly" else "d"
+            late_total = hs.get("late_completions", 0)
+            hs_mode = hs.get("mode", "free")
+            meta_str = f"30d rate: {hs['completion_rate_30d']}% • On-time: {hs['total_completions']}"
+            if hs_mode != "free":
+                meta_str = f"{HABIT_MODE_SHORT_LABELS.get(hs_mode, hs_mode)} • {meta_str}"
+            if late_total > 0:
+                meta_str += f" • 超时补卡: {late_total}"
             leaderboard_items.append(
                 ft.Container(
                     padding=14,
@@ -2221,7 +4016,7 @@ class HabitTrackerApp:
                                                 size=15,
                                             ),
                                             ft.Text(
-                                                f"30d rate: {hs['completion_rate_30d']}% • Total check-ins: {hs['total_completions']}",
+                                                meta_str,
                                                 size=12,
                                                 color=ft.Colors.BLUE_GREY_500,
                                             ),
@@ -2327,8 +4122,7 @@ class HabitTrackerApp:
             if self.sli_window_days == days:
                 return
             self.sli_window_days = days
-            await self.refresh_current_tab()
-            self.render_shell()
+            self._activate_current_view()
 
         def make_window_handler(days: int):
             async def _handler(_e: Any) -> None:
@@ -2837,7 +4631,8 @@ class HabitTrackerApp:
                     {"target_slo": round(val, 1)},
                 )
                 close_dialog(self.page, dialog)
-                await self.refresh_current_tab()
+                self._invalidate_tabs({2, 4})
+                await self.refresh_current_tab(force=True)
                 self.render_shell()
                 show_toast(self.page, f"Updated SLO for {item.get('title', 'habit')}")
             except ApiError as err:
@@ -2937,6 +4732,7 @@ class HabitTrackerApp:
             except ApiError as err:
                 if err.status_code == 401:
                     close_dialog(self.page, dialog)
+                    self._clear_tab_cache()
                     await self.api.logout()
                     self.render_auth_screen()
                     show_toast(self.page, err.message, is_error=True)

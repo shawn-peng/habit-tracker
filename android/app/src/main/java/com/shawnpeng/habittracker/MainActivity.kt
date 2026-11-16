@@ -1,5 +1,6 @@
 package com.shawnpeng.habittracker
 
+import android.content.ActivityNotFoundException
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -15,10 +16,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Alarm
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Today
@@ -46,16 +49,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.shawnpeng.habittracker.data.Habit
+import com.shawnpeng.habittracker.data.toHabit
+import com.shawnpeng.habittracker.notifications.AndroidHabitAlarmScheduler
 import com.shawnpeng.habittracker.ui.HabitUiState
 import com.shawnpeng.habittracker.ui.HabitViewModel
 import com.shawnpeng.habittracker.ui.HabitViewModelFactory
 import com.shawnpeng.habittracker.ui.components.ChangePasswordDialog
 import com.shawnpeng.habittracker.ui.components.HabitFormDialog
+import com.shawnpeng.habittracker.ui.components.RemindersOverviewDialog
 import com.shawnpeng.habittracker.ui.screens.AuthScreen
 import com.shawnpeng.habittracker.ui.screens.HabitsScreen
 import com.shawnpeng.habittracker.ui.screens.ScheduleScreen
@@ -126,6 +133,7 @@ private fun MainShell(
     uiState: HabitUiState,
     vm: HabitViewModel,
 ) {
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     var showCreateDialog by remember { mutableStateOf(false) }
     var editingHabit by remember { mutableStateOf<Habit?>(null) }
@@ -172,6 +180,21 @@ private fun MainShell(
                         }
                     },
                     actions = {
+                        IconButton(onClick = vm::openRemindersDialog) {
+                            Icon(
+                                imageVector = if (uiState.remindersMuted) {
+                                    Icons.Rounded.NotificationsOff
+                                } else {
+                                    Icons.Rounded.Alarm
+                                },
+                                contentDescription = "提醒与闹钟",
+                                tint = if (uiState.remindersMuted) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                            )
+                        }
                         IconButton(onClick = vm::refreshCurrentTab) {
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
@@ -255,6 +278,7 @@ private fun MainShell(
                     habits = uiState.todayHabits,
                     onShiftDate = vm::shiftDate,
                     onJumpToday = vm::jumpToToday,
+                    onStartExecution = vm::startHabitExecution,
                     onPrimaryCheckin = vm::primaryCheckin,
                     onDecrementCheckin = vm::decrementCheckin,
                     onUpdateNote = vm::updateCheckinNote,
@@ -320,6 +344,64 @@ private fun MainShell(
             errorMessage = uiState.changePasswordError,
             onDismiss = vm::dismissChangePasswordDialog,
             onSubmit = vm::changePassword,
+        )
+    }
+
+    if (uiState.showRemindersDialog) {
+        RemindersOverviewDialog(
+            overview = uiState.remindersOverview,
+            isLoading = uiState.isLoadingReminders,
+            remindersMuted = uiState.remindersMuted,
+            onToggleMute = vm::toggleRemindersMuted,
+            onRefresh = vm::refreshRemindersOverview,
+            onEditHabit = { item ->
+                val resolved = uiState.allHabits.firstOrNull { it.id == item.habitId }
+                    ?: uiState.todayHabits.firstOrNull { it.id == item.habitId }?.toHabit()
+                    ?: Habit(
+                        id = item.habitId,
+                        title = item.title,
+                        color = item.color,
+                        icon = item.icon,
+                        frequencyType = item.frequencyType,
+                        targetPerDay = item.targetPerDay,
+                        reminderEnabled = item.reminderEnabled,
+                        reminderTimes = item.reminderTimes,
+                        reminderMode = item.reminderMode,
+                        reminderSnoozeMinutes = item.reminderSnoozeMinutes,
+                        reminderMessage = item.reminderMessage,
+                    )
+                vm.dismissRemindersDialog()
+                editingHabit = resolved
+                showCreateDialog = true
+            },
+            onSyncSystemClock = { item ->
+                val resolved = uiState.allHabits.firstOrNull { it.id == item.habitId }
+                    ?: uiState.todayHabits.firstOrNull { it.id == item.habitId }?.toHabit()
+                    ?: Habit(
+                        id = item.habitId,
+                        title = item.title,
+                        color = item.color,
+                        icon = item.icon,
+                        frequencyType = item.frequencyType,
+                        targetPerDay = item.targetPerDay,
+                        reminderEnabled = item.reminderEnabled,
+                        reminderTimes = item.reminderTimes,
+                        reminderMode = item.reminderMode,
+                        reminderSnoozeMinutes = item.reminderSnoozeMinutes,
+                        reminderMessage = item.reminderMessage,
+                    )
+                val clockIntent = AndroidHabitAlarmScheduler.buildSystemClockAlarmIntent(resolved)
+                if (clockIntent == null) {
+                    vm.showSnackbar("请先为该习惯设置至少一个提醒时间")
+                } else {
+                    try {
+                        context.startActivity(clockIntent)
+                    } catch (_: ActivityNotFoundException) {
+                        vm.showSnackbar("未找到系统时钟应用，已使用应用内置闹钟提醒")
+                    }
+                }
+            },
+            onDismiss = vm::dismissRemindersDialog,
         )
     }
 }

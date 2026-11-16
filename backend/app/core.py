@@ -93,6 +93,14 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
         unique=True,
     )
     await db.checkins.create_index([("user_id", ASCENDING), ("date", ASCENDING)])
+    await db.checkins.create_index(
+        [
+            ("user_id", ASCENDING),
+            ("completed", ASCENDING),
+            ("habit_id", ASCENDING),
+            ("date", ASCENDING),
+        ]
+    )
 
 
 def get_db(request: Request) -> AsyncDatabase:
@@ -439,7 +447,299 @@ class ChangePasswordRequest(BaseModel):
 
 FrequencyType = Literal["daily", "weekdays", "monthly"]
 MonthlyMode = Literal["from_start", "from_end", "nth_weekday"]
+ReminderMode = Literal["notification", "alarm"]
 VALID_MONTHLY_WEEKS = {-1, 1, 2, 3, 4, 5}
+MAX_REMINDER_TIMES = 12
+_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def normalize_reminder_time(raw: str) -> str:
+    """Validate and normalize a 24-hour time string (H:MM or HH:MM) to HH:MM."""
+    cleaned = raw.strip()
+    match = _REMINDER_TIME_RE.match(cleaned)
+    if not match:
+        raise ValueError(
+            f"Invalid reminder time '{raw}', expected HH:MM (00:00..23:59)"
+        )
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(
+            f"Invalid reminder time '{raw}', expected HH:MM (00:00..23:59)"
+        )
+    return f"{hour:02d}:{minute:02d}"
+
+
+def normalize_reminder_times(times: list[str]) -> list[str]:
+    """Normalize, deduplicate, and sort up to MAX_REMINDER_TIMES HH:MM strings."""
+    normalized = sorted({normalize_reminder_time(item) for item in times})
+    if len(normalized) > MAX_REMINDER_TIMES:
+        raise ValueError(
+            f"At most {MAX_REMINDER_TIMES} reminder times are allowed per habit"
+        )
+    return normalized
+
+
+HabitMode = Literal["free", "strict", "window", "reminder"]
+HabitDayStatus = Literal[
+    "pending", "reminding", "in_progress", "on_time", "violation", "late_makeup"
+]
+ViolationReason = Literal["missed_start", "missed_end"]
+VALID_HABIT_MODES = ("free", "strict", "window", "reminder")
+
+
+def normalize_hhmm(value: str | None) -> str | None:
+    """Validate and normalize an optional 24-hour HH:MM string."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return normalize_reminder_time(stripped)
+
+
+def validate_and_normalize_mode_times(
+    mode: HabitMode,
+    remind_time: str | None,
+    force_start_time: str | None,
+    force_end_time: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Validate mode-specific time fields and return normalized (remind, start, end)."""
+    remind = normalize_hhmm(remind_time)
+    start = normalize_hhmm(force_start_time)
+    end = normalize_hhmm(force_end_time)
+
+    if mode == "free":
+        return (None, None, None)
+    if mode == "reminder":
+        if not remind:
+            raise ValueError("Mode 'reminder' requires remind_time")
+        return (remind, None, None)
+    if mode == "window":
+        if not remind or not end:
+            raise ValueError("Mode 'window' requires remind_time and force_end_time")
+        if remind >= end:
+            raise ValueError("remind_time must be earlier than force_end_time")
+        return (remind, None, end)
+    if mode == "strict":
+        if not remind or not start or not end:
+            raise ValueError(
+                "Mode 'strict' requires remind_time, force_start_time, and force_end_time"
+            )
+        if not (remind < start < end):
+            raise ValueError(
+                "Mode 'strict' requires remind_time < force_start_time < force_end_time"
+            )
+        return (remind, start, end)
+    raise ValueError(f"Unsupported habit mode: {mode}")
+
+
+def extract_habit_mode_fields(
+    habit: dict,
+) -> tuple[HabitMode, str | None, str | None, str | None]:
+    """Safely extract (mode, remind_time, force_start_time, force_end_time) with legacy fallbacks."""
+    raw_mode = habit.get("mode", "free")
+    mode: HabitMode = raw_mode if raw_mode in VALID_HABIT_MODES else "free"
+    if mode == "free":
+        return ("free", None, None, None)
+
+    def _safe_hhmm(raw: object) -> str | None:
+        if not isinstance(raw, str):
+            return None
+        try:
+            return normalize_hhmm(raw)
+        except ValueError:
+            return None
+
+    remind = _safe_hhmm(habit.get("remind_time"))
+    start = _safe_hhmm(habit.get("force_start_time")) if mode == "strict" else None
+    end = (
+        _safe_hhmm(habit.get("force_end_time"))
+        if mode in ("strict", "window")
+        else None
+    )
+    return (mode, remind, start, end)
+
+
+def resolve_client_clock(
+    client_today: str | None,
+    client_time: str | None,
+    fallback_today: date | None = None,
+) -> tuple[date, str]:
+    """Resolve client local date and 24-hour HH:MM time with local clock defaults."""
+    now_local = datetime.now()
+    if client_today is not None and client_today.strip():
+        resolved_date = date.fromisoformat(client_today.strip())
+    else:
+        resolved_date = fallback_today or now_local.date()
+
+    if client_time is not None and client_time.strip():
+        resolved_time = normalize_hhmm(client_time)
+        assert resolved_time is not None
+    else:
+        resolved_time = now_local.strftime("%H:%M")
+    return resolved_date, resolved_time
+
+
+@dataclass(frozen=True)
+class HabitDayEvaluation:
+    day_status: HabitDayStatus
+    violation_reason: ViolationReason | None
+    started_at_time: str | None
+    started_on_time: bool
+    is_late: bool
+    can_start: bool
+
+
+def evaluate_habit_day_status(
+    habit: dict,
+    checkin: dict | None,
+    target_date_str: str,
+    client_today_str: str,
+    client_time: str,
+    scheduled: bool | None = None,
+) -> HabitDayEvaluation:
+    """Evaluate the mode-aware daily lifecycle status for a habit check-in."""
+    mode, remind_time, force_start_time, force_end_time = extract_habit_mode_fields(
+        habit
+    )
+    target = max(1, int(habit.get("target_per_day", 1)))
+
+    chk = checkin or {}
+    count = int(chk.get("count", 0))
+    completed = bool(chk.get("completed", False)) or count >= target
+    started_on_time = bool(chk.get("started_on_time", False))
+    started_at_time = chk.get("started_at_time")
+    stored_is_late = bool(chk.get("is_late", False))
+    raw_violation = chk.get("violation_reason")
+    stored_violation: ViolationReason | None = (
+        raw_violation if raw_violation in ("missed_start", "missed_end") else None
+    )
+
+    if scheduled is None:
+        scheduled = is_scheduled_on(habit, date.fromisoformat(target_date_str))
+
+    if completed:
+        if mode in ("strict", "window") and stored_is_late:
+            return HabitDayEvaluation(
+                day_status="late_makeup",
+                violation_reason=stored_violation,
+                started_at_time=started_at_time,
+                started_on_time=started_on_time,
+                is_late=True,
+                can_start=False,
+            )
+        return HabitDayEvaluation(
+            day_status="on_time",
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    if not scheduled or target_date_str > client_today_str:
+        return HabitDayEvaluation(
+            day_status=(
+                "in_progress" if (mode == "strict" and started_on_time) else "pending"
+            ),
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    is_past_day = target_date_str < client_today_str
+
+    if mode == "free":
+        return HabitDayEvaluation(
+            day_status="pending",
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    if mode == "reminder":
+        day_status: HabitDayStatus = (
+            "reminding"
+            if (not is_past_day and remind_time and client_time >= remind_time)
+            else "pending"
+        )
+        return HabitDayEvaluation(
+            day_status=day_status,
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    if mode == "window":
+        if is_past_day or (force_end_time and client_time > force_end_time):
+            return HabitDayEvaluation(
+                day_status="violation",
+                violation_reason="missed_end",
+                started_at_time=started_at_time,
+                started_on_time=started_on_time,
+                is_late=False,
+                can_start=False,
+            )
+        day_status = (
+            "reminding" if (remind_time and client_time >= remind_time) else "pending"
+        )
+        return HabitDayEvaluation(
+            day_status=day_status,
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    # mode == "strict"
+    if not started_on_time:
+        if is_past_day or (force_start_time and client_time > force_start_time):
+            return HabitDayEvaluation(
+                day_status="violation",
+                violation_reason="missed_start",
+                started_at_time=started_at_time,
+                started_on_time=False,
+                is_late=False,
+                can_start=False,
+            )
+        day_status = (
+            "reminding" if (remind_time and client_time >= remind_time) else "pending"
+        )
+        return HabitDayEvaluation(
+            day_status=day_status,
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=False,
+            is_late=False,
+            can_start=True,
+        )
+
+    if is_past_day or (force_end_time and client_time > force_end_time):
+        return HabitDayEvaluation(
+            day_status="violation",
+            violation_reason="missed_end",
+            started_at_time=started_at_time,
+            started_on_time=True,
+            is_late=False,
+            can_start=False,
+        )
+
+    return HabitDayEvaluation(
+        day_status="in_progress",
+        violation_reason=None,
+        started_at_time=started_at_time,
+        started_on_time=True,
+        is_late=False,
+        can_start=False,
+    )
 
 
 class HabitCreate(BaseModel):
@@ -471,6 +771,18 @@ class HabitCreate(BaseModel):
     )
     target_per_day: int = Field(default=1, ge=1, le=100)
     target_slo: float = Field(default=85.0, ge=1.0, le=100.0)
+    mode: HabitMode = "free"
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
+    reminder_enabled: bool = False
+    reminder_times: list[str] = Field(
+        default_factory=list,
+        description="Sorted 24-hour HH:MM strings",
+    )
+    reminder_mode: ReminderMode = "notification"
+    reminder_snooze_minutes: int = Field(default=10, ge=1, le=120)
+    reminder_message: str = Field(default="", max_length=200)
 
     @field_validator("weekdays")
     @classmethod
@@ -484,12 +796,36 @@ class HabitCreate(BaseModel):
             raise ValueError("monthly_week must be 1..5 or -1 (last)")
         return v
 
+    @field_validator("reminder_times")
+    @classmethod
+    def validate_reminder_times(cls, v: list[str]) -> list[str]:
+        return normalize_reminder_times(v)
+
+    @field_validator("reminder_message")
+    @classmethod
+    def strip_reminder_message(cls, v: str) -> str:
+        return v.strip()
+
     @model_validator(mode="after")
     def validate_schedule_fields(self) -> "HabitCreate":
         if self.frequency_type == "weekdays" and not self.weekdays:
             raise ValueError("At least one weekday (0..6) must be selected")
         if self.frequency_type in ("daily", "monthly") and not self.weekdays:
             self.weekdays = [0, 1, 2, 3, 4, 5, 6]
+        if self.reminder_enabled and not self.reminder_times:
+            raise ValueError(
+                "At least one reminder time (HH:MM) is required when reminders are enabled"
+            )
+        (
+            self.remind_time,
+            self.force_start_time,
+            self.force_end_time,
+        ) = validate_and_normalize_mode_times(
+            self.mode,
+            self.remind_time,
+            self.force_start_time,
+            self.force_end_time,
+        )
         return self
 
 
@@ -506,7 +842,21 @@ class HabitUpdate(BaseModel):
     monthly_weekday: int | None = Field(default=None, ge=0, le=6)
     target_per_day: int | None = Field(default=None, ge=1, le=100)
     target_slo: float | None = Field(default=None, ge=1.0, le=100.0)
+    mode: HabitMode | None = None
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
     archived: bool | None = None
+    reminder_enabled: bool | None = None
+    reminder_times: list[str] | None = None
+    reminder_mode: ReminderMode | None = None
+    reminder_snooze_minutes: int | None = Field(default=None, ge=1, le=120)
+    reminder_message: str | None = Field(default=None, max_length=200)
+
+    @field_validator("remind_time", "force_start_time", "force_end_time")
+    @classmethod
+    def validate_optional_mode_time(cls, v: str | None) -> str | None:
+        return normalize_hhmm(v)
 
     @field_validator("weekdays")
     @classmethod
@@ -522,6 +872,20 @@ class HabitUpdate(BaseModel):
             raise ValueError("monthly_week must be 1..5 or -1 (last)")
         return v
 
+    @field_validator("reminder_times")
+    @classmethod
+    def validate_reminder_times(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return normalize_reminder_times(v)
+
+    @field_validator("reminder_message")
+    @classmethod
+    def strip_reminder_message(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip()
+
     @model_validator(mode="after")
     def validate_schedule_fields(self) -> "HabitUpdate":
         if self.weekdays is not None and len(self.weekdays) == 0:
@@ -529,6 +893,14 @@ class HabitUpdate(BaseModel):
                 self.weekdays = [0, 1, 2, 3, 4, 5, 6]
             else:
                 raise ValueError("At least one weekday (0..6) must be selected")
+        if (
+            self.reminder_enabled is True
+            and self.reminder_times is not None
+            and len(self.reminder_times) == 0
+        ):
+            raise ValueError(
+                "At least one reminder time (HH:MM) is required when reminders are enabled"
+            )
         return self
 
 
@@ -546,6 +918,15 @@ class HabitOut(BaseModel):
     monthly_weekday: int = 0
     target_per_day: int
     target_slo: float = 85.0
+    mode: HabitMode = "free"
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
+    reminder_enabled: bool = False
+    reminder_times: list[str] = Field(default_factory=list)
+    reminder_mode: ReminderMode = "notification"
+    reminder_snooze_minutes: int = 10
+    reminder_message: str = ""
     archived: bool
     created_at: datetime
 
@@ -558,13 +939,26 @@ class HabitTodayOut(HabitOut):
     note: str = ""
     current_streak: int
     best_streak: int
+    day_status: HabitDayStatus = "pending"
+    violation_reason: ViolationReason | None = None
+    started_at_time: str | None = None
+    started_on_time: bool = False
+    is_late: bool = False
+    can_start: bool = False
 
 
 class CheckinRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    action: Literal["increment", "decrement", "toggle", "set"] = "increment"
+    action: Literal["increment", "decrement", "toggle", "set", "start"] = "increment"
     count: int | None = Field(default=None, ge=0, le=1000)
     note: str | None = Field(default=None, max_length=300)
+    client_today: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    client_time: str | None = None
+
+    @field_validator("client_time")
+    @classmethod
+    def validate_client_time(cls, v: str | None) -> str | None:
+        return normalize_hhmm(v)
 
 
 class DailyActivityPoint(BaseModel):
@@ -572,6 +966,7 @@ class DailyActivityPoint(BaseModel):
     weekday_label: str
     scheduled_count: int
     completed_count: int
+    late_count: int = 0
 
 
 class HabitStreakStat(BaseModel):
@@ -579,16 +974,20 @@ class HabitStreakStat(BaseModel):
     title: str
     color: str
     frequency_type: FrequencyType = "daily"
+    mode: HabitMode = "free"
     current_streak: int
     best_streak: int
     completion_rate_30d: float
     total_completions: int
+    late_completions: int = 0
 
 
 class StatsSummaryOut(BaseModel):
     active_habits_count: int
     completed_today: int
     scheduled_today: int
+    late_today: int = 0
+    violated_today: int = 0
     best_active_streak: int
     overall_completion_rate_30d: float
     last_7_days: list[DailyActivityPoint]
@@ -608,6 +1007,17 @@ class ScheduleHabitItemOut(BaseModel):
     monthly_week: int = 1
     monthly_weekday: int = 0
     target_per_day: int
+    mode: HabitMode = "free"
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
+    started_on_time: bool = False
+    is_late: bool = False
+    reminder_enabled: bool = False
+    reminder_times: list[str] = Field(default_factory=list)
+    reminder_mode: ReminderMode = "notification"
+    reminder_snooze_minutes: int = 10
+    reminder_message: str = ""
     date: str
     count: int
     completed: bool
@@ -641,6 +1051,15 @@ class HabitPeriodSummaryOut(BaseModel):
     monthly_week: int = 1
     monthly_weekday: int = 0
     target_per_day: int
+    mode: HabitMode = "free"
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
+    reminder_enabled: bool = False
+    reminder_times: list[str] = Field(default_factory=list)
+    reminder_mode: ReminderMode = "notification"
+    reminder_snooze_minutes: int = 10
+    reminder_message: str = ""
     scheduled_days: int
     completed_days: int
     remaining_days: int
@@ -660,6 +1079,37 @@ class PeriodScheduleOut(BaseModel):
     completion_rate: float
     habit_summaries: list[HabitPeriodSummaryOut]
     days: list[ScheduleDayOut]
+
+
+class HabitReminderItemOut(BaseModel):
+    habit_id: str
+    title: str
+    color: str
+    icon: str
+    frequency_type: FrequencyType = "daily"
+    scheduled_today: bool
+    completed_today: bool
+    count: int = 0
+    target_per_day: int = 1
+    reminder_enabled: bool = True
+    reminder_times: list[str] = Field(default_factory=list)
+    reminder_mode: ReminderMode = "notification"
+    reminder_snooze_minutes: int = 10
+    reminder_message: str = ""
+    next_trigger_date: str | None = None
+    next_trigger_time: str | None = None
+    due_today_times: list[str] = Field(default_factory=list)
+
+
+class RemindersOverviewOut(BaseModel):
+    date: str
+    now_time: str | None = None
+    enabled_habits_count: int
+    alarm_habits_count: int
+    notification_habits_count: int
+    scheduled_today_count: int
+    pending_today_triggers: int
+    items: list[HabitReminderItemOut]
 
 
 class SliTrendPoint(BaseModel):
@@ -771,11 +1221,11 @@ def compute_streaks(
     habit: dict,
     completed_dates: set[str],
     reference_date: date,
+    today_violated: bool = False,
 ) -> tuple[int, int]:
     """
     Calculate (current_streak, best_streak) across scheduled days.
-    Includes a same-day grace period so an uncompleted habit today keeps its streak
-    from yesterday until the day passes.
+    Includes a same-day grace period unless today_violated is True.
     """
     if not completed_dates:
         return 0, 0
@@ -800,6 +1250,8 @@ def compute_streaks(
     current_streak = 0
     cursor = reference_date
     if is_scheduled_on(habit, cursor) and cursor.isoformat() not in completed_dates:
+        if today_violated:
+            return 0, best_streak
         cursor -= timedelta(days=1)
 
     while cursor >= earliest:
@@ -867,6 +1319,32 @@ def compute_period_bounds(
     return start_date, end_date
 
 
+def extract_reminder_fields(
+    habit: dict,
+) -> tuple[bool, list[str], ReminderMode, int, str]:
+    """Safely extract reminder fields from a habit document with legacy fallbacks."""
+    enabled = bool(habit.get("reminder_enabled", False))
+    raw_times = habit.get("reminder_times") or []
+    clean_times: list[str] = []
+    if isinstance(raw_times, list):
+        for item in raw_times:
+            if isinstance(item, str):
+                try:
+                    clean_times.append(normalize_reminder_time(item))
+                except ValueError:
+                    continue
+    clean_times = sorted(set(clean_times))[:MAX_REMINDER_TIMES]
+    raw_mode = habit.get("reminder_mode", "notification")
+    mode: ReminderMode = raw_mode if raw_mode in ("notification", "alarm") else "notification"
+    try:
+        snooze = int(habit.get("reminder_snooze_minutes", 10))
+    except (TypeError, ValueError):
+        snooze = 10
+    snooze = max(1, min(120, snooze))
+    message = str(habit.get("reminder_message", "") or "").strip()[:200]
+    return enabled, clean_times, mode, snooze, message
+
+
 def build_period_schedule(
     habits: list[dict],
     checkins_by_key: dict[tuple[str, str], dict],
@@ -879,6 +1357,10 @@ def build_period_schedule(
 
     effective_created: dict[str, date] = {}
     habit_acc: dict[str, dict] = {}
+    reminder_meta_by_id: dict[str, tuple[bool, list[str], ReminderMode, int, str]] = {}
+    mode_meta_by_id: dict[
+        str, tuple[HabitMode, str | None, str | None, str | None]
+    ] = {}
     for h in habits:
         hid = str(h["_id"])
         raw_created = h.get("created_at")
@@ -888,6 +1370,8 @@ def build_period_schedule(
             if hasattr(raw_created, "date")
             else start_date
         )
+        reminder_meta_by_id[hid] = extract_reminder_fields(h)
+        mode_meta_by_id[hid] = extract_habit_mode_fields(h)
         habit_acc[hid] = {
             "habit": h,
             "scheduled_days": 0,
@@ -936,6 +1420,8 @@ def build_period_schedule(
             else:
                 item_status = "overdue"
 
+            r_enabled, r_times, r_mode, r_snooze, r_msg = reminder_meta_by_id[hid]
+            h_mode, h_remind, h_start, h_end = mode_meta_by_id[hid]
             day_items.append(
                 ScheduleHabitItemOut(
                     habit_id=hid,
@@ -950,6 +1436,17 @@ def build_period_schedule(
                     monthly_week=h.get("monthly_week", 1),
                     monthly_weekday=h.get("monthly_weekday", 0),
                     target_per_day=h.get("target_per_day", 1),
+                    mode=h_mode,
+                    remind_time=h_remind,
+                    force_start_time=h_start,
+                    force_end_time=h_end,
+                    started_on_time=bool(chk.get("started_on_time", False)) if chk else False,
+                    is_late=bool(chk.get("is_late", False)) if chk else False,
+                    reminder_enabled=r_enabled,
+                    reminder_times=r_times,
+                    reminder_mode=r_mode,
+                    reminder_snooze_minutes=r_snooze,
+                    reminder_message=r_msg,
                     date=cursor_iso,
                     count=count,
                     completed=completed,
@@ -999,10 +1496,13 @@ def build_period_schedule(
         if acc["scheduled_days"] == 0:
             continue
         h = acc["habit"]
+        hid = str(h["_id"])
+        r_enabled, r_times, r_mode, r_snooze, r_msg = reminder_meta_by_id[hid]
+        h_mode, h_remind, h_start, h_end = mode_meta_by_id[hid]
         next_due = acc["next_upcoming"] or acc["first_overdue"]
         habit_summaries.append(
             HabitPeriodSummaryOut(
-                habit_id=str(h["_id"]),
+                habit_id=hid,
                 title=h["title"],
                 description=h.get("description", ""),
                 color=h.get("color", "#6366F1"),
@@ -1014,6 +1514,15 @@ def build_period_schedule(
                 monthly_week=h.get("monthly_week", 1),
                 monthly_weekday=h.get("monthly_weekday", 0),
                 target_per_day=h.get("target_per_day", 1),
+                mode=h_mode,
+                remind_time=h_remind,
+                force_start_time=h_start,
+                force_end_time=h_end,
+                reminder_enabled=r_enabled,
+                reminder_times=r_times,
+                reminder_mode=r_mode,
+                reminder_snooze_minutes=r_snooze,
+                reminder_message=r_msg,
                 scheduled_days=acc["scheduled_days"],
                 completed_days=acc["completed_days"],
                 remaining_days=acc["remaining_days"],
@@ -1135,6 +1644,7 @@ def compute_habit_sli(
     completed_dates: set[str],
     reference_date: date,
     window_days: int = 30,
+    today_violated: bool = False,
 ) -> HabitSliItem:
     hid = str(habit.get("_id", habit.get("id", "")))
     target_slo = round(float(habit.get("target_slo", 85.0)), 1)
@@ -1173,7 +1683,9 @@ def compute_habit_sli(
     else:
         item_status = "healthy"
 
-    curr_streak, _ = compute_streaks(habit, completed_dates, reference_date)
+    curr_streak, _ = compute_streaks(
+        habit, completed_dates, reference_date, today_violated=today_violated
+    )
 
     return HabitSliItem(
         habit_id=hid,
@@ -1205,6 +1717,7 @@ def build_sli_dashboard(
     completed_by_habit: dict[str, set[str]],
     reference_date: date,
     window_days: int = 30,
+    violated_habit_ids: set[str] | None = None,
 ) -> SliDashboardOut:
     habit_items: list[HabitSliItem] = []
     total_sched_7 = 0
@@ -1214,7 +1727,13 @@ def build_sli_dashboard(
         hid = str(h.get("_id", h.get("id", "")))
         c_dates = completed_by_habit.get(hid, set())
         habit_items.append(
-            compute_habit_sli(h, c_dates, reference_date, window_days=window_days)
+            compute_habit_sli(
+                h,
+                c_dates,
+                reference_date,
+                window_days=window_days,
+                today_violated=bool(violated_habit_ids and hid in violated_habit_ids),
+            )
         )
         s7, c7 = compute_window_sli_counts(h, c_dates, reference_date, 7)
         total_sched_7 += s7
@@ -1431,4 +1950,132 @@ def build_sli_dashboard(
         trend=trend,
         weekday_sli=weekday_sli,
         habits=habit_items,
+    )
+
+
+def compute_next_reminder_occurrence(
+    habit: dict,
+    target_date: date,
+    now_hhmm: str | None = None,
+    completed_today: bool = False,
+) -> tuple[str | None, str | None]:
+    """Return (YYYY-MM-DD, HH:MM) for the next upcoming reminder/alarm trigger."""
+    if habit.get("archived", False):
+        return None, None
+    enabled, times, _, _, _ = extract_reminder_fields(habit)
+    if not enabled or not times:
+        return None, None
+
+    normalized_now = normalize_reminder_time(now_hhmm) if now_hhmm else None
+    for offset in range(63):
+        candidate = target_date + timedelta(days=offset)
+        if not is_scheduled_on(habit, candidate):
+            continue
+        if offset == 0:
+            if completed_today:
+                continue
+            if normalized_now is not None:
+                for hhmm in times:
+                    if hhmm >= normalized_now:
+                        return candidate.isoformat(), hhmm
+                continue
+        return candidate.isoformat(), times[0]
+
+    return None, None
+
+
+def build_reminders_overview(
+    habits: list[dict],
+    day_checkins: dict[str, dict],
+    target_date: date,
+    now_time: str | None = None,
+) -> RemindersOverviewOut:
+    """Build an overview of active habit reminders and alarms for target_date."""
+    normalized_now = (
+        normalize_reminder_time(now_time) if now_time and now_time.strip() else None
+    )
+    items: list[HabitReminderItemOut] = []
+    alarm_count = 0
+    notification_count = 0
+    scheduled_today_count = 0
+    pending_today_triggers = 0
+
+    for h in habits:
+        if h.get("archived", False):
+            continue
+        enabled, times, mode, snooze_mins, message = extract_reminder_fields(h)
+        if not enabled or not times:
+            continue
+
+        hid = str(h.get("_id", h.get("id", "")))
+        chk = day_checkins.get(hid)
+        completed_today = bool(chk.get("completed", False)) if chk else False
+        count = int(chk.get("count", 0)) if chk else 0
+        scheduled_today = is_scheduled_on(h, target_date)
+
+        due_today_times = (
+            [
+                hhmm
+                for hhmm in times
+                if normalized_now is None or hhmm >= normalized_now
+            ]
+            if scheduled_today and not completed_today
+            else []
+        )
+
+        next_date, next_time = compute_next_reminder_occurrence(
+            h,
+            target_date=target_date,
+            now_hhmm=normalized_now,
+            completed_today=completed_today,
+        )
+
+        if mode == "alarm":
+            alarm_count += 1
+        else:
+            notification_count += 1
+        if scheduled_today:
+            scheduled_today_count += 1
+        pending_today_triggers += len(due_today_times)
+
+        items.append(
+            HabitReminderItemOut(
+                habit_id=hid,
+                title=h["title"],
+                color=h.get("color", "#6366F1"),
+                icon=h.get("icon", "check_circle"),
+                frequency_type=h.get("frequency_type", "daily"),
+                scheduled_today=scheduled_today,
+                completed_today=completed_today,
+                count=count,
+                target_per_day=int(h.get("target_per_day", 1)),
+                reminder_enabled=True,
+                reminder_times=times,
+                reminder_mode=mode,
+                reminder_snooze_minutes=snooze_mins,
+                reminder_message=message,
+                next_trigger_date=next_date,
+                next_trigger_time=next_time,
+                due_today_times=due_today_times,
+            )
+        )
+
+    items.sort(
+        key=lambda it: (
+            it.next_trigger_date is None,
+            it.next_trigger_date or "9999-99-99",
+            it.next_trigger_time or "99:99",
+            it.title.lower(),
+        )
+    )
+
+    return RemindersOverviewOut(
+        date=target_date.isoformat(),
+        now_time=normalized_now,
+        enabled_habits_count=len(items),
+        alarm_habits_count=alarm_count,
+        notification_habits_count=notification_count,
+        scheduled_today_count=scheduled_today_count,
+        pending_today_triggers=pending_today_triggers,
+        items=items,
     )

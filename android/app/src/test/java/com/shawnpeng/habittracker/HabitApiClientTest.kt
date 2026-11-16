@@ -3,11 +3,19 @@ package com.shawnpeng.habittracker
 import androidx.compose.ui.graphics.Color
 import com.shawnpeng.habittracker.data.ApiException
 import com.shawnpeng.habittracker.data.CheckinRequest
+import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.HabitCreateRequest
 import com.shawnpeng.habittracker.data.HabitUpdateRequest
+import com.shawnpeng.habittracker.data.computeNextTriggerDateTime
 import com.shawnpeng.habittracker.data.formatFrequencySummary
+import com.shawnpeng.habittracker.data.formatHabitModeSummary
+import com.shawnpeng.habittracker.data.formatReminderBadge
+import com.shawnpeng.habittracker.data.normalizeReminderTime
+import com.shawnpeng.habittracker.data.normalizeReminderTimes
 import com.shawnpeng.habittracker.data.parseHabitColor
+import com.shawnpeng.habittracker.data.validateHabitModeTimes
+import java.time.LocalDateTime
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -812,5 +820,388 @@ class HabitApiClientTest {
         val verifyBody = verifyReq.body.readUtf8()
         assertTrue(verifyBody.contains("\"email\":\"newuser@example.com\""))
         assertTrue(verifyBody.contains("\"code\":\"135790\""))
+    }
+
+    @Test
+    fun reminderTimeHelpersNormalizeSortDedupeAndFormatBadge() {
+        assertEquals("08:05", normalizeReminderTime("8:05"))
+        assertEquals("23:59", normalizeReminderTime(" 23:59 "))
+        assertNull(normalizeReminderTime("24:00"))
+        assertNull(normalizeReminderTime("09:60"))
+        assertNull(normalizeReminderTime("not-a-time"))
+
+        assertEquals(
+            listOf("07:15", "08:30", "21:00"),
+            normalizeReminderTimes(listOf("21:00", "8:30", "08:30", "bad", "07:15")),
+        )
+
+        assertNull(formatReminderBadge(enabled = false, times = listOf("09:00"), mode = "alarm"))
+        assertNull(formatReminderBadge(enabled = true, times = emptyList(), mode = "notification"))
+        assertEquals(
+            "🔔 08:30",
+            formatReminderBadge(enabled = true, times = listOf("8:30"), mode = "notification"),
+        )
+        assertEquals(
+            "⏰ 07:00, 12:30 (+1)",
+            formatReminderBadge(
+                enabled = true,
+                times = listOf("21:00", "07:00", "12:30"),
+                mode = "alarm",
+            ),
+        )
+    }
+
+    @Test
+    fun computeNextTriggerDateTimeHandlesDailyWeeklyMonthlyAndCompletedToday() {
+        val dailyHabit = Habit(
+            id = "h-daily",
+            title = "Hydrate",
+            frequencyType = "daily",
+            reminderEnabled = true,
+            reminderTimes = listOf("08:00", "20:00"),
+            reminderMode = "notification",
+        )
+        assertEquals(
+            LocalDateTime.of(2026, 4, 6, 20, 0),
+            computeNextTriggerDateTime(
+                habit = dailyHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 9, 0),
+                completedToday = false,
+            ),
+        )
+        assertEquals(
+            LocalDateTime.of(2026, 4, 7, 8, 0),
+            computeNextTriggerDateTime(
+                habit = dailyHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 9, 0),
+                completedToday = true,
+            ),
+        )
+
+        val fridayHabit = Habit(
+            id = "h-fri",
+            title = "Weekly Review",
+            frequencyType = "weekdays",
+            weekdays = listOf(4),
+            reminderEnabled = true,
+            reminderTimes = listOf("09:00"),
+            reminderMode = "alarm",
+        )
+        assertEquals(
+            LocalDateTime.of(2026, 4, 10, 9, 0),
+            computeNextTriggerDateTime(
+                habit = fridayHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 7, 0),
+            ),
+        )
+
+        val monthlyClampedHabit = Habit(
+            id = "h-mon",
+            title = "Month End Report",
+            frequencyType = "monthly",
+            monthlyMode = "from_start",
+            monthlyDay = 31,
+            reminderEnabled = true,
+            reminderTimes = listOf("18:00"),
+            reminderMode = "alarm",
+        )
+        assertEquals(
+            LocalDateTime.of(2026, 4, 30, 18, 0),
+            computeNextTriggerDateTime(
+                habit = monthlyClampedHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 29, 10, 0),
+            ),
+        )
+
+        assertNull(
+            computeNextTriggerDateTime(
+                habit = dailyHabit.copy(archived = true),
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 9, 0),
+            ),
+        )
+        assertNull(
+            computeNextTriggerDateTime(
+                habit = dailyHabit.copy(reminderEnabled = false),
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 9, 0),
+            ),
+        )
+    }
+
+    @Test
+    fun createUpdateAndGetRemindersOverviewSerializeReminderFields() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(201)
+                .setBody(
+                    """
+                    {
+                      "id": "h-rem-1",
+                      "title": "Deep Work",
+                      "description": "",
+                      "color": "#6366F1",
+                      "icon": "check_circle",
+                      "frequency_type": "daily",
+                      "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                      "target_per_day": 1,
+                      "target_slo": 90.0,
+                      "archived": false,
+                      "reminder_enabled": true,
+                      "reminder_times": ["09:00", "14:00"],
+                      "reminder_mode": "alarm",
+                      "reminder_snooze_minutes": 15,
+                      "reminder_message": "Phones away",
+                      "created_at": "2026-04-06T00:00:00Z"
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "id": "h-rem-1",
+                      "title": "Deep Work",
+                      "description": "",
+                      "color": "#6366F1",
+                      "icon": "check_circle",
+                      "frequency_type": "daily",
+                      "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                      "target_per_day": 1,
+                      "target_slo": 90.0,
+                      "archived": false,
+                      "reminder_enabled": true,
+                      "reminder_times": ["09:30"],
+                      "reminder_mode": "alarm",
+                      "reminder_snooze_minutes": 20,
+                      "reminder_message": "Start sprint",
+                      "created_at": "2026-04-06T00:00:00Z"
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "date": "2026-04-06",
+                      "now_time": "08:30",
+                      "enabled_habits_count": 1,
+                      "alarm_habits_count": 1,
+                      "notification_habits_count": 0,
+                      "scheduled_today_count": 1,
+                      "pending_today_triggers": 1,
+                      "items": [
+                        {
+                          "habit_id": "h-rem-1",
+                          "title": "Deep Work",
+                          "color": "#6366F1",
+                          "icon": "check_circle",
+                          "frequency_type": "daily",
+                          "scheduled_today": true,
+                          "completed_today": false,
+                          "count": 0,
+                          "target_per_day": 1,
+                          "reminder_enabled": true,
+                          "reminder_times": ["09:30"],
+                          "reminder_mode": "alarm",
+                          "reminder_snooze_minutes": 20,
+                          "reminder_message": "Start sprint",
+                          "next_trigger_date": "2026-04-06",
+                          "next_trigger_time": "09:30",
+                          "due_today_times": ["09:30"]
+                        }
+                      ]
+                    }
+                    """.trimIndent(),
+                ),
+        )
+
+        val created = client.createHabit(
+            HabitCreateRequest(
+                title = "Deep Work",
+                reminderEnabled = true,
+                reminderTimes = listOf("09:00", "14:00"),
+                reminderMode = "alarm",
+                reminderSnoozeMinutes = 15,
+                reminderMessage = "Phones away",
+            ),
+        )
+        assertTrue(created.reminderEnabled)
+        assertEquals(listOf("09:00", "14:00"), created.reminderTimes)
+        assertEquals("alarm", created.reminderMode)
+        assertEquals(15, created.reminderSnoozeMinutes)
+        assertEquals("Phones away", created.reminderMessage)
+
+        val patched = client.updateHabit(
+            habitId = "h-rem-1",
+            request = HabitUpdateRequest(
+                reminderTimes = listOf("09:30"),
+                reminderSnoozeMinutes = 20,
+                reminderMessage = "Start sprint",
+            ),
+        )
+        assertEquals(listOf("09:30"), patched.reminderTimes)
+        assertEquals(20, patched.reminderSnoozeMinutes)
+
+        val overview = client.getRemindersOverview(targetDate = "2026-04-06", nowTime = "08:30")
+        assertEquals(1, overview.enabledHabitsCount)
+        assertEquals(1, overview.alarmHabitsCount)
+        assertEquals(1, overview.pendingTodayTriggers)
+        assertEquals(1, overview.items.size)
+        assertEquals("09:30", overview.items.first().nextTriggerTime)
+        assertEquals(listOf("09:30"), overview.items.first().dueTodayTimes)
+
+        val createReq = server.takeRequest()
+        val createBody = createReq.body.readUtf8()
+        assertTrue(createBody.contains("\"reminder_enabled\":true"))
+        assertTrue(createBody.contains("\"reminder_mode\":\"alarm\""))
+        assertTrue(createBody.contains("\"reminder_snooze_minutes\":15"))
+
+        val patchReq = server.takeRequest()
+        val patchBody = patchReq.body.readUtf8()
+        assertTrue(patchBody.contains("\"reminder_times\":[\"09:30\"]"))
+        assertTrue(patchBody.contains("\"reminder_snooze_minutes\":20"))
+        assertFalse(patchBody.contains("title"))
+
+        val overviewReq = server.takeRequest()
+        assertEquals("GET", overviewReq.method)
+        assertEquals("/api/habits/reminders?target_date=2026-04-06&now_time=08%3A30", overviewReq.path)
+    }
+
+    @Test
+    fun habitModesValidationAndApiSerializationWork() = runTest {
+        val validStrict = validateHabitModeTimes("strict", "8:30", "08:45", "10:00")
+        assertNull(validStrict.errorMessage)
+        assertEquals("08:30", validStrict.remindTime)
+        assertEquals("08:45", validStrict.forceStartTime)
+        assertEquals("10:00", validStrict.forceEndTime)
+
+        val badStrict = validateHabitModeTimes("strict", "09:00", "08:45", "10:00")
+        assertTrue(!badStrict.errorMessage.isNullOrBlank())
+
+        assertNull(formatHabitModeSummary("free"))
+        assertEquals(
+            "模式1·严格管控（提醒 08:30 · 开始 08:45 · 完成 10:00）",
+            formatHabitModeSummary("strict", "08:30", "08:45", "10:00"),
+        )
+
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    [
+                      {
+                        "id": "h-mode-1",
+                        "title": "Deep Work",
+                        "description": "",
+                        "color": "#6366F1",
+                        "icon": "check_circle",
+                        "frequency_type": "daily",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "target_per_day": 1,
+                        "target_slo": 85.0,
+                        "mode": "strict",
+                        "remind_time": "08:30",
+                        "force_start_time": "08:45",
+                        "force_end_time": "10:00",
+                        "archived": false,
+                        "created_at": "2026-11-15T00:00:00Z",
+                        "date": "2026-11-15",
+                        "scheduled_today": true,
+                        "count": 0,
+                        "completed": false,
+                        "note": "",
+                        "current_streak": 1,
+                        "best_streak": 3,
+                        "day_status": "reminding",
+                        "violation_reason": null,
+                        "started_at_time": null,
+                        "started_on_time": false,
+                        "is_late": false,
+                        "can_start": true
+                      }
+                    ]
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "id": "h-mode-1",
+                      "title": "Deep Work",
+                      "description": "",
+                      "color": "#6366F1",
+                      "icon": "check_circle",
+                      "frequency_type": "daily",
+                      "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                      "target_per_day": 1,
+                      "target_slo": 85.0,
+                      "mode": "strict",
+                      "remind_time": "08:30",
+                      "force_start_time": "08:45",
+                      "force_end_time": "10:00",
+                      "archived": false,
+                      "created_at": "2026-11-15T00:00:00Z",
+                      "date": "2026-11-15",
+                      "scheduled_today": true,
+                      "count": 0,
+                      "completed": false,
+                      "note": "",
+                      "current_streak": 1,
+                      "best_streak": 3,
+                      "day_status": "in_progress",
+                      "violation_reason": null,
+                      "started_at_time": "08:40",
+                      "started_on_time": true,
+                      "is_late": false,
+                      "can_start": false
+                    }
+                    """.trimIndent(),
+                ),
+        )
+
+        client.authToken = "jwt-modes"
+        val todayList = client.getTodayHabits(
+            targetDate = "2026-11-15",
+            clientToday = "2026-11-15",
+            clientTime = "08:35",
+        )
+        assertEquals(1, todayList.size)
+        assertEquals("strict", todayList.first().mode)
+        assertEquals("reminding", todayList.first().dayStatus)
+        assertTrue(todayList.first().canStart)
+
+        val started = client.checkinHabit(
+            habitId = "h-mode-1",
+            request = CheckinRequest(
+                date = "2026-11-15",
+                action = "start",
+                clientToday = "2026-11-15",
+                clientTime = "08:40",
+            ),
+        )
+        assertEquals("in_progress", started.dayStatus)
+        assertTrue(started.startedOnTime)
+        assertEquals("08:40", started.startedAtTime)
+        assertFalse(started.canStart)
+
+        val todayReq = server.takeRequest()
+        assertEquals(
+            "/api/habits/today?target_date=2026-11-15&client_today=2026-11-15&client_time=08%3A35",
+            todayReq.path,
+        )
+        val startReq = server.takeRequest()
+        val startBody = startReq.body.readUtf8()
+        assertTrue(startBody.contains("\"action\":\"start\""))
+        assertTrue(startBody.contains("\"client_today\":\"2026-11-15\""))
+        assertTrue(startBody.contains("\"client_time\":\"08:40\""))
     }
 }
