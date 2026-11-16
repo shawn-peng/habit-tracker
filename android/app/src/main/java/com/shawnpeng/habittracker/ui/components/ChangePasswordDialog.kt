@@ -59,7 +59,7 @@ fun ChangePasswordDialog(
         },
         title = {
             Text(
-                text = "修改密码",
+                text = "Change Password",
                 fontWeight = FontWeight.Bold,
             )
         },
@@ -73,14 +73,14 @@ fun ChangePasswordDialog(
                 OutlinedTextField(
                     value = currentPassword,
                     onValueChange = { currentPassword = it },
-                    label = { Text("当前密码") },
+                    label = { Text("Current Password") },
                     leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                     trailingIcon = {
                         IconButton(onClick = { passwordVisible = !passwordVisible }) {
                             Icon(
                                 imageVector = if (passwordVisible) Icons.Rounded.VisibilityOff
                                 else Icons.Rounded.Visibility,
-                                contentDescription = if (passwordVisible) "隐藏密码" else "显示密码",
+                                contentDescription = if (passwordVisible) "Hide password" else "Show password",
                             )
                         }
                     },
@@ -101,14 +101,14 @@ fun ChangePasswordDialog(
                 OutlinedTextField(
                     value = newPassword,
                     onValueChange = { newPassword = it },
-                    label = { Text("新密码（至少 6 位）") },
+                    label = { Text("New Password (at least 6 chars)") },
                     leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                     trailingIcon = {
                         IconButton(onClick = { passwordVisible = !passwordVisible }) {
                             Icon(
                                 imageVector = if (passwordVisible) Icons.Rounded.VisibilityOff
                                 else Icons.Rounded.Visibility,
-                                contentDescription = if (passwordVisible) "隐藏密码" else "显示密码",
+                                contentDescription = if (passwordVisible) "Hide password" else "Show password",
                             )
                         }
                     },
@@ -129,14 +129,14 @@ fun ChangePasswordDialog(
                 OutlinedTextField(
                     value = confirmPassword,
                     onValueChange = { confirmPassword = it },
-                    label = { Text("确认新密码") },
+                    label = { Text("Confirm New Password") },
                     leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                     trailingIcon = {
                         IconButton(onClick = { passwordVisible = !passwordVisible }) {
                             Icon(
                                 imageVector = if (passwordVisible) Icons.Rounded.VisibilityOff
                                 else Icons.Rounded.Visibility,
-                                contentDescription = if (passwordVisible) "隐藏密码" else "显示密码",
+                                contentDescription = if (passwordVisible) "Hide password" else "Show password",
                             )
                         }
                     },
@@ -193,7 +193,7 @@ fun ChangePasswordDialog(
                         color = MaterialTheme.colorScheme.onPrimary,
                     )
                 } else {
-                    Text("确认修改")
+                    Text("Update Password")
                 }
             }
         },
@@ -202,7 +202,7 @@ fun ChangePasswordDialog(
                 onClick = onDismiss,
                 enabled = !isSubmitting,
             ) {
-                Text("取消")
+                Text("Cancel")
             }
         },
     )

@@ -22,6 +22,7 @@ from app.core import (
     HabitTodayOut,
     HabitUpdate,
     LoginRequest,
+    MAX_REMINDER_TIMES,
     PeriodScheduleOut,
     RESET_MAX_ATTEMPTS,
     RESET_MAX_REQUESTS_PER_WINDOW,
@@ -747,73 +748,161 @@ async def update_habit(
     elif updates.get("frequency_type") == "monthly" and "weekdays" not in updates:
         updates["weekdays"] = [0, 1, 2, 3, 4, 5, 6]
 
-    mode_fields_touched = bool(
-        {"mode", "remind_time", "force_start_time", "force_end_time"}
+    mode_or_reminder_touched = bool(
+        {
+            "mode",
+            "remind_time",
+            "force_start_time",
+            "force_end_time",
+            "reminder_enabled",
+            "reminder_times",
+        }
         & payload.model_fields_set
     )
-    needs_existing = (
-        not updates
-        or mode_fields_touched
-        or (updates.get("reminder_enabled") is True and "reminder_times" not in updates)
-        or (
-            "reminder_times" in updates
-            and len(updates["reminder_times"]) == 0
-            and updates.get("reminder_enabled") is not False
-        )
-    )
-    if needs_existing:
+    if not updates or mode_or_reminder_touched:
         existing = await db.habits.find_one(
             {"_id": ObjectId(habit_id), "user_id": str(current_user["_id"])}
         )
         if not existing:
             raise HTTPException(status_code=404, detail="Habit not found")
-        if not updates and not mode_fields_touched:
+        if not updates and not mode_or_reminder_touched:
             return _serialize_habit(existing)
-        if (
-            updates.get("reminder_enabled") is True
-            and "reminder_times" not in updates
-            and not existing.get("reminder_times")
-        ) or (
-            "reminder_times" in updates
-            and len(updates["reminder_times"]) == 0
-            and updates.get("reminder_enabled") is not False
-            and existing.get("reminder_enabled", False)
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="At least one reminder time (HH:MM) is required when reminders are enabled",
+
+        explicit_free_mode = (
+            "mode" in payload.model_fields_set
+            and payload.mode == "free"
+            and payload.reminder_enabled is not True
+        )
+        explicit_disable_reminder = (
+            payload.reminder_enabled is False
+            and "mode" not in payload.model_fields_set
+        )
+        if explicit_free_mode or explicit_disable_reminder:
+            updates["mode"] = "free"
+            updates["remind_time"] = None
+            updates["force_start_time"] = None
+            updates["force_end_time"] = None
+            updates["reminder_enabled"] = False
+            updates["reminder_times"] = []
+        else:
+            existing_mode, existing_remind, existing_start, existing_end = (
+                extract_habit_mode_fields(existing)
             )
-        if mode_fields_touched:
+            _, existing_times, _, _, _ = extract_reminder_fields(existing)
+
+            if (
+                payload.reminder_enabled is True
+                and "reminder_times" not in payload.model_fields_set
+                and "remind_time" not in payload.model_fields_set
+                and not existing_times
+                and not existing_remind
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one reminder time (HH:MM) is required when reminders are enabled",
+                )
+
+            if (
+                "reminder_times" in payload.model_fields_set
+                and payload.reminder_times is not None
+                and len(payload.reminder_times) == 0
+                and existing.get("reminder_enabled", False)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one reminder time (HH:MM) is required when reminders are enabled",
+                )
+
             merged_mode = (
                 payload.mode
                 if "mode" in payload.model_fields_set and payload.mode is not None
-                else existing.get("mode", "free")
+                else existing_mode
             )
-            merged_remind = (
-                payload.remind_time
-                if "remind_time" in payload.model_fields_set
-                else existing.get("remind_time")
-            )
-            merged_start = (
-                payload.force_start_time
-                if "force_start_time" in payload.model_fields_set
-                else existing.get("force_start_time")
-            )
-            merged_end = (
-                payload.force_end_time
-                if "force_end_time" in payload.model_fields_set
-                else existing.get("force_end_time")
-            )
-            try:
-                norm_remind, norm_start, norm_end = validate_and_normalize_mode_times(
-                    merged_mode, merged_remind, merged_start, merged_end
+            if merged_mode == "free" and (
+                payload.reminder_enabled is True
+                or bool(payload.reminder_times and len(payload.reminder_times) > 0)
+            ):
+                merged_mode = "reminder"
+
+            if merged_mode == "free":
+                updates["mode"] = "free"
+                updates["remind_time"] = None
+                updates["force_start_time"] = None
+                updates["force_end_time"] = None
+                updates["reminder_enabled"] = False
+                updates["reminder_times"] = []
+            else:
+                merged_remind = (
+                    payload.remind_time
+                    if "remind_time" in payload.model_fields_set
+                    else existing_remind
                 )
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            updates["mode"] = merged_mode
-            updates["remind_time"] = norm_remind
-            updates["force_start_time"] = norm_start
-            updates["force_end_time"] = norm_end
+                if merged_mode == "reminder" and "remind_time" not in payload.model_fields_set:
+                    if "reminder_times" in payload.model_fields_set and payload.reminder_times:
+                        merged_remind = payload.reminder_times[0]
+                    elif merged_remind is None and existing_times:
+                        merged_remind = existing_times[0]
+
+                merged_start = (
+                    payload.force_start_time
+                    if "force_start_time" in payload.model_fields_set
+                    else existing_start
+                )
+                merged_end = (
+                    payload.force_end_time
+                    if "force_end_time" in payload.model_fields_set
+                    else existing_end
+                )
+                try:
+                    norm_remind, norm_start, norm_end = validate_and_normalize_mode_times(
+                        merged_mode, merged_remind, merged_start, merged_end
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+                updates["mode"] = merged_mode
+                updates["remind_time"] = norm_remind
+                updates["force_start_time"] = norm_start
+                updates["force_end_time"] = norm_end
+                updates["reminder_enabled"] = True
+
+                if (
+                    "reminder_times" in payload.model_fields_set
+                    and payload.reminder_times is not None
+                ):
+                    if merged_mode == "reminder":
+                        merged_t = sorted(
+                            set(payload.reminder_times)
+                            | (
+                                {norm_remind}
+                                if "remind_time" in payload.model_fields_set
+                                and norm_remind
+                                else set()
+                            )
+                        )[:MAX_REMINDER_TIMES]
+                        if not merged_t:
+                            raise HTTPException(
+                                status_code=422,
+                                detail="At least one reminder time (HH:MM) is required when reminders are enabled",
+                            )
+                        updates["reminder_times"] = merged_t
+                        updates["remind_time"] = merged_t[0]
+                    else:
+                        updates["reminder_times"] = sorted(
+                            set(payload.reminder_times)
+                            | ({norm_remind} if norm_remind else set())
+                        )[:MAX_REMINDER_TIMES]
+                else:
+                    if merged_mode in ("strict", "window"):
+                        updates["reminder_times"] = [norm_remind] if norm_remind else []
+                    else:
+                        if "remind_time" in payload.model_fields_set:
+                            updates["reminder_times"] = [norm_remind] if norm_remind else []
+                        else:
+                            updates["reminder_times"] = (
+                                existing_times
+                                or ([norm_remind] if norm_remind else [])
+                            )
 
     res = await db.habits.find_one_and_update(
         {"_id": ObjectId(habit_id), "user_id": str(current_user["_id"])},
@@ -1014,7 +1103,7 @@ async def get_habits_reminders(
             "created_at", 1
         )
     ]
-    habit_ids = [str(h["_id"]) for h in habits if h.get("reminder_enabled", False)]
+    habit_ids = [str(h["_id"]) for h in habits if extract_reminder_fields(h)[0]]
     day_checkins: dict[str, dict] = {}
     if habit_ids:
         async for chk in db.checkins.find(
@@ -1088,19 +1177,19 @@ async def checkin_habit(
         if mode != "strict":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="只有模式1（严格管控）需要点击「开始执行」",
+                detail="Only Mode 1 (Strict Control) supports Start Execution.",
             )
         if prev_completed or prev_count >= target:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="该习惯今日已完成，无需重复开始执行",
+                detail="This habit is already completed for today.",
             )
         if iso_date != client_today_iso or (
             force_start_time is not None and resolved_time > force_start_time
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="已超过强制执行时间，当前已违规，请直接点击「超时补卡」",
+                detail="Past the Force Start Time; this habit is now in violation. Please use Overdue Make-up instead.",
             )
         new_count = prev_count
         completed = False
@@ -1129,7 +1218,7 @@ async def checkin_habit(
         ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="模式1（严格管控）请先点击「开始执行」，再进行完成打卡",
+                detail="Mode 1 (Strict Control) requires clicking Start Execution before completing check-in.",
             )
 
         completed = new_count >= target

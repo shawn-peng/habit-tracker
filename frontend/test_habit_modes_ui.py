@@ -235,14 +235,14 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
             texts = _collect_text_values(view)
             # 2 on-time completed out of 7 scheduled (late makeup excluded!)
             self.assertIn("2 / 7 completed", texts)
-            self.assertTrue(any("超时补卡 1" in t for t in texts))
-            self.assertTrue(any("超时违规 1" in t for t in texts))
-            self.assertIn("开始提醒中", texts)
-            self.assertIn("执行中", texts)
-            self.assertIn("超时违规", texts)
-            self.assertIn("超时补卡", texts)
-            self.assertIn("准时完成", texts)
-            self.assertIn("待打卡", texts)
+            self.assertTrue(any("Overdue Make-up: 1" in t for t in texts))
+            self.assertTrue(any("Violations: 1" in t for t in texts))
+            self.assertIn("Reminding", texts)
+            self.assertIn("In Progress", texts)
+            self.assertIn("Violation", texts)
+            self.assertIn("Overdue Make-up", texts)
+            self.assertIn("On Time", texts)
+            self.assertIn("Pending", texts)
 
             filled_btns = [
                 c
@@ -250,8 +250,8 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
                 if isinstance(c, ft.FilledButton)
                 and isinstance(getattr(c, "content", None), ft.Text)
             ]
-            start_btn = next(b for b in filled_btns if b.content.value == "开始执行")
-            makeup_btn = next(b for b in filled_btns if b.content.value == "超时补卡")
+            start_btn = next(b for b in filled_btns if b.content.value == "Start Execution")
+            makeup_btn = next(b for b in filled_btns if b.content.value == "Overdue Make-up")
 
             await start_btn.on_click(None)
             self.assertEqual(app.api.checkin_habit.await_args.kwargs["action"], "start")
@@ -313,7 +313,7 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
             start_icon = next(
                 c
                 for c in _walk_controls(row)
-                if isinstance(c, ft.IconButton) and c.tooltip == "开始执行"
+                if isinstance(c, ft.IconButton) and c.tooltip == "Start Execution"
             )
             await start_icon.on_click(None)
             self.assertEqual(app.api.checkin_habit.await_args.kwargs["action"], "start")
@@ -388,11 +388,14 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         stats_view = app._build_stats_view()
         sli_view = app._build_sli_view()
         self.assertTrue(
-            any("模式1" in t for t in _collect_text_values(habits_view))
+            any("Mode 1" in t for t in _collect_text_values(habits_view))
+        )
+        self.assertTrue(
+            any("8:30 AM" in t for t in _collect_text_values(habits_view))
         )
         stats_texts = _collect_text_values(stats_view)
-        self.assertIn("+1补", stats_texts)
-        self.assertTrue(any("超时补卡: 1" in t for t in stats_texts))
+        self.assertIn("+1 late", stats_texts)
+        self.assertTrue(any("Make-ups: 1" in t for t in stats_texts))
         self.assertIsNotNone(sli_view)
 
         # Habit Dialog: switch to strict mode, validate ordering, then save payload
@@ -431,17 +434,47 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(err_text.visible)
         app.api.create_habit.assert_not_awaited()
 
-        # Valid time ordering accepted
+        # Valid 12h AM/PM time ordering accepted (08:30 AM < 08:45 AM < 01:30 PM -> 13:30)
         text_fields["Remind Time (HH:MM)"].value = "08:30"
+        dropdowns["Remind AM/PM"].value = "AM"
         text_fields["Force Start Time (HH:MM)"].value = "08:45"
-        text_fields["Force End Time (HH:MM)"].value = "10:00"
+        dropdowns["Start AM/PM"].value = "AM"
+        text_fields["Force End Time (HH:MM)"].value = "01:30"
+        dropdowns["End AM/PM"].value = "PM"
+        dropdowns["Reminder Style"].value = "alarm"
         await save_btn.on_click(None)
         app.api.create_habit.assert_awaited_once()
         payload = app.api.create_habit.await_args.args[0]
         self.assertEqual(payload["mode"], "strict")
         self.assertEqual(payload["remind_time"], "08:30")
         self.assertEqual(payload["force_start_time"], "08:45")
-        self.assertEqual(payload["force_end_time"], "10:00")
+        self.assertEqual(payload["force_end_time"], "13:30")
+        self.assertTrue(payload["reminder_enabled"])
+        self.assertEqual(payload["reminder_times"], ["08:30"])
+        self.assertEqual(payload["reminder_mode"], "alarm")
+
+        # Opening edit dialog pre-populates 12h values + AM/PM selectors cleanly
+        app._open_habit_dialog(
+            {
+                "id": "h-edit",
+                "title": "Afternoon Strict",
+                "frequency_type": "daily",
+                "mode": "strict",
+                "remind_time": "13:00",
+                "force_start_time": "13:15",
+                "force_end_time": "21:30",
+            }
+        )
+        edit_dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+        edit_ctrls = list(_walk_controls(edit_dlg))
+        edit_tf = {c.label: c for c in edit_ctrls if isinstance(c, ft.TextField) and c.label}
+        edit_dd = {c.label: c for c in edit_ctrls if isinstance(c, ft.Dropdown) and c.label}
+        self.assertEqual(edit_tf["Remind Time (HH:MM)"].value, "01:00")
+        self.assertEqual(edit_dd["Remind AM/PM"].value, "PM")
+        self.assertEqual(edit_tf["Force Start Time (HH:MM)"].value, "01:15")
+        self.assertEqual(edit_dd["Start AM/PM"].value, "PM")
+        self.assertEqual(edit_tf["Force End Time (HH:MM)"].value, "09:30")
+        self.assertEqual(edit_dd["End AM/PM"].value, "PM")
 
 
 if __name__ == "__main__":

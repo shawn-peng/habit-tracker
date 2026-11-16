@@ -49,7 +49,7 @@ fun StatsScreen(summary: StatsSummary?) {
     ) {
         item {
             Text(
-                text = "连胜与统计",
+                text = "Streaks & Statistics",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
             )
@@ -61,14 +61,14 @@ fun StatsScreen(summary: StatsSummary?) {
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 KpiCard(
-                    title = "最高活跃连胜",
-                    value = "${stats.bestActiveStreak} 天",
+                    title = "Best Streak",
+                    value = "${stats.bestActiveStreak}d",
                     icon = Icons.Rounded.LocalFireDepartment,
                     accent = MaterialTheme.colorScheme.tertiary,
                     modifier = Modifier.weight(1f),
                 )
                 KpiCard(
-                    title = "30天完成率",
+                    title = "30d Rate",
                     value = "${stats.overallCompletionRate30d}%",
                     icon = Icons.Rounded.Insights,
                     accent = MaterialTheme.colorScheme.secondary,
@@ -76,9 +76,9 @@ fun StatsScreen(summary: StatsSummary?) {
                 )
                 KpiCard(
                     title = if (stats.lateToday > 0 || stats.violatedToday > 0) {
-                        "今日达成 · 补卡${stats.lateToday}/违规${stats.violatedToday}"
+                        "Today (${stats.lateToday}L/${stats.violatedToday}V)"
                     } else {
-                        "今日达成"
+                        "Today's Score"
                     },
                     value = "${stats.completedToday}/${stats.scheduledToday}",
                     icon = Icons.Rounded.CheckCircleOutline,
@@ -100,14 +100,14 @@ fun StatsScreen(summary: StatsSummary?) {
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     Text(
-                        text = "近 7 天打卡趋势",
+                        text = "Last 7 Days Activity",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
 
                     if (stats.last7Days.isEmpty()) {
                         Text(
-                            text = "暂无最近 7 天数据",
+                            text = "No activity recorded in the last 7 days",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -137,7 +137,7 @@ fun StatsScreen(summary: StatsSummary?) {
                                 ) {
                                     Text(
                                         text = if (point.lateCount > 0) {
-                                            "${point.completedCount}/${point.scheduledCount}+${point.lateCount}补"
+                                            "${point.completedCount}/${point.scheduledCount} (+${point.lateCount}L)"
                                         } else {
                                             "${point.completedCount}/${point.scheduledCount}"
                                         },
@@ -175,7 +175,7 @@ fun StatsScreen(summary: StatsSummary?) {
 
         item {
             Text(
-                text = "习惯连胜榜",
+                text = "Habit Streaks Breakdown",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -189,7 +189,7 @@ fun StatsScreen(summary: StatsSummary?) {
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 ) {
                     Text(
-                        text = "开始打卡后即可查看每个习惯的连胜排行榜。",
+                        text = "Start checking in to see streak rankings for each habit.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(24.dp),
@@ -199,7 +199,7 @@ fun StatsScreen(summary: StatsSummary?) {
         } else {
             items(stats.habitStats, key = { it.habitId }) { hs ->
                 val accentColor = parseHabitColor(hs.color)
-                val streakUnit = if (hs.frequencyType == "monthly") "月" else "天"
+                val streakUnit = if (hs.frequencyType == "monthly") "mo" else "d"
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
@@ -239,12 +239,12 @@ fun StatsScreen(summary: StatsSummary?) {
                                     ""
                                 }
                                 val lateTag = if (hs.lateCompletions > 0) {
-                                    " · 补卡 ${hs.lateCompletions} 次"
+                                    " · Make-ups: ${hs.lateCompletions}"
                                 } else {
                                     ""
                                 }
                                 Text(
-                                    text = "${modeTag}30天完成率 ${hs.completionRate30d}% · 准时 ${hs.totalCompletions} 次$lateTag",
+                                    text = "${modeTag}30d rate: ${hs.completionRate30d}% · On-time: ${hs.totalCompletions}$lateTag",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -253,13 +253,13 @@ fun StatsScreen(summary: StatsSummary?) {
 
                         Column(horizontalAlignment = Alignment.End) {
                             Text(
-                                text = "当前 ${hs.currentStreak} $streakUnit",
+                                text = "Current: ${hs.currentStreak}$streakUnit",
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.tertiary,
                             )
                             Text(
-                                text = "最佳 ${hs.bestStreak} $streakUnit",
+                                text = "Best: ${hs.bestStreak}$streakUnit",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )

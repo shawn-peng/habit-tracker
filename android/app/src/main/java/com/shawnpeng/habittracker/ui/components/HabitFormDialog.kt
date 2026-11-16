@@ -27,7 +27,6 @@ import androidx.compose.material.icons.rounded.AccessTime
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalIconButton
@@ -38,7 +37,6 @@ import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
@@ -67,9 +65,12 @@ import com.shawnpeng.habittracker.data.REMINDER_SNOOZE_OPTIONS
 import com.shawnpeng.habittracker.data.REMINDER_TIME_PRESETS
 import com.shawnpeng.habittracker.data.WEEKDAY_SHORT_LABELS
 import com.shawnpeng.habittracker.data.formatFrequencySummary
+import com.shawnpeng.habittracker.data.formatTime12h
 import com.shawnpeng.habittracker.data.normalizeReminderTime
 import com.shawnpeng.habittracker.data.normalizeReminderTimes
 import com.shawnpeng.habittracker.data.parseHabitColor
+import com.shawnpeng.habittracker.data.resolveTimeWithMeridiem
+import com.shawnpeng.habittracker.data.split24hTo12h
 import com.shawnpeng.habittracker.data.validateHabitModeTimes
 import com.shawnpeng.habittracker.notifications.HabitNotificationHelper
 
@@ -123,25 +124,41 @@ fun HabitFormDialog(
         mutableStateOf(
             when (existing?.mode) {
                 "strict", "window", "reminder" -> existing.mode
-                else -> "free"
+                else -> if (existing?.reminderEnabled == true) "reminder" else "free"
             },
         )
     }
+    val initialRemindPair = remember(existing) {
+        val fallbackRemind = existing?.remindTime ?: existing?.reminderTimes?.firstOrNull()
+        split24hTo12h(fallbackRemind, "AM")
+    }
+    val initialStartPair = remember(existing) { split24hTo12h(existing?.forceStartTime, "AM") }
+    val initialEndPair = remember(existing) { split24hTo12h(existing?.forceEndTime, "PM") }
     var remindTimeText by remember(existing) {
-        mutableStateOf(existing?.remindTime.orEmpty())
+        mutableStateOf(initialRemindPair.first)
+    }
+    var remindMeridiem by remember(existing) {
+        mutableStateOf(initialRemindPair.second)
     }
     var forceStartTimeText by remember(existing) {
-        mutableStateOf(existing?.forceStartTime.orEmpty())
+        mutableStateOf(initialStartPair.first)
+    }
+    var startMeridiem by remember(existing) {
+        mutableStateOf(initialStartPair.second)
     }
     var forceEndTimeText by remember(existing) {
-        mutableStateOf(existing?.forceEndTime.orEmpty())
+        mutableStateOf(initialEndPair.first)
+    }
+    var endMeridiem by remember(existing) {
+        mutableStateOf(initialEndPair.second)
     }
     var modeTimePickerTarget by remember { mutableStateOf<String?>(null) }
-    var reminderEnabled by remember(existing) {
-        mutableStateOf(existing?.reminderEnabled ?: false)
-    }
     var reminderTimes by remember(existing) {
-        mutableStateOf(normalizeReminderTimes(existing?.reminderTimes.orEmpty()))
+        mutableStateOf(
+            normalizeReminderTimes(
+                existing?.reminderTimes.orEmpty() + listOfNotNull(existing?.remindTime),
+            ),
+        )
     }
     var reminderMode by remember(existing) {
         mutableStateOf(
@@ -155,13 +172,18 @@ fun HabitFormDialog(
         mutableStateOf(existing?.reminderMessage.orEmpty())
     }
     var customTimeText by remember { mutableStateOf("") }
+    var customTimeMeridiem by remember { mutableStateOf("AM") }
     var showTimePickerDialog by remember { mutableStateOf(false) }
     var validationError by remember { mutableStateOf<String?>(null) }
 
-    fun addReminderTime(raw: String): Boolean {
-        val normalized = normalizeReminderTime(raw)
+    fun addReminderTime(raw: String, meridiem: String? = null): Boolean {
+        val normalized = if (meridiem != null) {
+            resolveTimeWithMeridiem(raw, meridiem)
+        } else {
+            normalizeReminderTime(raw)
+        }
         if (normalized == null) {
-            validationError = "提醒时间格式需为 HH:MM（00:00-23:59）"
+            validationError = "Time must be in HH:MM or H:MM AM/PM format"
             return false
         }
         if (normalized in reminderTimes) {
@@ -169,7 +191,7 @@ fun HabitFormDialog(
             return true
         }
         if (reminderTimes.size >= MAX_REMINDER_TIMES) {
-            validationError = "最多添加 $MAX_REMINDER_TIMES 个提醒时间"
+            validationError = "At most $MAX_REMINDER_TIMES reminder times are allowed"
             return false
         }
         reminderTimes = normalizeReminderTimes(reminderTimes + normalized)
@@ -181,7 +203,7 @@ fun HabitFormDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = if (existing == null) "新建习惯" else "编辑习惯",
+                text = if (existing == null) "New Habit" else "Edit Habit",
                 fontWeight = FontWeight.Bold,
             )
         },
@@ -198,8 +220,8 @@ fun HabitFormDialog(
                         title = it
                         validationError = null
                     },
-                    label = { Text("习惯名称") },
-                    placeholder = { Text("例如：阅读 20 页、交房租、月度复盘") },
+                    label = { Text("Habit Title") },
+                    placeholder = { Text("e.g., Read 20 pages, Pay rent, Monthly review") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -207,7 +229,7 @@ fun HabitFormDialog(
                 OutlinedTextField(
                     value = description,
                     onValueChange = { description = it },
-                    label = { Text("备注 / 激励语（选填）") },
+                    label = { Text("Notes / Motivation (optional)") },
                     singleLine = false,
                     maxLines = 2,
                     modifier = Modifier.fillMaxWidth(),
@@ -219,7 +241,7 @@ fun HabitFormDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = if (scheduleType == "monthly") "单次目标次数" else "每日目标次数",
+                        text = if (scheduleType == "monthly") "Target Count (on due day)" else "Daily Target Count",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -228,10 +250,10 @@ fun HabitFormDialog(
                             onClick = { if (targetPerDay > 1) targetPerDay-- },
                             enabled = targetPerDay > 1,
                         ) {
-                            Icon(Icons.Rounded.Remove, contentDescription = "减少次数")
+                            Icon(Icons.Rounded.Remove, contentDescription = "Decrease count")
                         }
                         Text(
-                            text = "$targetPerDay 次",
+                            text = "${targetPerDay}x",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 12.dp),
@@ -240,14 +262,14 @@ fun HabitFormDialog(
                             onClick = { if (targetPerDay < 100) targetPerDay++ },
                             enabled = targetPerDay < 100,
                         ) {
-                            Icon(Icons.Rounded.Add, contentDescription = "增加次数")
+                            Icon(Icons.Rounded.Add, contentDescription = "Increase count")
                         }
                     }
                 }
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "目标 SLO (%)",
+                        text = "Target SLO (%)",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -273,8 +295,8 @@ fun HabitFormDialog(
                             targetSloText = it
                             validationError = null
                         },
-                        label = { Text("目标 SLO (%)") },
-                        placeholder = { Text("1 - 100，例如 85.0") },
+                        label = { Text("Target SLO (%)") },
+                        placeholder = { Text("1 - 100, e.g., 85.0") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.fillMaxWidth(),
@@ -283,7 +305,7 @@ fun HabitFormDialog(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "主题颜色",
+                        text = "Accent Color",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -324,7 +346,7 @@ fun HabitFormDialog(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "重复周期",
+                        text = "Schedule Frequency",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -335,7 +357,7 @@ fun HabitFormDialog(
                                 scheduleType = "daily"
                                 validationError = null
                             },
-                            label = { Text("每天") },
+                            label = { Text("Daily") },
                         )
                         FilterChip(
                             selected = scheduleType == "weekdays",
@@ -343,7 +365,7 @@ fun HabitFormDialog(
                                 scheduleType = "weekdays"
                                 validationError = null
                             },
-                            label = { Text("按周") },
+                            label = { Text("Weekly") },
                         )
                         FilterChip(
                             selected = scheduleType == "monthly",
@@ -351,7 +373,7 @@ fun HabitFormDialog(
                                 scheduleType = "monthly"
                                 validationError = null
                             },
-                            label = { Text("按月例行") },
+                            label = { Text("Monthly") },
                         )
                     }
 
@@ -366,7 +388,7 @@ fun HabitFormDialog(
                                     selectedDays = workDays
                                     validationError = null
                                 },
-                                label = { Text("工作日") },
+                                label = { Text("Weekdays") },
                             )
                             FilterChip(
                                 selected = selectedDays == weekendDays,
@@ -374,7 +396,7 @@ fun HabitFormDialog(
                                     selectedDays = weekendDays
                                     validationError = null
                                 },
-                                label = { Text("周末") },
+                                label = { Text("Weekends") },
                             )
                         }
 
@@ -420,17 +442,17 @@ fun HabitFormDialog(
                             FilterChip(
                                 selected = monthlyMode == "from_start",
                                 onClick = { monthlyMode = "from_start" },
-                                label = { Text("月初正数") },
+                                label = { Text("From Start") },
                             )
                             FilterChip(
                                 selected = monthlyMode == "from_end",
                                 onClick = { monthlyMode = "from_end" },
-                                label = { Text("月末倒数") },
+                                label = { Text("From End") },
                             )
                             FilterChip(
                                 selected = monthlyMode == "nth_weekday",
                                 onClick = { monthlyMode = "nth_weekday" },
-                                label = { Text("第Y周的周X") },
+                                label = { Text("Day X on Week Y") },
                             )
                         }
 
@@ -444,13 +466,13 @@ fun HabitFormDialog(
                                     onClick = { if (monthlyDay > 1) monthlyDay-- },
                                     enabled = monthlyDay > 1,
                                 ) {
-                                    Icon(Icons.Rounded.Remove, contentDescription = "减少天数")
+                                    Icon(Icons.Rounded.Remove, contentDescription = "Decrease day")
                                 }
                                 Text(
                                     text = if (monthlyMode == "from_end") {
-                                        if (monthlyDay == 1) "月末最后一天" else "倒数第 $monthlyDay 天"
+                                        if (monthlyDay == 1) "Last day of month" else "Day $monthlyDay from end"
                                     } else {
-                                        "每月第 $monthlyDay 天"
+                                        "Day $monthlyDay of month"
                                     },
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
@@ -459,7 +481,7 @@ fun HabitFormDialog(
                                     onClick = { if (monthlyDay < 31) monthlyDay++ },
                                     enabled = monthlyDay < 31,
                                 ) {
-                                    Icon(Icons.Rounded.Add, contentDescription = "增加天数")
+                                    Icon(Icons.Rounded.Add, contentDescription = "Increase day")
                                 }
                             }
 
@@ -474,9 +496,9 @@ fun HabitFormDialog(
                             ) {
                                 presets.forEach { presetDay ->
                                     val presetLabel = if (monthlyMode == "from_end") {
-                                        if (presetDay == 1) "月末" else "倒数${presetDay}天"
+                                        if (presetDay == 1) "Month end" else "-${presetDay}d"
                                     } else {
-                                        "${presetDay}日"
+                                        "Day $presetDay"
                                     }
                                     FilterChip(
                                         selected = monthlyDay == presetDay,
@@ -488,9 +510,9 @@ fun HabitFormDialog(
 
                             Text(
                                 text = if (monthlyMode == "from_end") {
-                                    "1 表示当月最后一天，2 表示倒数第二天，以此类推"
+                                    "1 = last day of month, 2 = 2nd-to-last, etc."
                                 } else {
-                                    "遇到不足该天数的月份（如 2 月、小月）将自动顺延至当月最后一天"
+                                    "Clamped to month-end on shorter months (e.g., Feb 28/29)"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -539,7 +561,7 @@ fun HabitFormDialog(
                         }
 
                         Text(
-                            text = "规则预览：${
+                            text = "Rule preview: ${
                                 formatFrequencySummary(
                                     frequencyType = "monthly",
                                     monthlyMode = monthlyMode,
@@ -559,7 +581,7 @@ fun HabitFormDialog(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "打卡模式",
+                        text = "Habit Mode & Alerts",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -573,14 +595,43 @@ fun HabitFormDialog(
                                 onClick = {
                                     habitMode = opt.key
                                     validationError = null
-                                    if (opt.key != "free" && remindTimeText.isBlank()) {
-                                        remindTimeText = "09:00"
+                                    if (opt.key != "free" &&
+                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                        !HabitNotificationHelper.hasNotificationPermission(context)
+                                    ) {
+                                        notificationPermissionLauncher.launch(
+                                            Manifest.permission.POST_NOTIFICATIONS,
+                                        )
                                     }
-                                    if (opt.key == "strict") {
-                                        if (forceStartTimeText.isBlank()) forceStartTimeText = "09:15"
-                                        if (forceEndTimeText.isBlank()) forceEndTimeText = "10:30"
-                                    } else if (opt.key == "window" && forceEndTimeText.isBlank()) {
-                                        forceEndTimeText = "21:00"
+                                    if (opt.key == "reminder") {
+                                        val resolvedRemind =
+                                            resolveTimeWithMeridiem(remindTimeText, remindMeridiem)
+                                        if (resolvedRemind != null && reminderTimes.isEmpty()) {
+                                            reminderTimes = listOf(resolvedRemind)
+                                        }
+                                        if (reminderTimes.isEmpty()) {
+                                            reminderTimes = listOf("09:00")
+                                        }
+                                    } else if (opt.key == "strict" || opt.key == "window") {
+                                        if (remindTimeText.isBlank()) {
+                                            val seed = reminderTimes.firstOrNull() ?: "09:00"
+                                            val pair = split24hTo12h(seed, "AM")
+                                            remindTimeText = pair.first
+                                            remindMeridiem = pair.second
+                                        }
+                                        if (opt.key == "strict") {
+                                            if (forceStartTimeText.isBlank()) {
+                                                forceStartTimeText = "09:15"
+                                                startMeridiem = "AM"
+                                            }
+                                            if (forceEndTimeText.isBlank()) {
+                                                forceEndTimeText = "10:30"
+                                                endMeridiem = "AM"
+                                            }
+                                        } else if (forceEndTimeText.isBlank()) {
+                                            forceEndTimeText = "09:00"
+                                            endMeridiem = "PM"
+                                        }
                                     }
                                 },
                                 label = { Text(opt.label) },
@@ -595,266 +646,220 @@ fun HabitFormDialog(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (habitMode != "free") {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = remindTimeText,
-                                onValueChange = {
-                                    remindTimeText = it
-                                    validationError = null
-                                },
-                                label = { Text("开始提醒时间 (HH:MM)") },
-                                placeholder = { Text("09:00") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
-                            )
-                            FilledTonalIconButton(onClick = { modeTimePickerTarget = "remind" }) {
-                                Icon(Icons.Rounded.AccessTime, contentDescription = "选择提醒时间")
-                            }
-                        }
+                    if (habitMode == "strict" || habitMode == "window") {
+                        ModeTimeInputRow(
+                            value = remindTimeText,
+                            onValueChange = {
+                                remindTimeText = it
+                                validationError = null
+                            },
+                            meridiem = remindMeridiem,
+                            onMeridiemChange = {
+                                remindMeridiem = it
+                                validationError = null
+                            },
+                            label = "Remind Time",
+                            placeholder = "09:00",
+                            pickerDescription = "Pick Remind Time",
+                            onOpenPicker = { modeTimePickerTarget = "remind" },
+                        )
                     }
                     if (habitMode == "strict") {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = forceStartTimeText,
-                                onValueChange = {
-                                    forceStartTimeText = it
-                                    validationError = null
-                                },
-                                label = { Text("强制执行时间 (HH:MM)") },
-                                placeholder = { Text("09:15") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
-                            )
-                            FilledTonalIconButton(onClick = { modeTimePickerTarget = "start" }) {
-                                Icon(Icons.Rounded.AccessTime, contentDescription = "选择强制执行时间")
-                            }
-                        }
+                        ModeTimeInputRow(
+                            value = forceStartTimeText,
+                            onValueChange = {
+                                forceStartTimeText = it
+                                validationError = null
+                            },
+                            meridiem = startMeridiem,
+                            onMeridiemChange = {
+                                startMeridiem = it
+                                validationError = null
+                            },
+                            label = "Force Start",
+                            placeholder = "09:15",
+                            pickerDescription = "Pick Force Start Time",
+                            onOpenPicker = { modeTimePickerTarget = "start" },
+                        )
                     }
                     if (habitMode == "strict" || habitMode == "window") {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = forceEndTimeText,
-                                onValueChange = {
-                                    forceEndTimeText = it
-                                    validationError = null
-                                },
-                                label = { Text("强制完成时间 (HH:MM)") },
-                                placeholder = { Text("10:30") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
+                        ModeTimeInputRow(
+                            value = forceEndTimeText,
+                            onValueChange = {
+                                forceEndTimeText = it
+                                validationError = null
+                            },
+                            meridiem = endMeridiem,
+                            onMeridiemChange = {
+                                endMeridiem = it
+                                validationError = null
+                            },
+                            label = "Force End",
+                            placeholder = "10:30",
+                            pickerDescription = "Pick Force End Time",
+                            onOpenPicker = { modeTimePickerTarget = "end" },
+                        )
+                    }
+                    if (habitMode == "reminder") {
+                        Text(
+                            text = "Reminder Times",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        if (reminderTimes.isEmpty()) {
+                            Text(
+                                text = "No reminder times added yet. Pick below or enter HH:MM.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            FilledTonalIconButton(onClick = { modeTimePickerTarget = "end" }) {
-                                Icon(Icons.Rounded.AccessTime, contentDescription = "选择强制完成时间")
+                        } else {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                reminderTimes.forEach { hhmm ->
+                                    val displayLabel = formatTime12h(hhmm)
+                                    InputChip(
+                                        selected = true,
+                                        onClick = {
+                                            reminderTimes = reminderTimes.filterNot { it == hhmm }
+                                            validationError = null
+                                        },
+                                        label = { Text(displayLabel) },
+                                        trailingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Close,
+                                                contentDescription = "Remove $displayLabel",
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                        },
+                                    )
+                                }
                             }
                         }
-                    }
-                }
 
-                HorizontalDivider()
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.NotificationsActive,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp),
-                        )
                         Text(
-                            text = "提醒与闹钟",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                    Switch(
-                        checked = reminderEnabled,
-                        onCheckedChange = { checked ->
-                            reminderEnabled = checked
-                            validationError = null
-                            if (checked && reminderTimes.isEmpty()) {
-                                reminderTimes = listOf("09:00")
-                            }
-                            if (checked &&
-                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                !HabitNotificationHelper.hasNotificationPermission(context)
-                            ) {
-                                notificationPermissionLauncher.launch(
-                                    Manifest.permission.POST_NOTIFICATIONS,
-                                )
-                            }
-                        },
-                    )
-                }
-
-                if (reminderEnabled) {
-                    Text(
-                        text = "提醒时间",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    if (reminderTimes.isEmpty()) {
-                        Text(
-                            text = "尚未添加提醒时间，请从下方选择或输入 HH:MM",
-                            style = MaterialTheme.typography.bodySmall,
+                            text = "Quick Presets",
+                            style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                    } else {
                         FlowRow(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            reminderTimes.forEach { hhmm ->
-                                InputChip(
-                                    selected = true,
+                            REMINDER_TIME_PRESETS.forEach { preset ->
+                                val selected = preset in reminderTimes
+                                FilterChip(
+                                    selected = selected,
                                     onClick = {
-                                        reminderTimes = reminderTimes.filterNot { it == hhmm }
-                                        validationError = null
+                                        if (selected) {
+                                            reminderTimes = reminderTimes.filterNot { it == preset }
+                                        } else {
+                                            addReminderTime(preset)
+                                        }
                                     },
-                                    label = { Text(hhmm) },
-                                    trailingIcon = {
-                                        Icon(
-                                            imageVector = Icons.Rounded.Close,
-                                            contentDescription = "移除 $hhmm",
-                                            modifier = Modifier.size(16.dp),
-                                        )
-                                    },
+                                    label = { Text(formatTime12h(preset)) },
                                 )
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = { showTimePickerDialog = true },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.AccessTime,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Pick Clock Time")
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            OutlinedTextField(
+                                value = customTimeText,
+                                onValueChange = {
+                                    customTimeText = it
+                                    validationError = null
+                                },
+                                label = { Text("Time (HH:MM)") },
+                                placeholder = { Text("08:30") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            MeridiemSelector(
+                                selected = customTimeMeridiem,
+                                onSelect = {
+                                    customTimeMeridiem = it
+                                    validationError = null
+                                },
+                            )
+                            TextButton(
+                                onClick = {
+                                    if (addReminderTime(customTimeText, customTimeMeridiem)) {
+                                        customTimeText = ""
+                                    }
+                                },
+                            ) {
+                                Text("Add")
                             }
                         }
                     }
 
-                    Text(
-                        text = "常用时间快捷选择",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        REMINDER_TIME_PRESETS.forEach { preset ->
-                            val selected = preset in reminderTimes
-                            FilterChip(
-                                selected = selected,
-                                onClick = {
-                                    if (selected) {
-                                        reminderTimes = reminderTimes.filterNot { it == preset }
-                                    } else {
-                                        addReminderTime(preset)
-                                    }
-                                },
-                                label = { Text(preset) },
-                            )
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = { showTimePickerDialog = true },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AccessTime,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
+                    if (habitMode != "free") {
+                        Text(
+                            text = "Alert Delivery",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium,
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("选择钟表时间")
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        OutlinedTextField(
-                            value = customTimeText,
-                            onValueChange = {
-                                customTimeText = it
-                                validationError = null
-                            },
-                            label = { Text("自定义时间 (HH:MM)") },
-                            placeholder = { Text("例如 08:30") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(
-                            onClick = {
-                                if (addReminderTime(customTimeText)) {
-                                    customTimeText = ""
-                                }
-                            },
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            Text("添加")
-                        }
-                    }
-
-                    Text(
-                        text = "提醒方式",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        FilterChip(
-                            selected = reminderMode != "alarm",
-                            onClick = { reminderMode = "notification" },
-                            label = { Text("普通通知 🔔") },
-                        )
-                        FilterChip(
-                            selected = reminderMode == "alarm",
-                            onClick = { reminderMode = "alarm" },
-                            label = { Text("强提醒闹钟 ⏰") },
-                        )
-                    }
-
-                    Text(
-                        text = "贪睡延时",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        REMINDER_SNOOZE_OPTIONS.forEach { mins ->
                             FilterChip(
-                                selected = reminderSnoozeMinutes == mins,
-                                onClick = { reminderSnoozeMinutes = mins },
-                                label = { Text("${mins} 分钟") },
+                                selected = reminderMode != "alarm",
+                                onClick = { reminderMode = "notification" },
+                                label = { Text("Notification 🔔") },
+                            )
+                            FilterChip(
+                                selected = reminderMode == "alarm",
+                                onClick = { reminderMode = "alarm" },
+                                label = { Text("Alarm Ring ⏰") },
                             )
                         }
-                    }
 
-                    OutlinedTextField(
-                        value = reminderMessage,
-                        onValueChange = { if (it.length <= 160) reminderMessage = it },
-                        label = { Text("自定义提醒语（选填）") },
-                        placeholder = { Text("例如：别忘了喝水或开始专注 20 分钟") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                        Text(
+                            text = "Snooze Duration",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            REMINDER_SNOOZE_OPTIONS.forEach { mins ->
+                                FilterChip(
+                                    selected = reminderSnoozeMinutes == mins,
+                                    onClick = { reminderSnoozeMinutes = mins },
+                                    label = { Text("${mins} min") },
+                                )
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = reminderMessage,
+                            onValueChange = { if (it.length <= 160) reminderMessage = it },
+                            label = { Text("Custom Reminder Message (optional)") },
+                            placeholder = { Text("e.g., Drink water or focus for 20 minutes") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
 
                 if (validationError != null) {
@@ -872,50 +877,86 @@ fun HabitFormDialog(
                 onClick = {
                     val trimmedTitle = title.trim()
                     if (trimmedTitle.isEmpty()) {
-                        validationError = "请输入习惯名称"
+                        validationError = "Please enter a habit title"
                         return@TextButton
                     }
                     if (scheduleType == "weekdays" && selectedDays.isEmpty()) {
-                        validationError = "请至少选择一个重复日期"
+                        validationError = "Pick at least one day of the week"
                         return@TextButton
                     }
                     val parsedSlo = targetSloText.trim().toDoubleOrNull()
                     if (parsedSlo == null || parsedSlo !in 1.0..100.0) {
-                        validationError = "目标 SLO 需在 1 到 100 之间"
+                        validationError = "Target SLO must be between 1 and 100"
                         return@TextButton
                     }
-                    var finalReminderTimes = reminderTimes
-                    val pendingCustom = customTimeText.trim()
-                    if (pendingCustom.isNotEmpty()) {
-                        val normPending = normalizeReminderTime(pendingCustom)
-                        if (normPending == null) {
-                            validationError = "提醒时间格式需为 HH:MM（00:00-23:59）"
-                            return@TextButton
+
+                    val finalRemindTime: String?
+                    val finalForceStartTime: String?
+                    val finalForceEndTime: String?
+                    val finalReminderEnabled: Boolean
+                    var finalReminderTimes: List<String>
+
+                    when (habitMode) {
+                        "free" -> {
+                            finalRemindTime = null
+                            finalForceStartTime = null
+                            finalForceEndTime = null
+                            finalReminderEnabled = false
+                            finalReminderTimes = emptyList()
                         }
-                        if (normPending !in finalReminderTimes) {
-                            if (finalReminderTimes.size >= MAX_REMINDER_TIMES) {
-                                validationError = "最多添加 $MAX_REMINDER_TIMES 个提醒时间"
+                        "strict", "window" -> {
+                            val validatedMode = validateHabitModeTimes(
+                                mode = habitMode,
+                                remindRaw = remindTimeText,
+                                startRaw = forceStartTimeText,
+                                endRaw = forceEndTimeText,
+                                remindMeridiem = remindMeridiem,
+                                startMeridiem = startMeridiem,
+                                endMeridiem = endMeridiem,
+                            )
+                            if (validatedMode.errorMessage != null) {
+                                validationError = validatedMode.errorMessage
                                 return@TextButton
                             }
-                            finalReminderTimes = normalizeReminderTimes(finalReminderTimes + normPending)
-                            reminderTimes = finalReminderTimes
-                            customTimeText = ""
+                            finalRemindTime = validatedMode.remindTime
+                            finalForceStartTime = validatedMode.forceStartTime
+                            finalForceEndTime = validatedMode.forceEndTime
+                            finalReminderEnabled = true
+                            finalReminderTimes = listOfNotNull(validatedMode.remindTime)
+                        }
+                        else -> {
+                            finalReminderTimes = reminderTimes
+                            val pendingCustom = customTimeText.trim()
+                            if (pendingCustom.isNotEmpty()) {
+                                val normPending =
+                                    resolveTimeWithMeridiem(pendingCustom, customTimeMeridiem)
+                                if (normPending == null) {
+                                    validationError = "Time must be in HH:MM or H:MM AM/PM format"
+                                    return@TextButton
+                                }
+                                if (normPending !in finalReminderTimes) {
+                                    if (finalReminderTimes.size >= MAX_REMINDER_TIMES) {
+                                        validationError =
+                                            "At most $MAX_REMINDER_TIMES reminder times are allowed"
+                                        return@TextButton
+                                    }
+                                    finalReminderTimes =
+                                        normalizeReminderTimes(finalReminderTimes + normPending)
+                                    reminderTimes = finalReminderTimes
+                                    customTimeText = ""
+                                }
+                            }
+                            if (finalReminderTimes.isEmpty()) {
+                                validationError = "Add at least one reminder time"
+                                return@TextButton
+                            }
+                            finalReminderEnabled = true
+                            finalRemindTime = finalReminderTimes.first()
+                            finalForceStartTime = null
+                            finalForceEndTime = null
                         }
                     }
-                    if (reminderEnabled && finalReminderTimes.isEmpty()) {
-                        validationError = "开启提醒后请至少设置一个提醒时间"
-                        return@TextButton
-                    }
-                    val validatedMode = validateHabitModeTimes(
-                        mode = habitMode,
-                        remindRaw = remindTimeText,
-                        startRaw = forceStartTimeText,
-                        endRaw = forceEndTimeText,
-                    )
-                    if (validatedMode.errorMessage != null) {
-                        validationError = validatedMode.errorMessage
-                        return@TextButton
-                    }
+
                     val roundedSlo = kotlin.math.round(parsedSlo * 10.0) / 10.0
                     val sortedDays = if (scheduleType == "weekdays") {
                         selectedDays.sorted()
@@ -941,10 +982,10 @@ fun HabitFormDialog(
                             targetPerDay = targetPerDay,
                             targetSlo = roundedSlo,
                             mode = habitMode,
-                            remindTime = validatedMode.remindTime,
-                            forceStartTime = validatedMode.forceStartTime,
-                            forceEndTime = validatedMode.forceEndTime,
-                            reminderEnabled = reminderEnabled,
+                            remindTime = finalRemindTime,
+                            forceStartTime = finalForceStartTime,
+                            forceEndTime = finalForceEndTime,
+                            reminderEnabled = finalReminderEnabled,
                             reminderTimes = finalReminderTimes,
                             reminderMode = reminderMode,
                             reminderSnoozeMinutes = reminderSnoozeMinutes,
@@ -953,12 +994,12 @@ fun HabitFormDialog(
                     )
                 },
             ) {
-                Text("保存")
+                Text("Save")
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("取消")
+                Text("Cancel")
             }
         },
     )
@@ -970,11 +1011,11 @@ fun HabitFormDialog(
         val pickerState = rememberTimePickerState(
             initialHour = initHour,
             initialMinute = initMinute,
-            is24Hour = true,
+            is24Hour = false,
         )
         AlertDialog(
             onDismissRequest = { showTimePickerDialog = false },
-            title = { Text("选择提醒时间", fontWeight = FontWeight.Bold) },
+            title = { Text("Pick Reminder Time", fontWeight = FontWeight.Bold) },
             text = { TimePicker(state = pickerState) },
             confirmButton = {
                 TextButton(
@@ -985,35 +1026,35 @@ fun HabitFormDialog(
                         showTimePickerDialog = false
                     },
                 ) {
-                    Text("确定")
+                    Text("OK")
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showTimePickerDialog = false }) {
-                    Text("取消")
+                    Text("Cancel")
                 }
             },
         )
     }
 
     modeTimePickerTarget?.let { targetKey ->
-        val currentRaw = when (targetKey) {
-            "start" -> forceStartTimeText
-            "end" -> forceEndTimeText
-            else -> remindTimeText
+        val (currentRaw, currentMeridiem) = when (targetKey) {
+            "start" -> forceStartTimeText to startMeridiem
+            "end" -> forceEndTimeText to endMeridiem
+            else -> remindTimeText to remindMeridiem
         }
-        val parts = normalizeReminderTime(currentRaw)?.split(":")
+        val parts = resolveTimeWithMeridiem(currentRaw, currentMeridiem)?.split(":")
         val initHour = parts?.getOrNull(0)?.toIntOrNull() ?: 9
         val initMinute = parts?.getOrNull(1)?.toIntOrNull() ?: 0
         val modePickerState = rememberTimePickerState(
             initialHour = initHour,
             initialMinute = initMinute,
-            is24Hour = true,
+            is24Hour = false,
         )
         val dialogTitle = when (targetKey) {
-            "start" -> "选择强制执行时间"
-            "end" -> "选择强制完成时间"
-            else -> "选择开始提醒时间"
+            "start" -> "Pick Force Start Time"
+            "end" -> "Pick Force End Time"
+            else -> "Pick Remind Time"
         }
         AlertDialog(
             onDismissRequest = { modeTimePickerTarget = null },
@@ -1022,25 +1063,85 @@ fun HabitFormDialog(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val formatted =
+                        val formatted24 =
                             "${modePickerState.hour.toString().padStart(2, '0')}:${modePickerState.minute.toString().padStart(2, '0')}"
+                        val (time12, meridiem) = split24hTo12h(formatted24)
                         when (targetKey) {
-                            "start" -> forceStartTimeText = formatted
-                            "end" -> forceEndTimeText = formatted
-                            else -> remindTimeText = formatted
+                            "start" -> {
+                                forceStartTimeText = time12
+                                startMeridiem = meridiem
+                            }
+                            "end" -> {
+                                forceEndTimeText = time12
+                                endMeridiem = meridiem
+                            }
+                            else -> {
+                                remindTimeText = time12
+                                remindMeridiem = meridiem
+                            }
                         }
                         validationError = null
                         modeTimePickerTarget = null
                     },
                 ) {
-                    Text("确定")
+                    Text("OK")
                 }
             },
             dismissButton = {
                 TextButton(onClick = { modeTimePickerTarget = null }) {
-                    Text("取消")
+                    Text("Cancel")
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun MeridiemSelector(
+    selected: String,
+    onSelect: (String) -> Unit,
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        listOf("AM", "PM").forEach { option ->
+            FilterChip(
+                selected = selected.equals(option, ignoreCase = true),
+                onClick = { onSelect(option) },
+                label = { Text(option) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModeTimeInputRow(
+    value: String,
+    onValueChange: (String) -> Unit,
+    meridiem: String,
+    onMeridiemChange: (String) -> Unit,
+    label: String,
+    placeholder: String,
+    pickerDescription: String,
+    onOpenPicker: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { Text(label) },
+            placeholder = { Text(placeholder) },
+            singleLine = true,
+            modifier = Modifier.weight(1f),
+        )
+        MeridiemSelector(
+            selected = meridiem,
+            onSelect = onMeridiemChange,
+        )
+        FilledTonalIconButton(onClick = onOpenPicker) {
+            Icon(Icons.Rounded.AccessTime, contentDescription = pickerDescription)
+        }
     }
 }

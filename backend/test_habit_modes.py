@@ -201,7 +201,7 @@ def test_strict_mode_happy_path_start_guard_and_note_preservation():
             },
         )
         assert blocked.status_code == 400
-        assert "开始执行" in blocked.json()["detail"]
+        assert "Start Execution" in blocked.json()["detail"]
 
         # Note-only save while count=0 remains allowed
         note_only = client.post(
@@ -588,5 +588,108 @@ def test_window_and_reminder_modes_lifecycle():
         ).json()
         assert rem_late["day_status"] == "on_time"
         assert rem_late["is_late"] is False
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_normalize_reminder_time_accepts_am_pm_and_rejects_invalid():
+    from app.core import normalize_reminder_time
+
+    assert normalize_reminder_time("8:05 AM") == "08:05"
+    assert normalize_reminder_time("12:00 AM") == "00:00"
+    assert normalize_reminder_time("12:30 PM") == "12:30"
+    assert normalize_reminder_time("9:15 pm") == "21:15"
+    assert normalize_reminder_time("1:00pm") == "13:00"
+    assert normalize_reminder_time("20:45") == "20:45"
+
+    for bad in ("13:00 PM", "0:15 AM", "12:60 PM", "25:00", "invalid"):
+        try:
+            normalize_reminder_time(bad)
+            raise AssertionError(f"Expected ValueError for {bad!r}")
+        except ValueError:
+            pass
+
+
+def test_merged_habit_mode_and_reminders_sync():
+    client, _db, _uid = _make_client_and_db()
+    try:
+        # 1. Strict mode automatically enables reminder_enabled & seeds reminder_times=[remind_time]
+        r_strict = client.post(
+            "/api/habits",
+            json={
+                "title": "Strict Alarm Sprint",
+                "mode": "strict",
+                "remind_time": "08:30",
+                "force_start_time": "08:45",
+                "force_end_time": "10:00",
+                "reminder_mode": "alarm",
+                "reminder_snooze_minutes": 15,
+                "reminder_message": "Start sprint!",
+            },
+        )
+        assert r_strict.status_code == 201
+        strict_h = r_strict.json()
+        assert strict_h["mode"] == "strict"
+        assert strict_h["reminder_enabled"] is True
+        assert strict_h["reminder_times"] == ["08:30"]
+        assert strict_h["reminder_mode"] == "alarm"
+        assert strict_h["reminder_snooze_minutes"] == 15
+
+        # 2. Mode 3 ('reminder') with reminder_times and no explicit remind_time syncs remind_time=first time
+        r_rem = client.post(
+            "/api/habits",
+            json={
+                "title": "Hydrate Multi",
+                "mode": "reminder",
+                "reminder_times": ["20:30", "08:00"],
+                "reminder_mode": "alarm",
+                "reminder_snooze_minutes": 10,
+                "reminder_message": "Drink water",
+            },
+        )
+        assert r_rem.status_code == 201
+        rem_h = r_rem.json()
+        assert rem_h["mode"] == "reminder"
+        assert rem_h["reminder_enabled"] is True
+        assert rem_h["reminder_times"] == ["08:00", "20:30"]
+        assert rem_h["remind_time"] == "08:00"
+        assert rem_h["reminder_mode"] == "alarm"
+
+        # Both appear in GET /api/habits/reminders with mode metadata
+        ov_resp = client.get(
+            "/api/habits/reminders?target_date=2026-11-16&now_time=07:30"
+        )
+        assert ov_resp.status_code == 200
+        ov = ov_resp.json()
+        assert ov["enabled_habits_count"] == 2
+        assert ov["alarm_habits_count"] == 2
+        by_id = {it["habit_id"]: it for it in ov["items"]}
+        assert by_id[strict_h["id"]]["mode"] == "strict"
+        assert by_id[strict_h["id"]]["remind_time"] == "08:30"
+        assert by_id[strict_h["id"]]["force_start_time"] == "08:45"
+        assert by_id[strict_h["id"]]["force_end_time"] == "10:00"
+        assert by_id[rem_h["id"]]["mode"] == "reminder"
+        assert by_id[rem_h["id"]]["next_trigger_time"] == "08:00"
+
+        # 3. Switching strict -> free disables reminders and removes it from overview
+        to_free = client.patch(
+            f"/api/habits/{strict_h['id']}",
+            json={"mode": "free"},
+        )
+        assert to_free.status_code == 200
+        free_h = to_free.json()
+        assert free_h["mode"] == "free"
+        assert free_h["reminder_enabled"] is False
+        assert free_h["reminder_times"] == []
+        assert free_h["remind_time"] is None
+        assert free_h["force_start_time"] is None
+        assert free_h["force_end_time"] is None
+
+        ov_after = client.get(
+            "/api/habits/reminders?target_date=2026-11-16&now_time=07:30"
+        )
+        assert ov_after.status_code == 200
+        assert ov_after.json()["enabled_habits_count"] == 1
+        assert [it["habit_id"] for it in ov_after.json()["items"]] == [rem_h["id"]]
     finally:
         app.dependency_overrides.clear()

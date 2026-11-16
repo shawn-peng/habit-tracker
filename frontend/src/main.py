@@ -18,27 +18,28 @@ from api_client import (
 )
 
 MAX_REMINDER_TIMES = 12
-_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$")
+_BARE_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 REMINDER_TIME_PRESETS = ["07:30", "09:00", "12:30", "18:00", "21:30"]
 REMINDER_SNOOZE_OPTIONS = [5, 10, 15, 30, 60]
 
 HABIT_MODE_OPTIONS = [
-    ("free", "自由打卡（默认）"),
-    ("strict", "模式1：严格管控（提醒→强制开始→强制完成）"),
-    ("window", "模式2：弹性时间窗（提醒→强制完成）"),
-    ("reminder", "模式3：定时提醒（开始提醒时间）"),
+    ("free", "Free Mode (Default — No Reminders)"),
+    ("strict", "Mode 1: Strict Control (Remind -> Force Start -> Force End)"),
+    ("window", "Mode 2: Flexible Window (Remind -> Force End)"),
+    ("reminder", "Mode 3: Timed Reminder & Alarm"),
 ]
 HABIT_MODE_SHORT_LABELS = {
-    "free": "自由模式",
-    "strict": "模式1·严格管控",
-    "window": "模式2·弹性时间窗",
-    "reminder": "模式3·定时提醒",
+    "free": "Free Mode",
+    "strict": "Mode 1 · Strict",
+    "window": "Mode 2 · Window",
+    "reminder": "Mode 3 · Reminder",
 }
 HABIT_MODE_HINTS = {
-    "free": "无时间限制，当天随时打卡均计为准时完成。",
-    "strict": "需严格按 提醒时间 < 强制执行时间 < 强制完成时间 顺序；开始前不可直接完成。",
-    "window": "到开始提醒时间提示打卡，在强制完成时间前完成即算准时。",
-    "reminder": "到达开始提醒时间触发提示，不设超时违规，任意完成均算准时。",
+    "free": "Check in anytime with no time limits and no reminders or alarms.",
+    "strict": "Remind Time < Force Start Time < Force End Time, with notification or ringing alarm and mandatory Start Execution.",
+    "window": "Notification or alarm at Remind Time; completing before Force End Time counts as on-time.",
+    "reminder": "Notification or ringing alarm at one or more times with no overdue violation.",
 }
 
 COLOR_SWATCHES = [
@@ -93,14 +94,74 @@ def format_habit_schedule(habit: dict[str, Any]) -> str:
 
 
 def normalize_hhmm(raw: str) -> str | None:
-    """Validate and normalize a 24-hour time string (H:MM or HH:MM) to HH:MM."""
+    """Validate and normalize a 24-hour (HH:MM) or 12-hour (H:MM AM/PM) time string to HH:MM."""
     match = _REMINDER_TIME_RE.match((raw or "").strip())
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    meridiem = match.group(3).upper() if match.group(3) else None
+    if not (0 <= minute <= 59):
+        return None
+    if meridiem is not None:
+        if not (1 <= hour <= 12):
+            return None
+        hour = (0 if hour == 12 else hour) if meridiem == "AM" else (12 if hour == 12 else hour + 12)
+    elif not (0 <= hour <= 23):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def format_hhmm_12h(hhmm: str | None) -> str:
+    """Format a 24-hour HH:MM string as 12-hour H:MM AM/PM."""
+    norm = normalize_hhmm(str(hhmm or ""))
+    if norm is None:
+        return str(hhmm or "")
+    hour, minute = int(norm[:2]), int(norm[3:5])
+    meridiem = "AM" if hour < 12 else "PM"
+    hour12 = hour % 12 or 12
+    return f"{hour12}:{minute:02d} {meridiem}"
+
+
+def split_24h_to_12h(
+    hhmm: str | None, default_meridiem: str = "AM"
+) -> tuple[str, str]:
+    """Split HH:MM into (12-hour 'HH:MM', 'AM'|'PM') for paired input + selector controls."""
+    cleaned = (hhmm or "").strip()
+    if not cleaned:
+        return "", default_meridiem
+    norm = normalize_hhmm(cleaned)
+    if norm is None:
+        return cleaned, default_meridiem
+    hour, minute = int(norm[:2]), int(norm[3:5])
+    meridiem = "AM" if hour < 12 else "PM"
+    hour12 = hour % 12 or 12
+    return f"{hour12:02d}:{minute:02d}", meridiem
+
+
+def resolve_time_with_meridiem(
+    raw: str | None, meridiem: str | None = None
+) -> str | None:
+    """Resolve user-entered HH:MM paired with an AM/PM selector to normalized 24h HH:MM.
+
+    Explicit AM/PM inside `raw` wins; explicit 24h hours (0 or 13..23) stay 24h;
+    hours 1..12 without inline AM/PM combine with `meridiem` when provided.
+    """
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return None
+    if re.search(r"[AaPp][Mm]$", cleaned):
+        return normalize_hhmm(cleaned)
+    match = _BARE_TIME_RE.match(cleaned)
     if not match:
         return None
     hour = int(match.group(1))
     minute = int(match.group(2))
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
+    mer = (meridiem or "").strip().upper()
+    if 1 <= hour <= 12 and mer in ("AM", "PM"):
+        hour = (0 if hour == 12 else hour) if mer == "AM" else (12 if hour == 12 else hour + 12)
     return f"{hour:02d}:{minute:02d}"
 
 
@@ -109,36 +170,45 @@ def validate_habit_mode_times(
     remind_raw: str | None,
     start_raw: str | None,
     end_raw: str | None,
+    remind_meridiem: str | None = None,
+    start_meridiem: str | None = None,
+    end_meridiem: str | None = None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Validate habit mode time inputs and return (remind, start, end, error_message)."""
     if mode == "free":
         return None, None, None, None
 
-    def _parse(val: str | None, label: str) -> tuple[str | None, str | None]:
+    def _parse(
+        val: str | None, label: str, meridiem: str | None
+    ) -> tuple[str | None, str | None]:
         cleaned = (val or "").strip()
         if not cleaned:
-            return None, f"{label} 不能为空"
-        norm = normalize_hhmm(cleaned)
+            return None, f"{label} is required"
+        norm = (
+            resolve_time_with_meridiem(cleaned, meridiem)
+            if meridiem is not None
+            else normalize_hhmm(cleaned)
+        )
         if norm is None:
-            return None, f"{label} 格式必须为 24 小时制 HH:MM"
+            return None, f"{label} must be in HH:MM or H:MM AM/PM format"
         return norm, None
 
-    remind, err = _parse(remind_raw, "开始提醒时间")
+    remind, err = _parse(remind_raw, "Remind Time", remind_meridiem)
     if err:
         return None, None, None, err
     if mode == "reminder":
         return remind, None, None, None
 
-    end, err = _parse(end_raw, "强制完成时间")
+    end, err = _parse(end_raw, "Force End Time", end_meridiem)
     if err:
         return None, None, None, err
     if mode == "window":
         if remind >= end:  # type: ignore[operator]
-            return None, None, None, "开始提醒时间必须早于强制完成时间"
+            return None, None, None, "Remind Time must be earlier than Force End Time"
         return remind, None, end, None
 
     if mode == "strict":
-        start, err = _parse(start_raw, "强制执行时间")
+        start, err = _parse(start_raw, "Force Start Time", start_meridiem)
         if err:
             return None, None, None, err
         if not (remind < start < end):  # type: ignore[operator]
@@ -146,26 +216,28 @@ def validate_habit_mode_times(
                 None,
                 None,
                 None,
-                "模式1需满足：开始提醒时间 < 强制执行时间 < 强制完成时间",
+                "Mode 1 requires Remind Time < Force Start Time < Force End Time",
             )
         return remind, start, end, None
 
-    return None, None, None, f"不支持的模式: {mode}"
+    return None, None, None, f"Unsupported mode: {mode}"
 
 
 def format_habit_mode_summary(habit: dict[str, Any]) -> str:
     mode = habit.get("mode") or "free"
     if mode == "free":
         return ""
+    if mode == "reminder":
+        return "Mode 3 · Alarm" if habit.get("reminder_mode") == "alarm" else "Mode 3 · Reminder"
     label = HABIT_MODE_SHORT_LABELS.get(mode, mode)
     parts: list[str] = []
     if habit.get("remind_time"):
-        parts.append(f"提醒 {habit['remind_time']}")
+        parts.append(f"Remind {format_hhmm_12h(habit['remind_time'])}")
     if mode == "strict" and habit.get("force_start_time"):
-        parts.append(f"开始 {habit['force_start_time']}")
+        parts.append(f"Start {format_hhmm_12h(habit['force_start_time'])}")
     if mode in ("strict", "window") and habit.get("force_end_time"):
-        parts.append(f"完成 {habit['force_end_time']}")
-    return f"{label}（{' · '.join(parts)}）" if parts else label
+        parts.append(f"End {format_hhmm_12h(habit['force_end_time'])}")
+    return f"{label} ({' · '.join(parts)})" if parts else label
 
 
 def evaluate_local_habit_status(
@@ -267,12 +339,29 @@ def is_habit_scheduled_on_date(habit: dict[str, Any], target: date) -> bool:
     return target.weekday() in weekdays
 
 
+def effective_habit_reminder_times(habit: dict[str, Any]) -> list[str]:
+    """Return sorted normalized HH:MM trigger times unified across Habit Mode and legacy reminders."""
+    if habit.get("archived", False):
+        return []
+    mode = habit.get("mode") or "free"
+    if mode in ("strict", "window", "reminder"):
+        if habit.get("reminder_enabled") is False:
+            return []
+        raw_list: list[Any] = list(habit.get("reminder_times") or [])
+        if habit.get("remind_time"):
+            raw_list.append(habit["remind_time"])
+    else:
+        if not habit.get("reminder_enabled", False):
+            return []
+        raw_list = list(habit.get("reminder_times") or [])
+    return sorted(
+        {t for t in (normalize_hhmm(str(x)) for x in raw_list) if t is not None}
+    )[:MAX_REMINDER_TIMES]
+
+
 def format_reminder_badge(habit: dict[str, Any]) -> str | None:
-    """Return a compact display label for a habit's reminders/alarms, or None."""
-    if not habit.get("reminder_enabled", False):
-        return None
-    raw_times = habit.get("reminder_times") or []
-    times = [t for t in (normalize_hhmm(str(x)) for x in raw_times) if t is not None]
+    """Return a compact 12-hour AM/PM display label for a habit's reminders/alarms, or None."""
+    times = [format_hhmm_12h(t) for t in effective_habit_reminder_times(habit)]
     if not times:
         return None
     prefix = "⏰" if habit.get("reminder_mode") == "alarm" else "🔔"
@@ -319,14 +408,14 @@ def find_due_habit_reminders(
     now_hhmm = now_dt.strftime("%H:%M")
 
     for habit in habits:
-        if habit.get("archived", False) or not habit.get("reminder_enabled", False):
+        times = effective_habit_reminder_times(habit)
+        if not times:
             continue
         hid = str(habit.get("id") or habit.get("habit_id") or "")
         if not hid or hid in completed_ids or hid in seen_habit_ids:
             continue
         if not is_habit_scheduled_on_date(habit, today_date):
             continue
-        times = habit.get("reminder_times") or []
         if now_hhmm not in times:
             continue
         fire_key = f"{today_iso}|{hid}|{now_hhmm}"
@@ -1507,16 +1596,29 @@ class HabitTrackerApp:
                 self._notified_mode_phases[phase_key] = day_status
                 if day_status == "reminding" and not self.reminders_muted:
                     if mode == "strict":
-                        msg = f"🔔「{item['title']}」已到开始提醒时间，请在 {item.get('force_start_time', '')} 前点击开始执行"
+                        msg = (
+                            f"🔔 '{item['title']}' reminder — tap Start Execution before "
+                            f"{format_hhmm_12h(item.get('force_start_time', ''))}"
+                        )
                     elif mode == "window":
-                        msg = f"🔔「{item['title']}」已进入弹性打卡窗口，请在 {item.get('force_end_time', '')} 前完成"
+                        msg = (
+                            f"🔔 '{item['title']}' window started — complete before "
+                            f"{format_hhmm_12h(item.get('force_end_time', ''))}"
+                        )
                     else:
-                        msg = f"🔔「{item['title']}」已到提醒时间（{item.get('remind_time', '')}）"
+                        msg = (
+                            f"🔔 Reminder for '{item['title']}' "
+                            f"({format_hhmm_12h(item.get('remind_time', ''))})"
+                        )
                     changed_to_notify.append((msg, False))
                 elif day_status == "violation":
-                    why = "未在强制执行时间前开始" if reason == "missed_start" else "未在强制完成时间前完成"
+                    why = (
+                        "missed Force Start Time"
+                        if reason == "missed_start"
+                        else "missed Force End Time"
+                    )
                     changed_to_notify.append(
-                        (f"⚠️「{item['title']}」{why}，已记为超时违规（支持补卡）", True)
+                        (f"⚠️ '{item['title']}' {why} — marked overdue (make-up available)", True)
                     )
 
         for msg, is_err in changed_to_notify:
@@ -1612,6 +1714,8 @@ class HabitTrackerApp:
             self._fired_reminder_keys.add(trigger["fire_key"])
             habit = trigger["habit"]
             hid = str(habit.get("id") or habit.get("habit_id") or "")
+            if hid:
+                self._notified_mode_phases[f"{today_iso}|{hid}"] = "reminding"
             if trigger["is_snooze"]:
                 self._snoozed_alarms.pop(hid, None)
             if trigger["mode"] == "alarm":
@@ -1623,7 +1727,7 @@ class HabitTrackerApp:
                 suffix = f" — {note}" if note else ""
                 show_toast(
                     self.page,
-                    f"🔔 Reminder ({trigger['time_label']}): {habit.get('title', 'Habit')}{suffix}",
+                    f"🔔 Reminder ({format_hhmm_12h(trigger['time_label'])}): {habit.get('title', 'Habit')}{suffix}",
                 )
         return due
 
@@ -1693,7 +1797,7 @@ class HabitTrackerApp:
             close_dialog(self.page, dialog)
             show_toast(
                 self.page,
-                f"⏰ Snoozed {title} for {snooze_minutes} min (until {wake_dt.strftime('%H:%M')})",
+                f"⏰ Snoozed {title} for {snooze_minutes} min (until {format_hhmm_12h(wake_dt.strftime('%H:%M'))})",
             )
 
         def handle_dismiss(_e: Any = None) -> None:
@@ -1707,7 +1811,7 @@ class HabitTrackerApp:
                     [
                         ft.Text("Habit Alarm", size=18, weight=ft.FontWeight.BOLD),
                         ft.Text(
-                            f"Scheduled for {time_label}",
+                            f"Scheduled for {format_hhmm_12h(time_label)}",
                             size=12,
                             color=ft.Colors.BLUE_GREY_500,
                         ),
@@ -1743,6 +1847,17 @@ class HabitTrackerApp:
                 spacing=8,
             ),
         )
+        now_dt_btn = datetime.now()
+        today_iso_btn = now_dt_btn.date().isoformat()
+        now_hhmm_btn = now_dt_btn.strftime("%H:%M")
+        _, _, alarm_can_start, _ = evaluate_local_habit_status(
+            habit, today_iso_btn, today_iso_btn, now_hhmm_btn
+        )
+        primary_btn_label = (
+            "Start Execution"
+            if (habit.get("mode") == "strict" and alarm_can_start)
+            else "Check In Now"
+        )
         dialog.actions = [
             ft.TextButton(
                 content=ft.Text("Dismiss"),
@@ -1753,7 +1868,7 @@ class HabitTrackerApp:
                 on_click=handle_snooze,
             ),
             ft.FilledButton(
-                content=ft.Text("Check In Now"),
+                content=ft.Text(primary_btn_label),
                 on_click=handle_checkin_now,
             ),
         ]
@@ -1772,9 +1887,7 @@ class HabitTrackerApp:
                 source_habits = []
 
         reminder_habits = [
-            h
-            for h in source_habits
-            if not h.get("archived", False) and h.get("reminder_enabled", False)
+            h for h in source_habits if effective_habit_reminder_times(h)
         ]
         dialog = ft.AlertDialog(modal=True)
 
@@ -1857,7 +1970,7 @@ class HabitTrackerApp:
                     ft.Row(
                         [
                             ft.Text(
-                                f"⏰ {s_habit.get('title', '')} → {wake_dt.strftime('%H:%M')}",
+                                f"⏰ {s_habit.get('title', '')} → {format_hhmm_12h(wake_dt.strftime('%H:%M'))}",
                                 size=13,
                             ),
                             ft.TextButton(
@@ -1882,18 +1995,24 @@ class HabitTrackerApp:
         if not reminder_habits:
             rows.append(
                 ft.Text(
-                    "No habit reminders or alarms configured yet. Edit any habit to set reminder times and alert mode.",
+                    "No habit reminders or alarms configured yet. Edit any habit and choose Mode 1, 2, or 3 under Habit Mode to configure reminders and alarms.",
                     size=13,
                     color=ft.Colors.BLUE_GREY_500,
                 )
             )
         else:
             for h in reminder_habits:
+                h_mode_short = HABIT_MODE_SHORT_LABELS.get(
+                    h.get("mode") or "free", ""
+                )
                 mode_label = (
                     "Alarm" if h.get("reminder_mode") == "alarm" else "Notification"
                 )
-                times_str = ", ".join(h.get("reminder_times") or [])
+                times_str = ", ".join(
+                    format_hhmm_12h(t) for t in effective_habit_reminder_times(h)
+                )
                 snooze_mins = h.get("reminder_snooze_minutes", 10)
+                meta_parts = [p for p in (h_mode_short, mode_label, times_str, f"Snooze {snooze_mins}m") if p]
                 rows.append(
                     ft.Container(
                         padding=10,
@@ -1909,7 +2028,7 @@ class HabitTrackerApp:
                                             weight=ft.FontWeight.BOLD,
                                         ),
                                         ft.Text(
-                                            f"{mode_label} • {times_str} • Snooze {snooze_mins}m",
+                                            " • ".join(meta_parts),
                                             size=12,
                                             color=ft.Colors.BLUE_GREY_600,
                                         ),
@@ -1919,7 +2038,7 @@ class HabitTrackerApp:
                                 ),
                                 ft.IconButton(
                                     icon=ft.Icons.EDIT_OUTLINED,
-                                    tooltip="Edit reminder settings",
+                                    tooltip="Edit Habit Mode & alert settings",
                                     on_click=lambda _e, target_h=h: open_edit(target_h),
                                 ),
                             ],
@@ -2061,7 +2180,7 @@ class HabitTrackerApp:
                     border_radius=8,
                     bgcolor="#FEF3C7",
                     content=ft.Text(
-                        f"超时补卡 {late_count} 项（不计入连胜/准时率）",
+                        f"Overdue Make-up: {late_count} (excluded from streak/on-time)",
                         size=11,
                         weight=ft.FontWeight.BOLD,
                         color="#B45309",
@@ -2075,7 +2194,7 @@ class HabitTrackerApp:
                     border_radius=8,
                     bgcolor="#FEE2E2",
                     content=ft.Text(
-                        f"超时违规 {violation_count} 项",
+                        f"Violations: {violation_count}",
                         size=11,
                         weight=ft.FontWeight.BOLD,
                         color="#B91C1C",
@@ -2127,11 +2246,11 @@ class HabitTrackerApp:
         if violated_items or reminding_items:
             banner_parts: list[str] = []
             if violated_items:
-                names = "、".join(h["title"] for h in violated_items[:3])
-                banner_parts.append(f"⚠️ 超时违规（可一键补卡）：{names}")
+                names = ", ".join(h["title"] for h in violated_items[:3])
+                banner_parts.append(f"⚠️ Overdue (make-up available): {names}")
             if reminding_items:
-                names = "、".join(h["title"] for h in reminding_items[:3])
-                banner_parts.append(f"🔔 正在提醒：{names}")
+                names = ", ".join(h["title"] for h in reminding_items[:3])
+                banner_parts.append(f"🔔 Reminding now: {names}")
             is_violation_banner = bool(violated_items)
             cards.append(
                 ft.Container(
@@ -2301,7 +2420,7 @@ class HabitTrackerApp:
         if can_start:
             controls_right.append(
                 ft.FilledButton(
-                    content=ft.Text("开始执行"),
+                    content=ft.Text("Start Execution"),
                     icon=ft.Icons.PLAY_ARROW_ROUNDED,
                     on_click=on_start_tap,
                 )
@@ -2309,7 +2428,7 @@ class HabitTrackerApp:
         elif day_status == "violation":
             controls_right.append(
                 ft.FilledButton(
-                    content=ft.Text("超时补卡"),
+                    content=ft.Text("Overdue Make-up"),
                     icon=ft.Icons.HISTORY_ROUNDED,
                     style=ft.ButtonStyle(bgcolor="#DC2626", color=ft.Colors.WHITE),
                     on_click=on_primary_tap,
@@ -2343,10 +2462,14 @@ class HabitTrackerApp:
         if mode_summary:
             subtitle_parts.append(mode_summary)
         if day_status == "in_progress" and item.get("started_at_time"):
-            subtitle_parts.append(f"已于 {item['started_at_time']} 开始")
+            subtitle_parts.append(
+                f"Started at {format_hhmm_12h(item['started_at_time'])}"
+            )
         elif day_status == "violation":
             reason_label = (
-                "未按时开始" if violation_reason == "missed_start" else "未按时完成"
+                "Missed Start Time"
+                if violation_reason == "missed_start"
+                else "Missed End Time"
             )
             subtitle_parts.append(reason_label)
         if is_monthly:
@@ -2366,16 +2489,16 @@ class HabitTrackerApp:
         ]
 
         status_badge_styles = {
-            "reminding": ("开始提醒中", "#DBEAFE", "#1D4ED8"),
-            "in_progress": ("执行中", "#E0E7FF", "#4338CA"),
-            "on_time": ("准时完成", "#DCFCE7", "#15803D"),
-            "violation": ("超时违规", "#FEE2E2", "#B91C1C"),
-            "late_makeup": ("超时补卡", "#FEF3C7", "#B45309"),
-            "pending": ("待开始" if mode == "strict" else "待打卡", "#F1F5F9", "#475569"),
+            "reminding": ("Reminding", "#DBEAFE", "#1D4ED8"),
+            "in_progress": ("In Progress", "#E0E7FF", "#4338CA"),
+            "on_time": ("On Time", "#DCFCE7", "#15803D"),
+            "violation": ("Violation", "#FEE2E2", "#B91C1C"),
+            "late_makeup": ("Overdue Make-up", "#FEF3C7", "#B45309"),
+            "pending": ("Pending Start" if mode == "strict" else "Pending", "#F1F5F9", "#475569"),
         }
         if mode != "free" or day_status in ("violation", "late_makeup"):
             st_label, st_bg, st_fg = status_badge_styles.get(
-                day_status, ("待打卡", "#F1F5F9", "#475569")
+                day_status, ("Pending", "#F1F5F9", "#475569")
             )
             title_controls.append(
                 ft.Container(
@@ -2948,7 +3071,7 @@ class HabitTrackerApp:
             await do_checkin("decrement")
 
         status_labels = {
-            "completed": "超时补卡" if is_late else "Done",
+            "completed": "Overdue Make-up" if is_late else "Done",
             "today": "Due today",
             "upcoming": "Upcoming",
             "overdue": "Missed",
@@ -3035,7 +3158,7 @@ class HabitTrackerApp:
                         )
                     ),
                     icon_size=26,
-                    tooltip="开始执行" if needs_strict_start else "Check in",
+                    tooltip="Start Execution" if needs_strict_start else "Check in",
                     on_click=on_primary_tap,
                 )
             )
@@ -3256,10 +3379,32 @@ class HabitTrackerApp:
         )
         if initial_habit_mode not in ("free", "strict", "window", "reminder"):
             initial_habit_mode = "free"
+        if (
+            initial_habit_mode == "free"
+            and existing
+            and existing.get("reminder_enabled", False)
+        ):
+            initial_habit_mode = "reminder"
+        raw_existing_times = (existing.get("reminder_times") or []) if existing else []
+        reminder_times_state: list[str] = []
+        for raw_item in raw_existing_times:
+            norm = normalize_hhmm(str(raw_item))
+            if norm and norm not in reminder_times_state:
+                reminder_times_state.append(norm)
+        if initial_habit_mode != "free" and existing and existing.get("remind_time"):
+            norm_r = normalize_hhmm(str(existing["remind_time"]))
+            if norm_r and norm_r not in reminder_times_state:
+                reminder_times_state.append(norm_r)
+        reminder_times_state.sort()
+
         initial_mode_remind = (
-            str(existing.get("remind_time") or "09:00")
+            str(existing.get("remind_time"))
             if (existing and existing.get("remind_time"))
-            else ("09:00" if initial_habit_mode != "free" else "")
+            else (
+                reminder_times_state[0]
+                if reminder_times_state
+                else ("09:00" if initial_habit_mode != "free" else "")
+            )
         )
         initial_mode_start = (
             str(existing.get("force_start_time") or "") if existing else ""
@@ -3419,80 +3564,156 @@ class HabitTrackerApp:
             on_select=on_schedule_change,
         )
 
+        from datetime import time as dt_time
+
+        init_remind_12, init_remind_mer = split_24h_to_12h(initial_mode_remind, "AM")
+        init_start_12, init_start_mer = split_24h_to_12h(initial_mode_start, "AM")
+        init_end_12, init_end_mer = split_24h_to_12h(initial_mode_end, "PM")
+
+        def make_meridiem_dropdown(label: str, value: str) -> ft.Dropdown:
+            return ft.Dropdown(
+                label=label,
+                value=value if value in ("AM", "PM") else "AM",
+                width=96,
+                options=[
+                    ft.dropdown.Option(key="AM", text="AM"),
+                    ft.dropdown.Option(key="PM", text="PM"),
+                ],
+            )
+
+        def open_mode_time_picker(
+            field: ft.TextField,
+            meridiem_dd: ft.Dropdown,
+            default_hhmm: str,
+            help_text: str,
+        ) -> None:
+            resolved = (
+                resolve_time_with_meridiem(field.value, meridiem_dd.value)
+                or default_hhmm
+            )
+            parts = resolved.split(":")
+            init_time = dt_time(int(parts[0]), int(parts[1]))
+
+            def on_picked(ev: Any) -> None:
+                picked = getattr(ev.control, "value", None)
+                if picked is not None:
+                    h12_mm, mer = split_24h_to_12h(
+                        f"{picked.hour:02d}:{picked.minute:02d}", "AM"
+                    )
+                    field.value = h12_mm
+                    meridiem_dd.value = mer
+                    err_label.visible = False
+                    self.page.update()
+
+            picker = ft.TimePicker(
+                value=init_time,
+                hour_format=ft.TimePickerHourFormat.H12,
+                help_text=help_text,
+                on_change=on_picked,
+            )
+            open_dialog(self.page, picker)
+
         remind_time_field = ft.TextField(
             label="Remind Time (HH:MM)",
-            value=initial_mode_remind,
-            hint_text="例如 09:00",
+            value=init_remind_12,
+            hint_text="e.g. 09:00",
+            expand=True,
         )
+        remind_meridiem_dropdown = make_meridiem_dropdown(
+            "Remind AM/PM", init_remind_mer
+        )
+        remind_time_row = ft.Row(
+            [
+                remind_time_field,
+                remind_meridiem_dropdown,
+                ft.IconButton(
+                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                    tooltip="Pick Remind Time",
+                    on_click=lambda _e: open_mode_time_picker(
+                        remind_time_field,
+                        remind_meridiem_dropdown,
+                        "09:00",
+                        "Pick remind time",
+                    ),
+                ),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
         force_start_time_field = ft.TextField(
             label="Force Start Time (HH:MM)",
-            value=initial_mode_start,
-            hint_text="例如 09:15",
+            value=init_start_12,
+            hint_text="e.g. 09:15",
+            expand=True,
             visible=(initial_habit_mode == "strict"),
         )
+        start_meridiem_dropdown = make_meridiem_dropdown(
+            "Start AM/PM", init_start_mer
+        )
+        force_start_time_row = ft.Row(
+            [
+                force_start_time_field,
+                start_meridiem_dropdown,
+                ft.IconButton(
+                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                    tooltip="Pick Force Start Time",
+                    on_click=lambda _e: open_mode_time_picker(
+                        force_start_time_field,
+                        start_meridiem_dropdown,
+                        "09:15",
+                        "Pick force start time",
+                    ),
+                ),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            visible=(initial_habit_mode == "strict"),
+        )
+
         force_end_time_field = ft.TextField(
             label="Force End Time (HH:MM)",
-            value=initial_mode_end,
-            hint_text="例如 10:30",
+            value=init_end_12,
+            hint_text="e.g. 10:30",
+            expand=True,
             visible=(initial_habit_mode in ("strict", "window")),
         )
+        end_meridiem_dropdown = make_meridiem_dropdown("End AM/PM", init_end_mer)
+        force_end_time_row = ft.Row(
+            [
+                force_end_time_field,
+                end_meridiem_dropdown,
+                ft.IconButton(
+                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                    tooltip="Pick Force End Time",
+                    on_click=lambda _e: open_mode_time_picker(
+                        force_end_time_field,
+                        end_meridiem_dropdown,
+                        "10:30",
+                        "Pick force end time",
+                    ),
+                ),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            visible=(initial_habit_mode in ("strict", "window")),
+        )
+
         mode_hint_text = ft.Text(
             HABIT_MODE_HINTS.get(initial_habit_mode, ""),
             size=11,
             color=ft.Colors.ON_SURFACE_VARIANT,
         )
-        mode_times_section = ft.Column(
+        strict_window_times_col = ft.Column(
             [
-                mode_hint_text,
-                remind_time_field,
-                force_start_time_field,
-                force_end_time_field,
+                remind_time_row,
+                force_start_time_row,
+                force_end_time_row,
             ],
             tight=True,
             spacing=8,
-            visible=(initial_habit_mode != "free"),
+            visible=(initial_habit_mode in ("strict", "window")),
         )
-
-        def on_habit_mode_change(_e: Any) -> None:
-            m = habit_mode_dropdown.value or "free"
-            mode_hint_text.value = HABIT_MODE_HINTS.get(m, "")
-            mode_times_section.visible = m != "free"
-            force_start_time_field.visible = m == "strict"
-            force_end_time_field.visible = m in ("strict", "window")
-            if m != "free" and not (remind_time_field.value or "").strip():
-                remind_time_field.value = "09:00"
-            if m == "strict":
-                if not (force_start_time_field.value or "").strip():
-                    force_start_time_field.value = "09:15"
-                if not (force_end_time_field.value or "").strip():
-                    force_end_time_field.value = "10:30"
-            elif m == "window" and not (force_end_time_field.value or "").strip():
-                force_end_time_field.value = "21:00"
-            err_label.visible = False
-            self.page.update()
-
-        habit_mode_dropdown = ft.Dropdown(
-            label="Habit Mode",
-            value=initial_habit_mode,
-            options=[
-                ft.dropdown.Option(key=k, text=label)
-                for k, label in HABIT_MODE_OPTIONS
-            ],
-            on_select=on_habit_mode_change,
-        )
-
-        from datetime import time as dt_time
-
-        initial_reminder_enabled = (
-            bool(existing.get("reminder_enabled", False)) if existing else False
-        )
-        raw_existing_times = (existing.get("reminder_times") or []) if existing else []
-        reminder_times_state: list[str] = []
-        for raw_item in raw_existing_times:
-            norm = normalize_hhmm(str(raw_item))
-            if norm and norm not in reminder_times_state:
-                reminder_times_state.append(norm)
-        reminder_times_state.sort()
 
         initial_reminder_mode = (
             str(existing.get("reminder_mode") or "notification")
@@ -3525,6 +3746,7 @@ class HabitTrackerApp:
             hint_text="e.g. 08:30",
             expand=True,
         )
+        custom_time_meridiem_dropdown = make_meridiem_dropdown("Add Time AM/PM", "AM")
         reminder_mode_dropdown = ft.Dropdown(
             label="Reminder Style",
             value=initial_reminder_mode,
@@ -3551,7 +3773,7 @@ class HabitTrackerApp:
             if reminder_times_state:
                 reminder_times_row.controls = [
                     ft.Chip(
-                        label=ft.Text(hhmm),
+                        label=ft.Text(format_hhmm_12h(hhmm)),
                         on_delete=lambda _e, t=hhmm: remove_reminder_time(t),
                     )
                     for hhmm in reminder_times_state
@@ -3566,7 +3788,7 @@ class HabitTrackerApp:
                 ]
             preset_chips_row.controls = [
                 ft.Chip(
-                    label=ft.Text(preset),
+                    label=ft.Text(format_hhmm_12h(preset)),
                     selected=(preset in reminder_times_state),
                     on_click=(
                         lambda _e, t=preset: remove_reminder_time(t)
@@ -3577,10 +3799,14 @@ class HabitTrackerApp:
                 for preset in REMINDER_TIME_PRESETS
             ]
 
-        def add_reminder_time(raw_val: str) -> bool:
-            norm = normalize_hhmm(raw_val)
+        def add_reminder_time(raw_val: str, meridiem: str | None = None) -> bool:
+            norm = (
+                resolve_time_with_meridiem(raw_val, meridiem)
+                if meridiem is not None
+                else normalize_hhmm(raw_val)
+            )
             if norm is None:
-                err_label.value = "Reminder time must be HH:MM (00:00-23:59)"
+                err_label.value = "Reminder time must be HH:MM or H:MM AM/PM"
                 err_label.visible = True
                 self.page.update()
                 return False
@@ -3617,7 +3843,7 @@ class HabitTrackerApp:
                 err_label.visible = True
                 self.page.update()
                 return
-            if add_reminder_time(raw_val):
+            if add_reminder_time(raw_val, meridiem=custom_time_meridiem_dropdown.value):
                 custom_time_input.value = ""
                 self.page.update()
 
@@ -3635,12 +3861,13 @@ class HabitTrackerApp:
 
             picker = ft.TimePicker(
                 value=init_time,
+                hour_format=ft.TimePickerHourFormat.H12,
                 help_text="Pick reminder time",
                 on_change=on_picker_change,
             )
             open_dialog(self.page, picker)
 
-        reminder_details_section = ft.Column(
+        multi_reminder_times_col = ft.Column(
             [
                 ft.Text(
                     "Reminder Times",
@@ -3658,6 +3885,7 @@ class HabitTrackerApp:
                 ft.Row(
                     [
                         custom_time_input,
+                        custom_time_meridiem_dropdown,
                         ft.OutlinedButton(
                             content=ft.Text("Add"),
                             on_click=on_add_custom_time,
@@ -3671,28 +3899,78 @@ class HabitTrackerApp:
                     spacing=6,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
+            ],
+            tight=True,
+            spacing=8,
+            visible=(initial_habit_mode == "reminder"),
+        )
+
+        mode_settings_section = ft.Column(
+            [
+                mode_hint_text,
+                strict_window_times_col,
+                multi_reminder_times_col,
+                ft.Text(
+                    "Alert Delivery (Notification & Alarm)",
+                    size=12,
+                    weight=ft.FontWeight.W_600,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
                 reminder_mode_dropdown,
                 snooze_dropdown,
                 reminder_msg_field,
             ],
             tight=True,
             spacing=8,
-            visible=initial_reminder_enabled,
+            visible=(initial_habit_mode != "free"),
         )
 
-        def on_reminder_toggle(_e: Any) -> None:
-            enabled = bool(reminder_switch.value)
-            if enabled and not reminder_times_state:
-                reminder_times_state.append("09:00")
-            rebuild_reminder_chips()
-            reminder_details_section.visible = enabled
+        def on_habit_mode_change(_e: Any) -> None:
+            m = habit_mode_dropdown.value or "free"
+            mode_hint_text.value = HABIT_MODE_HINTS.get(m, "")
+            mode_settings_section.visible = m != "free"
+            strict_window_times_col.visible = m in ("strict", "window")
+            multi_reminder_times_col.visible = m == "reminder"
+            force_start_time_field.visible = m == "strict"
+            force_start_time_row.visible = m == "strict"
+            force_end_time_field.visible = m in ("strict", "window")
+            force_end_time_row.visible = m in ("strict", "window")
+            if m == "reminder":
+                resolved_r = resolve_time_with_meridiem(
+                    remind_time_field.value, remind_meridiem_dropdown.value
+                )
+                if resolved_r and not reminder_times_state:
+                    reminder_times_state.append(resolved_r)
+                if not reminder_times_state:
+                    reminder_times_state.append("09:00")
+                rebuild_reminder_chips()
+            elif m in ("strict", "window"):
+                if not (remind_time_field.value or "").strip():
+                    seed = reminder_times_state[0] if reminder_times_state else "09:00"
+                    h12, mer = split_24h_to_12h(seed, "AM")
+                    remind_time_field.value = h12
+                    remind_meridiem_dropdown.value = mer
+                if m == "strict":
+                    if not (force_start_time_field.value or "").strip():
+                        force_start_time_field.value = "09:15"
+                        start_meridiem_dropdown.value = "AM"
+                    if not (force_end_time_field.value or "").strip():
+                        force_end_time_field.value = "10:30"
+                        end_meridiem_dropdown.value = "AM"
+                elif m == "window" and not (force_end_time_field.value or "").strip():
+                    force_end_time_field.value = "09:00"
+                    end_meridiem_dropdown.value = "PM"
             err_label.visible = False
             self.page.update()
 
-        reminder_switch = ft.Switch(
-            label="Enable Reminders & Alarms",
-            value=initial_reminder_enabled,
-            on_change=on_reminder_toggle,
+        habit_mode_dropdown = ft.Dropdown(
+            label="Habit Mode",
+            value=initial_habit_mode,
+            options=[
+                ft.dropdown.Option(key=k, text=label)
+                for k, label in HABIT_MODE_OPTIONS
+            ],
+            on_select=on_habit_mode_change,
         )
         rebuild_reminder_chips()
 
@@ -3749,33 +4027,9 @@ class HabitTrackerApp:
                 self.page.update()
                 return
 
-            reminder_enabled = bool(reminder_switch.value)
-            pending_time_raw = (custom_time_input.value or "").strip()
-            if pending_time_raw:
-                norm_pending = normalize_hhmm(pending_time_raw)
-                if norm_pending is None:
-                    err_label.value = "Reminder time must be HH:MM (00:00-23:59)"
-                    err_label.visible = True
-                    self.page.update()
-                    return
-                if norm_pending not in reminder_times_state:
-                    if len(reminder_times_state) >= MAX_REMINDER_TIMES:
-                        err_label.value = (
-                            f"At most {MAX_REMINDER_TIMES} reminder times are allowed"
-                        )
-                        err_label.visible = True
-                        self.page.update()
-                        return
-                    reminder_times_state.append(norm_pending)
-                    reminder_times_state.sort()
-                    custom_time_input.value = ""
-                    rebuild_reminder_chips()
-
-            if reminder_enabled and not reminder_times_state:
-                err_label.value = "Add at least one reminder time (HH:MM)"
-                err_label.visible = True
-                self.page.update()
-                return
+            chosen_habit_mode = habit_mode_dropdown.value or "free"
+            if chosen_habit_mode not in ("free", "strict", "window", "reminder"):
+                chosen_habit_mode = "free"
 
             reminder_mode = reminder_mode_dropdown.value or "notification"
             if reminder_mode not in ("notification", "alarm"):
@@ -3788,18 +4042,59 @@ class HabitTrackerApp:
             if not (1 <= snooze_val <= 120):
                 snooze_val = 10
 
-            chosen_habit_mode = habit_mode_dropdown.value or "free"
-            m_remind, m_start, m_end, mode_err = validate_habit_mode_times(
-                chosen_habit_mode,
-                remind_time_field.value,
-                force_start_time_field.value,
-                force_end_time_field.value,
-            )
-            if mode_err:
-                err_label.value = mode_err
-                err_label.visible = True
-                self.page.update()
-                return
+            if chosen_habit_mode == "free":
+                m_remind, m_start, m_end = None, None, None
+                reminder_enabled = False
+                final_reminder_times: list[str] = []
+            elif chosen_habit_mode in ("strict", "window"):
+                m_remind, m_start, m_end, mode_err = validate_habit_mode_times(
+                    chosen_habit_mode,
+                    remind_time_field.value,
+                    force_start_time_field.value,
+                    force_end_time_field.value,
+                    remind_meridiem=remind_meridiem_dropdown.value,
+                    start_meridiem=start_meridiem_dropdown.value,
+                    end_meridiem=end_meridiem_dropdown.value,
+                )
+                if mode_err:
+                    err_label.value = mode_err
+                    err_label.visible = True
+                    self.page.update()
+                    return
+                reminder_enabled = True
+                final_reminder_times = [m_remind] if m_remind else []
+            else:
+                pending_time_raw = (custom_time_input.value or "").strip()
+                if pending_time_raw:
+                    norm_pending = resolve_time_with_meridiem(
+                        pending_time_raw, custom_time_meridiem_dropdown.value
+                    )
+                    if norm_pending is None:
+                        err_label.value = "Reminder time must be HH:MM or H:MM AM/PM"
+                        err_label.visible = True
+                        self.page.update()
+                        return
+                    if norm_pending not in reminder_times_state:
+                        if len(reminder_times_state) >= MAX_REMINDER_TIMES:
+                            err_label.value = (
+                                f"At most {MAX_REMINDER_TIMES} reminder times are allowed"
+                            )
+                            err_label.visible = True
+                            self.page.update()
+                            return
+                        reminder_times_state.append(norm_pending)
+                        reminder_times_state.sort()
+                        custom_time_input.value = ""
+                        rebuild_reminder_chips()
+
+                if not reminder_times_state:
+                    err_label.value = "Add at least one reminder time (HH:MM)"
+                    err_label.visible = True
+                    self.page.update()
+                    return
+                reminder_enabled = True
+                final_reminder_times = list(reminder_times_state)
+                m_remind, m_start, m_end = final_reminder_times[0], None, None
 
             payload = {
                 "title": title,
@@ -3818,7 +4113,7 @@ class HabitTrackerApp:
                 "force_start_time": m_start,
                 "force_end_time": m_end,
                 "reminder_enabled": reminder_enabled,
-                "reminder_times": list(reminder_times_state),
+                "reminder_times": final_reminder_times,
                 "reminder_mode": reminder_mode,
                 "reminder_snooze_minutes": snooze_val,
                 "reminder_message": (reminder_msg_field.value or "").strip(),
@@ -3854,10 +4149,7 @@ class HabitTrackerApp:
                     monthly_section,
                     ft.Divider(height=1),
                     habit_mode_dropdown,
-                    mode_times_section,
-                    ft.Divider(height=1),
-                    reminder_switch,
-                    reminder_details_section,
+                    mode_settings_section,
                     err_label,
                 ],
                 tight=True,
@@ -3889,7 +4181,7 @@ class HabitTrackerApp:
         late_today = summary.get("late_today", 0)
         violated_today = summary.get("violated_today", 0)
         score_subtext = (
-            f"补卡 {late_today} · 违规 {violated_today}"
+            f"Make-up {late_today} · Violation {violated_today}"
             if (late_today > 0 or violated_today > 0)
             else None
         )
@@ -3933,7 +4225,7 @@ class HabitTrackerApp:
             ]
             if late_cnt > 0:
                 bar_col_items.append(
-                    ft.Text(f"+{late_cnt}补", size=10, color="#D97706")
+                    ft.Text(f"+{late_cnt} late", size=10, color="#D97706")
                 )
             bar_col_items.extend(
                 [
@@ -3992,7 +4284,7 @@ class HabitTrackerApp:
             if hs_mode != "free":
                 meta_str = f"{HABIT_MODE_SHORT_LABELS.get(hs_mode, hs_mode)} • {meta_str}"
             if late_total > 0:
-                meta_str += f" • 超时补卡: {late_total}"
+                meta_str += f" • Make-ups: {late_total}"
             leaderboard_items.append(
                 ft.Container(
                     padding=14,

@@ -8,12 +8,16 @@ import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.HabitCreateRequest
 import com.shawnpeng.habittracker.data.HabitUpdateRequest
 import com.shawnpeng.habittracker.data.computeNextTriggerDateTime
+import com.shawnpeng.habittracker.data.effectiveReminderTimes
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
 import com.shawnpeng.habittracker.data.formatReminderBadge
+import com.shawnpeng.habittracker.data.formatTime12h
 import com.shawnpeng.habittracker.data.normalizeReminderTime
 import com.shawnpeng.habittracker.data.normalizeReminderTimes
 import com.shawnpeng.habittracker.data.parseHabitColor
+import com.shawnpeng.habittracker.data.resolveTimeWithMeridiem
+import com.shawnpeng.habittracker.data.split24hTo12h
 import com.shawnpeng.habittracker.data.validateHabitModeTimes
 import java.time.LocalDateTime
 import kotlinx.coroutines.test.runTest
@@ -246,26 +250,26 @@ class HabitApiClientTest {
 
     @Test
     fun formatFrequencySummarySupportsDailyWeekdaysAndMonthlyRules() {
-        assertEquals("每天", formatFrequencySummary("daily"))
-        assertEquals("周一、周三、周五", formatFrequencySummary("weekdays", listOf(0, 2, 4)))
+        assertEquals("Every day", formatFrequencySummary("daily"))
+        assertEquals("Mon, Wed, Fri", formatFrequencySummary("weekdays", listOf(0, 2, 4)))
         assertEquals(
-            "每月第 15 天",
+            "Monthly • 15th day",
             formatFrequencySummary("monthly", monthlyMode = "from_start", monthlyDay = 15),
         )
         assertEquals(
-            "每月最后一天",
+            "Monthly • Last day of month",
             formatFrequencySummary("monthly", monthlyMode = "from_end", monthlyDay = 1),
         )
         assertEquals(
-            "每月倒数第 3 天",
+            "Monthly • 3rd day from end",
             formatFrequencySummary("monthly", monthlyMode = "from_end", monthlyDay = 3),
         )
         assertEquals(
-            "每月第 2 周 · 周一",
+            "Monthly • Mon on Week 2",
             formatFrequencySummary("monthly", monthlyMode = "nth_weekday", monthlyWeek = 2, monthlyWeekday = 0),
         )
         assertEquals(
-            "每月最后一周 · 周五",
+            "Monthly • Fri on Last week",
             formatFrequencySummary("monthly", monthlyMode = "nth_weekday", monthlyWeek = -1, monthlyWeekday = 4),
         )
     }
@@ -462,8 +466,8 @@ class HabitApiClientTest {
                       "habit_summaries": [
                         {
                           "habit_id": "h1",
-                          "title": "月度复盘",
-                          "description": "每月 14 号完成总结",
+                          "title": "Monthly Review",
+                          "description": "Monthly summary on the 14th",
                           "color": "#16A34A",
                           "icon": "check_circle",
                           "frequency_type": "monthly",
@@ -481,7 +485,7 @@ class HabitApiClientTest {
                         },
                         {
                           "habit_id": "h2",
-                          "title": "晨跑",
+                          "title": "Morning Run",
                           "description": "",
                           "color": "#2563EB",
                           "icon": "directions_run",
@@ -499,7 +503,7 @@ class HabitApiClientTest {
                         {
                           "date": "2026-11-13",
                           "weekday": 4,
-                          "weekday_label": "周五",
+                          "weekday_label": "Fri",
                           "is_today": false,
                           "is_past": true,
                           "is_future": false,
@@ -509,7 +513,7 @@ class HabitApiClientTest {
                           "items": [
                             {
                               "habit_id": "h2",
-                              "title": "晨跑",
+                              "title": "Morning Run",
                               "description": "",
                               "color": "#2563EB",
                               "icon": "directions_run",
@@ -519,7 +523,7 @@ class HabitApiClientTest {
                               "date": "2026-11-13",
                               "count": 1,
                               "completed": false,
-                              "note": "完成一半",
+                              "note": "Halfway there",
                               "status": "overdue"
                             }
                           ]
@@ -527,7 +531,7 @@ class HabitApiClientTest {
                         {
                           "date": "2026-11-14",
                           "weekday": 5,
-                          "weekday_label": "周六",
+                          "weekday_label": "Sat",
                           "is_today": true,
                           "is_past": false,
                           "is_future": false,
@@ -537,8 +541,8 @@ class HabitApiClientTest {
                           "items": [
                             {
                               "habit_id": "h1",
-                              "title": "月度复盘",
-                              "description": "每月 14 号完成总结",
+                              "title": "Monthly Review",
+                              "description": "Monthly summary on the 14th",
                               "color": "#16A34A",
                               "icon": "check_circle",
                               "frequency_type": "monthly",
@@ -581,7 +585,7 @@ class HabitApiClientTest {
                         {
                           "date": "2026-11-20",
                           "weekday": 4,
-                          "weekday_label": "周五",
+                          "weekday_label": "Fri",
                           "is_today": false,
                           "is_past": false,
                           "is_future": true,
@@ -591,7 +595,7 @@ class HabitApiClientTest {
                           "items": [
                             {
                               "habit_id": "h1",
-                              "title": "月度复盘",
+                              "title": "Monthly Review",
                               "frequency_type": "monthly",
                               "monthly_mode": "from_end",
                               "monthly_day": 11,
@@ -826,23 +830,38 @@ class HabitApiClientTest {
     fun reminderTimeHelpersNormalizeSortDedupeAndFormatBadge() {
         assertEquals("08:05", normalizeReminderTime("8:05"))
         assertEquals("23:59", normalizeReminderTime(" 23:59 "))
+        assertEquals("08:05", normalizeReminderTime("8:05 AM"))
+        assertEquals("00:00", normalizeReminderTime("12:00 AM"))
+        assertEquals("12:30", normalizeReminderTime("12:30 PM"))
+        assertEquals("21:15", normalizeReminderTime("9:15 pm"))
+        assertNull(normalizeReminderTime("13:00 PM"))
+        assertNull(normalizeReminderTime("0:15 AM"))
         assertNull(normalizeReminderTime("24:00"))
         assertNull(normalizeReminderTime("09:60"))
         assertNull(normalizeReminderTime("not-a-time"))
 
+        assertEquals("12:05 AM", formatTime12h("00:05"))
+        assertEquals("12:00 PM", formatTime12h("12:00"))
+        assertEquals("1:30 PM", formatTime12h("13:30"))
+        assertEquals("01:30" to "PM", split24hTo12h("13:30"))
+        assertEquals("12:05" to "AM", split24hTo12h("00:05"))
+        assertEquals("13:30", resolveTimeWithMeridiem("01:30", "PM"))
+        assertEquals("00:00", resolveTimeWithMeridiem("12:00", "AM"))
+        assertEquals("21:15", resolveTimeWithMeridiem("21:15", "AM"))
+
         assertEquals(
             listOf("07:15", "08:30", "21:00"),
-            normalizeReminderTimes(listOf("21:00", "8:30", "08:30", "bad", "07:15")),
+            normalizeReminderTimes(listOf("21:00", "8:30 AM", "08:30", "bad", "07:15")),
         )
 
         assertNull(formatReminderBadge(enabled = false, times = listOf("09:00"), mode = "alarm"))
         assertNull(formatReminderBadge(enabled = true, times = emptyList(), mode = "notification"))
         assertEquals(
-            "🔔 08:30",
+            "🔔 8:30 AM",
             formatReminderBadge(enabled = true, times = listOf("8:30"), mode = "notification"),
         )
         assertEquals(
-            "⏰ 07:00, 12:30 (+1)",
+            "⏰ 7:00 AM, 12:30 PM (+1)",
             formatReminderBadge(
                 enabled = true,
                 times = listOf("21:00", "07:00", "12:30"),
@@ -1080,12 +1099,26 @@ class HabitApiClientTest {
         assertEquals("08:45", validStrict.forceStartTime)
         assertEquals("10:00", validStrict.forceEndTime)
 
+        val validStrictAmPm = validateHabitModeTimes(
+            mode = "strict",
+            remindRaw = "08:30",
+            startRaw = "08:45",
+            endRaw = "01:30",
+            remindMeridiem = "AM",
+            startMeridiem = "AM",
+            endMeridiem = "PM",
+        )
+        assertNull(validStrictAmPm.errorMessage)
+        assertEquals("08:30", validStrictAmPm.remindTime)
+        assertEquals("08:45", validStrictAmPm.forceStartTime)
+        assertEquals("13:30", validStrictAmPm.forceEndTime)
+
         val badStrict = validateHabitModeTimes("strict", "09:00", "08:45", "10:00")
         assertTrue(!badStrict.errorMessage.isNullOrBlank())
 
         assertNull(formatHabitModeSummary("free"))
         assertEquals(
-            "模式1·严格管控（提醒 08:30 · 开始 08:45 · 完成 10:00）",
+            "Mode 1 · Strict (Remind 8:30 AM · Start 8:45 AM · End 10:00 AM)",
             formatHabitModeSummary("strict", "08:30", "08:45", "10:00"),
         )
 
@@ -1203,5 +1236,62 @@ class HabitApiClientTest {
         assertTrue(startBody.contains("\"action\":\"start\""))
         assertTrue(startBody.contains("\"client_today\":\"2026-11-15\""))
         assertTrue(startBody.contains("\"client_time\":\"08:40\""))
+    }
+
+    @Test
+    fun mergedHabitModeAndRemindersComputeTriggersWithoutSeparateToggle() {
+        val strictHabit = Habit(
+            id = "h-strict-merged",
+            title = "Morning Focus",
+            frequencyType = "daily",
+            mode = "strict",
+            remindTime = "08:30",
+            forceStartTime = "08:45",
+            forceEndTime = "10:00",
+            reminderMode = "alarm",
+        )
+        assertEquals(listOf("08:30"), effectiveReminderTimes(strictHabit))
+        assertEquals("⏰ 8:30 AM", formatReminderBadge(strictHabit))
+        assertEquals(
+            LocalDateTime.of(2026, 4, 6, 8, 30),
+            computeNextTriggerDateTime(
+                habit = strictHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 8, 0),
+            ),
+        )
+
+        val windowHabit = Habit(
+            id = "h-win-merged",
+            title = "Workout",
+            frequencyType = "daily",
+            mode = "window",
+            remindTime = "17:30",
+            forceEndTime = "21:00",
+            reminderMode = "notification",
+        )
+        assertEquals(listOf("17:30"), effectiveReminderTimes(windowHabit))
+        assertEquals("🔔 5:30 PM", formatReminderBadge(windowHabit))
+
+        val reminderModeHabit = Habit(
+            id = "h-rem-merged",
+            title = "Hydrate",
+            frequencyType = "daily",
+            mode = "reminder",
+            remindTime = "09:00",
+            reminderTimes = listOf("09:00", "20:00"),
+            reminderMode = "alarm",
+        )
+        assertEquals(listOf("09:00", "20:00"), effectiveReminderTimes(reminderModeHabit))
+        assertEquals(
+            "Mode 3 · Alarm",
+            formatHabitModeSummary(mode = "reminder", reminderMode = "alarm"),
+        )
+        assertEquals(
+            LocalDateTime.of(2026, 4, 6, 20, 0),
+            computeNextTriggerDateTime(
+                habit = reminderModeHabit,
+                fromDateTime = LocalDateTime.of(2026, 4, 6, 10, 0),
+            ),
+        )
     }
 }

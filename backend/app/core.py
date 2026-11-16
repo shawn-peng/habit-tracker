@@ -450,22 +450,36 @@ MonthlyMode = Literal["from_start", "from_end", "nth_weekday"]
 ReminderMode = Literal["notification", "alarm"]
 VALID_MONTHLY_WEEKS = {-1, 1, 2, 3, 4, 5}
 MAX_REMINDER_TIMES = 12
-_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_REMINDER_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$")
 
 
 def normalize_reminder_time(raw: str) -> str:
-    """Validate and normalize a 24-hour time string (H:MM or HH:MM) to HH:MM."""
+    """Validate and normalize a 24-hour (HH:MM) or 12-hour (H:MM AM/PM) time string to HH:MM."""
     cleaned = raw.strip()
     match = _REMINDER_TIME_RE.match(cleaned)
     if not match:
         raise ValueError(
-            f"Invalid reminder time '{raw}', expected HH:MM (00:00..23:59)"
+            f"Invalid time '{raw}', expected HH:MM (00:00..23:59) or H:MM AM/PM"
         )
     hour = int(match.group(1))
     minute = int(match.group(2))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+    meridiem = match.group(3).upper() if match.group(3) else None
+    if not (0 <= minute <= 59):
         raise ValueError(
-            f"Invalid reminder time '{raw}', expected HH:MM (00:00..23:59)"
+            f"Invalid time '{raw}', minute must be between 00 and 59"
+        )
+    if meridiem is not None:
+        if not (1 <= hour <= 12):
+            raise ValueError(
+                f"Invalid 12-hour time '{raw}', hour must be 1..12 before {meridiem}"
+            )
+        if meridiem == "AM":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    elif not (0 <= hour <= 23):
+        raise ValueError(
+            f"Invalid time '{raw}', expected HH:MM (00:00..23:59) or H:MM AM/PM"
         )
     return f"{hour:02d}:{minute:02d}"
 
@@ -538,11 +552,6 @@ def extract_habit_mode_fields(
     habit: dict,
 ) -> tuple[HabitMode, str | None, str | None, str | None]:
     """Safely extract (mode, remind_time, force_start_time, force_end_time) with legacy fallbacks."""
-    raw_mode = habit.get("mode", "free")
-    mode: HabitMode = raw_mode if raw_mode in VALID_HABIT_MODES else "free"
-    if mode == "free":
-        return ("free", None, None, None)
-
     def _safe_hhmm(raw: object) -> str | None:
         if not isinstance(raw, str):
             return None
@@ -551,7 +560,35 @@ def extract_habit_mode_fields(
         except ValueError:
             return None
 
+    raw_mode = habit.get("mode", "free")
+    mode: HabitMode = raw_mode if raw_mode in VALID_HABIT_MODES else "free"
+    if mode == "free":
+        if habit.get("reminder_enabled", False):
+            raw_times = habit.get("reminder_times") or []
+            clean_times = (
+                sorted(
+                    {
+                        t
+                        for item in raw_times
+                        if (t := _safe_hhmm(item)) is not None
+                    }
+                )
+                if isinstance(raw_times, list)
+                else []
+            )
+            if clean_times:
+                return ("reminder", clean_times[0], None, None)
+        return ("free", None, None, None)
+
     remind = _safe_hhmm(habit.get("remind_time"))
+    if mode == "reminder" and remind is None:
+        raw_times = habit.get("reminder_times") or []
+        if isinstance(raw_times, list):
+            clean_times = sorted(
+                {t for item in raw_times if (t := _safe_hhmm(item)) is not None}
+            )
+            if clean_times:
+                remind = clean_times[0]
     start = _safe_hhmm(habit.get("force_start_time")) if mode == "strict" else None
     end = (
         _safe_hhmm(habit.get("force_end_time"))
@@ -812,20 +849,50 @@ class HabitCreate(BaseModel):
             raise ValueError("At least one weekday (0..6) must be selected")
         if self.frequency_type in ("daily", "monthly") and not self.weekdays:
             self.weekdays = [0, 1, 2, 3, 4, 5, 6]
-        if self.reminder_enabled and not self.reminder_times:
-            raise ValueError(
-                "At least one reminder time (HH:MM) is required when reminders are enabled"
+
+        if self.mode == "free":
+            if self.reminder_enabled:
+                if not self.reminder_times:
+                    raise ValueError(
+                        "At least one reminder time (HH:MM) is required when reminders are enabled"
+                    )
+                self.mode = "reminder"
+                self.remind_time = self.reminder_times[0]
+                self.force_start_time = None
+                self.force_end_time = None
+            else:
+                self.remind_time = None
+                self.force_start_time = None
+                self.force_end_time = None
+                self.reminder_enabled = False
+                self.reminder_times = []
+        else:
+            if self.mode == "reminder" and not self.remind_time and self.reminder_times:
+                self.remind_time = self.reminder_times[0]
+            (
+                self.remind_time,
+                self.force_start_time,
+                self.force_end_time,
+            ) = validate_and_normalize_mode_times(
+                self.mode,
+                self.remind_time,
+                self.force_start_time,
+                self.force_end_time,
             )
-        (
-            self.remind_time,
-            self.force_start_time,
-            self.force_end_time,
-        ) = validate_and_normalize_mode_times(
-            self.mode,
-            self.remind_time,
-            self.force_start_time,
-            self.force_end_time,
-        )
+            self.reminder_enabled = True
+            if self.mode == "reminder":
+                merged = set(self.reminder_times)
+                if self.remind_time:
+                    merged.add(self.remind_time)
+                self.reminder_times = sorted(merged)[:MAX_REMINDER_TIMES]
+                self.remind_time = self.reminder_times[0]
+            else:
+                if "reminder_times" not in self.model_fields_set or not self.reminder_times:
+                    self.reminder_times = [self.remind_time] if self.remind_time else []
+                elif self.remind_time:
+                    self.reminder_times = sorted(
+                        set(self.reminder_times) | {self.remind_time}
+                    )[:MAX_REMINDER_TIMES]
         return self
 
 
@@ -1091,6 +1158,10 @@ class HabitReminderItemOut(BaseModel):
     completed_today: bool
     count: int = 0
     target_per_day: int = 1
+    mode: HabitMode = "reminder"
+    remind_time: str | None = None
+    force_start_time: str | None = None
+    force_end_time: str | None = None
     reminder_enabled: bool = True
     reminder_times: list[str] = Field(default_factory=list)
     reminder_mode: ReminderMode = "notification"
@@ -1333,7 +1404,24 @@ def extract_reminder_fields(
                     clean_times.append(normalize_reminder_time(item))
                 except ValueError:
                     continue
+    raw_habit_mode = habit.get("mode")
+    if (
+        raw_habit_mode in ("strict", "window", "reminder")
+        and habit.get("reminder_enabled") is not False
+    ):
+        raw_remind = habit.get("remind_time")
+        if isinstance(raw_remind, str) and raw_remind.strip():
+            try:
+                clean_times.append(normalize_reminder_time(raw_remind))
+            except ValueError:
+                pass
     clean_times = sorted(set(clean_times))[:MAX_REMINDER_TIMES]
+    if (
+        raw_habit_mode in ("strict", "window", "reminder")
+        and habit.get("reminder_enabled") is not False
+        and clean_times
+    ):
+        enabled = True
     raw_mode = habit.get("reminder_mode", "notification")
     mode: ReminderMode = raw_mode if raw_mode in ("notification", "alarm") else "notification"
     try:
@@ -2006,6 +2094,10 @@ def build_reminders_overview(
         enabled, times, mode, snooze_mins, message = extract_reminder_fields(h)
         if not enabled or not times:
             continue
+        h_mode, h_remind, h_start, h_end = extract_habit_mode_fields(h)
+        if h_mode == "free":
+            h_mode = "reminder"
+            h_remind = times[0]
 
         hid = str(h.get("_id", h.get("id", "")))
         chk = day_checkins.get(hid)
@@ -2049,6 +2141,10 @@ def build_reminders_overview(
                 completed_today=completed_today,
                 count=count,
                 target_per_day=int(h.get("target_per_day", 1)),
+                mode=h_mode,
+                remind_time=h_remind,
+                force_start_time=h_start,
+                force_end_time=h_end,
                 reminder_enabled=True,
                 reminder_times=times,
                 reminder_mode=mode,

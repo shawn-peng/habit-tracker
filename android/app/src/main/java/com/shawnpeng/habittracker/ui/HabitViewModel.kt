@@ -218,7 +218,7 @@ class HabitViewModel(
     fun login(serverUrl: String, email: String, password: String) {
         val cleanEmail = email.trim()
         if (cleanEmail.isEmpty() || password.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入邮箱和密码", authInfoMessage = null) }
+            _uiState.update { it.copy(authError = "Please enter email and password", authInfoMessage = null) }
             return
         }
 
@@ -259,7 +259,7 @@ class HabitViewModel(
                         it.copy(
                             isAuthSubmitting = false,
                             pendingVerificationEmail = cleanEmail,
-                            authInfoMessage = "该账号尚未完成邮箱验证，请输入 6 位验证码或点击重新发送验证码",
+                            authInfoMessage = "Email not yet verified. Enter the 6-digit code or tap Resend Code.",
                             authError = null,
                         )
                     }
@@ -276,12 +276,12 @@ class HabitViewModel(
         val cleanName = name.trim()
         val cleanEmail = email.trim()
         if (cleanName.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入你的名字", authInfoMessage = null) }
+            _uiState.update { it.copy(authError = "Please enter your name", authInfoMessage = null) }
             return
         }
         if (cleanEmail.isEmpty() || password.length < 6) {
             _uiState.update {
-                it.copy(authError = "请输入有效邮箱且密码至少 6 位", authInfoMessage = null)
+                it.copy(authError = "Enter a valid email and a password of at least 6 characters", authInfoMessage = null)
             }
             return
         }
@@ -303,9 +303,9 @@ class HabitViewModel(
                     password = password,
                 )
                 val info = if (!resp.devVerificationCode.isNullOrBlank()) {
-                    "6 位验证码已发送至 $cleanEmail（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devVerificationCode}）"
+                    "6-digit verification code sent to $cleanEmail (valid ${resp.expiresInMinutes} min, dev code: ${resp.devVerificationCode})"
                 } else {
-                    "6 位验证码已发送至 $cleanEmail，有效期 ${resp.expiresInMinutes} 分钟，请查收邮件"
+                    "6-digit verification code sent to $cleanEmail (valid ${resp.expiresInMinutes} min). Please check your inbox."
                 }
                 _uiState.update {
                     it.copy(
@@ -328,11 +328,11 @@ class HabitViewModel(
         val cleanEmail = email.trim()
         val cleanCode = code.trim()
         if (cleanEmail.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入注册邮箱") }
+            _uiState.update { it.copy(authError = "Please enter your registered email") }
             return
         }
         if (cleanCode.length != 6 || !cleanCode.all { it.isDigit() }) {
-            _uiState.update { it.copy(authError = "请输入 6 位数字验证码") }
+            _uiState.update { it.copy(authError = "Please enter the 6-digit numeric code") }
             return
         }
 
@@ -356,7 +356,7 @@ class HabitViewModel(
                         pendingVerificationEmail = null,
                         resetCodeSentEmail = null,
                         remindersMuted = muted,
-                        snackbarMessage = "邮箱验证成功，欢迎使用",
+                        snackbarMessage = "Email verified — welcome!",
                     )
                 }
                 clearTabCache()
@@ -373,7 +373,7 @@ class HabitViewModel(
     fun resendVerificationCode(serverUrl: String, email: String) {
         val cleanEmail = email.trim()
         if (cleanEmail.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入注册邮箱", authInfoMessage = null) }
+            _uiState.update { it.copy(authError = "Please enter your registered email", authInfoMessage = null) }
             return
         }
 
@@ -390,9 +390,9 @@ class HabitViewModel(
                 prefs.setServerUrl(normalizedUrl)
                 val resp = api.resendVerification(email = cleanEmail)
                 val info = if (!resp.devVerificationCode.isNullOrBlank()) {
-                    "新验证码已发送至 $cleanEmail（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devVerificationCode}）"
+                    "New verification code sent to $cleanEmail (valid ${resp.expiresInMinutes} min, dev code: ${resp.devVerificationCode})"
                 } else {
-                    "新验证码已发送至 $cleanEmail，有效期 ${resp.expiresInMinutes} 分钟，请查收邮件"
+                    "New verification code sent to $cleanEmail (valid ${resp.expiresInMinutes} min). Please check your inbox."
                 }
                 _uiState.update {
                     it.copy(
@@ -424,7 +424,7 @@ class HabitViewModel(
     fun requestPasswordReset(serverUrl: String, email: String) {
         val cleanEmail = email.trim()
         if (cleanEmail.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入注册邮箱", authInfoMessage = null) }
+            _uiState.update { it.copy(authError = "Please enter your registered email", authInfoMessage = null) }
             return
         }
 
@@ -441,9 +441,9 @@ class HabitViewModel(
                 prefs.setServerUrl(normalizedUrl)
                 val resp = api.forgotPassword(email = cleanEmail)
                 val info = if (!resp.devResetCode.isNullOrBlank()) {
-                    "验证码已发送（有效期 ${resp.expiresInMinutes} 分钟，开发模式验证码：${resp.devResetCode}）"
+                    "Reset code sent (valid ${resp.expiresInMinutes} min, dev code: ${resp.devResetCode})"
                 } else {
-                    "验证码已发送（若该邮箱已注册），有效期 ${resp.expiresInMinutes} 分钟"
+                    "If this email is registered, a reset code valid for ${resp.expiresInMinutes} min has been sent"
                 }
                 _uiState.update {
                     it.copy(
@@ -471,19 +471,19 @@ class HabitViewModel(
         val cleanEmail = email.trim()
         val cleanCode = code.trim()
         if (cleanEmail.isEmpty()) {
-            _uiState.update { it.copy(authError = "请输入注册邮箱") }
+            _uiState.update { it.copy(authError = "Please enter your registered email") }
             return
         }
         if (cleanCode.length != 6 || !cleanCode.all { it.isDigit() }) {
-            _uiState.update { it.copy(authError = "请输入 6 位数字验证码") }
+            _uiState.update { it.copy(authError = "Please enter the 6-digit numeric code") }
             return
         }
         if (newPassword.length < 6) {
-            _uiState.update { it.copy(authError = "新密码至少需要 6 位") }
+            _uiState.update { it.copy(authError = "New password must be at least 6 characters") }
             return
         }
         if (newPassword != confirmPassword) {
-            _uiState.update { it.copy(authError = "两次输入的新密码不一致") }
+            _uiState.update { it.copy(authError = "Passwords do not match") }
             return
         }
 
@@ -511,7 +511,7 @@ class HabitViewModel(
                         pendingVerificationEmail = null,
                         resetCodeSentEmail = null,
                         remindersMuted = muted,
-                        snackbarMessage = "密码已重置，已自动登录",
+                        snackbarMessage = "Password reset and signed in",
                     )
                 }
                 clearTabCache()
@@ -551,19 +551,19 @@ class HabitViewModel(
         confirmPassword: String,
     ) {
         if (currentPassword.isEmpty()) {
-            _uiState.update { it.copy(changePasswordError = "请输入当前密码") }
+            _uiState.update { it.copy(changePasswordError = "Please enter your current password") }
             return
         }
         if (newPassword.length < 6) {
-            _uiState.update { it.copy(changePasswordError = "新密码至少需要 6 位") }
+            _uiState.update { it.copy(changePasswordError = "New password must be at least 6 characters") }
             return
         }
         if (newPassword != confirmPassword) {
-            _uiState.update { it.copy(changePasswordError = "两次输入的新密码不一致") }
+            _uiState.update { it.copy(changePasswordError = "Passwords do not match") }
             return
         }
         if (newPassword == currentPassword) {
-            _uiState.update { it.copy(changePasswordError = "新密码不能与当前密码相同") }
+            _uiState.update { it.copy(changePasswordError = "New password cannot match current password") }
             return
         }
 
@@ -583,7 +583,7 @@ class HabitViewModel(
                         showChangePasswordDialog = false,
                         changePasswordError = null,
                         currentUser = tokenResp.user,
-                        snackbarMessage = "密码修改成功",
+                        snackbarMessage = "Password updated",
                     )
                 }
             } catch (exc: ApiException) {
@@ -879,10 +879,10 @@ class HabitViewModel(
                             reminderMessage = request.reminderMessage,
                         ),
                     )
-                    _uiState.update { it.copy(snackbarMessage = "习惯已更新") }
+                    _uiState.update { it.copy(snackbarMessage = "Habit updated") }
                 } else {
                     api.createHabit(request)
-                    _uiState.update { it.copy(snackbarMessage = "已创建新习惯") }
+                    _uiState.update { it.copy(snackbarMessage = "Habit created") }
                 }
                 invalidateTabs(0, 1, 2, 3, 4)
                 tabLoadJob?.cancel()
@@ -902,7 +902,7 @@ class HabitViewModel(
         viewModelScope.launch {
             try {
                 api.updateHabit(habit.id, HabitUpdateRequest(archived = !habit.archived))
-                val msg = if (habit.archived) "已取消归档" else "已归档习惯"
+                val msg = if (habit.archived) "Habit unarchived" else "Habit archived"
                 invalidateTabs(0, 1, 2, 3, 4)
                 tabLoadJob?.cancel()
                 _uiState.update { it.copy(snackbarMessage = msg) }
@@ -921,7 +921,7 @@ class HabitViewModel(
                 alarmController.cancelHabit(habit.id)
                 invalidateTabs(0, 1, 2, 3, 4)
                 tabLoadJob?.cancel()
-                _uiState.update { it.copy(snackbarMessage = "已删除习惯「${habit.title}」") }
+                _uiState.update { it.copy(snackbarMessage = "Deleted habit \"${habit.title}\"") }
                 loadTabData(_uiState.value.selectedTab, force = true)
                 refreshAndSyncAlarms()
             } catch (exc: ApiException) {
@@ -967,7 +967,7 @@ class HabitViewModel(
             _uiState.update {
                 it.copy(
                     remindersMuted = newMuted,
-                    snackbarMessage = if (newMuted) "已暂停所有提醒与闹钟" else "已开启提醒与闹钟",
+                    snackbarMessage = if (newMuted) "Reminders & alarms muted on this device" else "Reminders & alarms active on this device",
                 )
             }
             val todayIso = isoDate(LocalDate.now())
@@ -1004,7 +1004,7 @@ class HabitViewModel(
                 api.updateHabit(habitId, HabitUpdateRequest(targetSlo = rounded))
                 invalidateTabs(2, 4)
                 tabLoadJob?.cancel()
-                _uiState.update { it.copy(snackbarMessage = "已更新目标 SLO") }
+                _uiState.update { it.copy(snackbarMessage = "Updated target SLO") }
                 loadTabData(_uiState.value.selectedTab, force = true)
             } catch (exc: ApiException) {
                 _uiState.update { it.copy(isRefreshing = false) }
@@ -1121,7 +1121,7 @@ class HabitViewModel(
                     showRemindersDialog = false,
                     remindersOverview = null,
                     isLoadingReminders = false,
-                    authError = "登录状态已过期，请重新登录",
+                    authError = "Session expired. Please sign in again.",
                     authInfoMessage = null,
                     resetCodeSentEmail = null,
                 )

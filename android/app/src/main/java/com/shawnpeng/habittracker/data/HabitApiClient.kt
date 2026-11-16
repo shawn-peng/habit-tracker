@@ -281,7 +281,7 @@ class HabitApiClient(
         return try {
             json.decodeFromString<T>(raw)
         } catch (exc: Exception) {
-            throw ApiException("响应数据解析失败: ${exc.message ?: "格式错误"}")
+            throw ApiException("Failed to parse server response: ${exc.message ?: "Invalid format"}")
         }
     }
 
@@ -315,7 +315,7 @@ class HabitApiClient(
         val response = try {
             httpClient.newCall(request).execute()
         } catch (exc: IOException) {
-            throw ApiException("无法连接服务器 $baseUrl (${exc.message ?: "网络异常"})")
+            throw ApiException("Unable to connect to $baseUrl (${exc.message ?: "Network error"})")
         }
 
         response.use { resp ->
@@ -373,7 +373,7 @@ class HabitApiClient(
         fun normalizeBaseUrl(raw: String): String {
             val trimmed = raw.trim()
             if (trimmed.isEmpty()) {
-                throw ApiException("请输入服务器地址")
+                throw ApiException("Please enter a server URL")
             }
             val withScheme = if (
                 trimmed.startsWith("http://", ignoreCase = true) ||
@@ -384,13 +384,13 @@ class HabitApiClient(
                 "http://$trimmed"
             }
             val cleaned = withScheme.trimEnd('/')
-            cleaned.toHttpUrlOrNull() ?: throw ApiException("服务器地址格式无效: $raw")
+            cleaned.toHttpUrlOrNull() ?: throw ApiException("Invalid server URL: $raw")
             return cleaned
         }
 
         fun parseErrorDetail(rawBody: String, statusCode: Int): String {
             if (rawBody.isBlank()) {
-                return "请求失败 (HTTP $statusCode)"
+                return "Request failed (HTTP $statusCode)"
             }
             return try {
                 val root = json.parseToJsonElement(rawBody).jsonObject
@@ -405,12 +405,12 @@ class HabitApiClient(
                                 return msg.content
                             }
                         }
-                        "请求失败 (HTTP $statusCode)"
+                        "Request failed (HTTP $statusCode)"
                     }
-                    else -> "请求失败 (HTTP $statusCode)"
+                    else -> "Request failed (HTTP $statusCode)"
                 }
             } catch (_: Exception) {
-                "请求失败 (HTTP $statusCode)"
+                "Request failed (HTTP $statusCode)"
             }
         }
     }

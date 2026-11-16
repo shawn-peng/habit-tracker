@@ -119,7 +119,7 @@ private fun LoadingSplash() {
         ) {
             CircularProgressIndicator()
             Text(
-                text = "正在连接服务器...",
+                text = "Connecting to server...",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 12.dp),
@@ -187,7 +187,7 @@ private fun MainShell(
                                 } else {
                                     Icons.Rounded.Alarm
                                 },
-                                contentDescription = "提醒与闹钟",
+                                contentDescription = "Reminders & Alarms",
                                 tint = if (uiState.remindersMuted) {
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 } else {
@@ -198,19 +198,19 @@ private fun MainShell(
                         IconButton(onClick = vm::refreshCurrentTab) {
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
-                                contentDescription = "刷新",
+                                contentDescription = "Refresh",
                             )
                         }
                         IconButton(onClick = vm::openChangePasswordDialog) {
                             Icon(
                                 imageVector = Icons.Rounded.Lock,
-                                contentDescription = "修改密码",
+                                contentDescription = "Change Password",
                             )
                         }
                         IconButton(onClick = vm::logout) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Rounded.Logout,
-                                contentDescription = "退出登录",
+                                contentDescription = "Log Out",
                             )
                         }
                     },
@@ -224,25 +224,25 @@ private fun MainShell(
                     selected = uiState.selectedTab == 0,
                     onClick = { vm.selectTab(0) },
                     icon = { Icon(Icons.Rounded.Today, contentDescription = null) },
-                    label = { Text("今日") },
+                    label = { Text("Today") },
                 )
                 NavigationBarItem(
                     selected = uiState.selectedTab == 1,
                     onClick = { vm.selectTab(1) },
                     icon = { Icon(Icons.Rounded.CalendarMonth, contentDescription = null) },
-                    label = { Text("待办") },
+                    label = { Text("Schedule") },
                 )
                 NavigationBarItem(
                     selected = uiState.selectedTab == 2,
                     onClick = { vm.selectTab(2) },
                     icon = { Icon(Icons.Rounded.Checklist, contentDescription = null) },
-                    label = { Text("习惯") },
+                    label = { Text("Habits") },
                 )
                 NavigationBarItem(
                     selected = uiState.selectedTab == 3,
                     onClick = { vm.selectTab(3) },
                     icon = { Icon(Icons.Rounded.Insights, contentDescription = null) },
-                    label = { Text("统计") },
+                    label = { Text("Stats") },
                 )
                 NavigationBarItem(
                     selected = uiState.selectedTab == 4,
@@ -262,7 +262,7 @@ private fun MainShell(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                 ) {
-                    Icon(Icons.Rounded.Add, contentDescription = "新建习惯")
+                    Icon(Icons.Rounded.Add, contentDescription = "New Habit")
                 }
             }
         },
@@ -364,6 +364,10 @@ private fun MainShell(
                         icon = item.icon,
                         frequencyType = item.frequencyType,
                         targetPerDay = item.targetPerDay,
+                        mode = item.mode,
+                        remindTime = item.remindTime,
+                        forceStartTime = item.forceStartTime,
+                        forceEndTime = item.forceEndTime,
                         reminderEnabled = item.reminderEnabled,
                         reminderTimes = item.reminderTimes,
                         reminderMode = item.reminderMode,
@@ -384,6 +388,10 @@ private fun MainShell(
                         icon = item.icon,
                         frequencyType = item.frequencyType,
                         targetPerDay = item.targetPerDay,
+                        mode = item.mode,
+                        remindTime = item.remindTime,
+                        forceStartTime = item.forceStartTime,
+                        forceEndTime = item.forceEndTime,
                         reminderEnabled = item.reminderEnabled,
                         reminderTimes = item.reminderTimes,
                         reminderMode = item.reminderMode,
@@ -392,12 +400,12 @@ private fun MainShell(
                     )
                 val clockIntent = AndroidHabitAlarmScheduler.buildSystemClockAlarmIntent(resolved)
                 if (clockIntent == null) {
-                    vm.showSnackbar("请先为该习惯设置至少一个提醒时间")
+                    vm.showSnackbar("Add at least one reminder time first")
                 } else {
                     try {
                         context.startActivity(clockIntent)
                     } catch (_: ActivityNotFoundException) {
-                        vm.showSnackbar("未找到系统时钟应用，已使用应用内置闹钟提醒")
+                        vm.showSnackbar("System clock app not found; using built-in app alarms instead")
                     }
                 }
             },

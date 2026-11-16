@@ -59,6 +59,7 @@ import com.shawnpeng.habittracker.data.HabitPeriodSummary
 import com.shawnpeng.habittracker.data.PeriodSchedule
 import com.shawnpeng.habittracker.data.ScheduleDay
 import com.shawnpeng.habittracker.data.ScheduleHabitItem
+import com.shawnpeng.habittracker.data.effectiveReminderTimes
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
 import com.shawnpeng.habittracker.data.formatReminderBadge
@@ -94,10 +95,10 @@ fun ScheduleScreen(
 
     val periodTitle = remember(period, anchorDate, isCurrentPeriod) {
         when {
-            period == "month" && isCurrentPeriod -> "本月待办"
-            period == "month" -> "${anchorDate.year}年${anchorDate.monthValue}月"
-            isCurrentPeriod -> "本周待办"
-            else -> "周度待办"
+            period == "month" && isCurrentPeriod -> "This Month"
+            period == "month" -> anchorDate.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.ENGLISH))
+            isCurrentPeriod -> "This Week"
+            else -> "Weekly Plan"
         }
     }
 
@@ -118,12 +119,12 @@ fun ScheduleScreen(
                 FilterChip(
                     selected = period == "week",
                     onClick = { onSelectPeriod("week") },
-                    label = { Text("本周") },
+                    label = { Text("Week") },
                 )
                 FilterChip(
                     selected = period == "month",
                     onClick = { onSelectPeriod("month") },
-                    label = { Text("本月") },
+                    label = { Text("Month") },
                 )
                 Spacer(modifier = Modifier.weight(1f))
                 if (!isCurrentPeriod) {
@@ -136,7 +137,7 @@ fun ScheduleScreen(
                                 modifier = Modifier.size(16.dp),
                             )
                         },
-                        label = { Text("回到当前") },
+                        label = { Text("Current") },
                     )
                 }
             }
@@ -148,7 +149,7 @@ fun ScheduleScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = { onShiftPeriod(-1) }) {
-                    Icon(Icons.Rounded.ChevronLeft, contentDescription = "上一周期")
+                    Icon(Icons.Rounded.ChevronLeft, contentDescription = "Previous period")
                 }
                 Column(
                     modifier = Modifier.weight(1f),
@@ -166,7 +167,7 @@ fun ScheduleScreen(
                     )
                 }
                 IconButton(onClick = { onShiftPeriod(1) }) {
-                    Icon(Icons.Rounded.ChevronRight, contentDescription = "下一周期")
+                    Icon(Icons.Rounded.ChevronRight, contentDescription = "Next period")
                 }
             }
         }
@@ -191,7 +192,7 @@ fun ScheduleScreen(
                             modifier = Modifier.size(36.dp),
                         )
                         Text(
-                            text = "正在加载待办计划...",
+                            text = "Loading schedule...",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -215,35 +216,35 @@ fun ScheduleScreen(
                     FilterChip(
                         selected = statusFilter == "todo",
                         onClick = { statusFilter = "todo" },
-                        label = { Text("待完成 (${schedule.remainingCount})") },
+                        label = { Text("To Do (${schedule.remainingCount})") },
                     )
                 }
                 item {
                     FilterChip(
                         selected = statusFilter == "overdue",
                         onClick = { statusFilter = "overdue" },
-                        label = { Text("漏卡 (${schedule.overdueCount})") },
+                        label = { Text("Missed (${schedule.overdueCount})") },
                     )
                 }
                 item {
                     FilterChip(
                         selected = statusFilter == "all",
                         onClick = { statusFilter = "all" },
-                        label = { Text("全部 (${schedule.totalScheduled})") },
+                        label = { Text("All (${schedule.totalScheduled})") },
                     )
                 }
                 item {
                     FilterChip(
                         selected = groupBy == "day",
                         onClick = { groupBy = "day" },
-                        label = { Text("按日期") },
+                        label = { Text("By Day") },
                     )
                 }
                 item {
                     FilterChip(
                         selected = groupBy == "habit",
                         onClick = { groupBy = "habit" },
-                        label = { Text("按习惯") },
+                        label = { Text("By Habit") },
                     )
                 }
             }
@@ -329,9 +330,9 @@ private fun PeriodSummaryCard(schedule: PeriodSchedule) {
         String.format(Locale.US, "%.1f%%", schedule.completionRate)
     }
     val headline = when {
-        schedule.totalScheduled == 0 -> "本周期暂无安排任务"
-        schedule.remainingCount > 0 -> "还需完成 ${schedule.remainingCount} 项"
-        else -> "本周期任务已全部完成"
+        schedule.totalScheduled == 0 -> "No habits scheduled this period"
+        schedule.remainingCount > 0 -> "${schedule.remainingCount} remaining"
+        else -> "All scheduled tasks complete"
     }
 
     Card(
@@ -362,7 +363,7 @@ private fun PeriodSummaryCard(schedule: PeriodSchedule) {
                     )
                     if (schedule.overdueCount > 0) {
                         Text(
-                            text = "其中漏卡 ${schedule.overdueCount} 项可补卡",
+                            text = "${schedule.overdueCount} missed (make-up available)",
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Medium,
                             color = MaterialTheme.colorScheme.error,
@@ -396,12 +397,12 @@ private fun ScheduleEmptyStateCard(
     period: String,
     totalScheduled: Int,
 ) {
-    val periodLabel = if (period == "month") "本月" else "本周"
+    val periodLabel = if (period == "month") "this month" else "this week"
     val (title, subtitle) = when {
-        totalScheduled == 0 -> "暂无待办习惯" to "${periodLabel}范围内没有需要打卡的习惯安排"
-        statusFilter == "todo" -> "${periodLabel}待办已清零" to "当前所有已安排的打卡任务都已经完成"
-        statusFilter == "overdue" -> "没有漏卡记录" to "${periodLabel}过去日期的计划均已完成，继续保持！"
-        else -> "暂无匹配记录" to "尝试切换周期或筛选条件查看"
+        totalScheduled == 0 -> "No habits scheduled" to "No habits are due $periodLabel"
+        statusFilter == "todo" -> "All caught up!" to "All scheduled check-ins $periodLabel are complete"
+        statusFilter == "overdue" -> "No missed days" to "Past scheduled items $periodLabel are all complete — keep it up!"
+        else -> "No matching tasks" to "Try switching period or filter options"
     }
 
     Card(
@@ -491,7 +492,7 @@ private fun ScheduleHabitSummaryCard(summary: HabitPeriodSummary) {
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "${summary.completedDays}/${summary.scheduledDays} 天",
+                        text = "${summary.completedDays}/${summary.scheduledDays} d",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = habitColor,
@@ -502,11 +503,21 @@ private fun ScheduleHabitSummaryCard(summary: HabitPeriodSummary) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                val summaryReminderBadge = formatReminderBadge(
-                    enabled = summary.reminderEnabled,
-                    times = summary.reminderTimes,
-                    mode = summary.reminderMode,
+                val summaryEffectiveTimes = effectiveReminderTimes(
+                    mode = summary.mode,
+                    reminderEnabled = summary.reminderEnabled,
+                    reminderTimes = summary.reminderTimes,
+                    remindTime = summary.remindTime,
                 )
+                val summaryReminderBadge = if (summaryEffectiveTimes.isEmpty()) {
+                    null
+                } else {
+                    formatReminderBadge(
+                        enabled = true,
+                        times = summaryEffectiveTimes,
+                        mode = summary.reminderMode,
+                    )
+                }
                 if (summaryReminderBadge != null) {
                     Surface(
                         shape = RoundedCornerShape(6.dp),
@@ -545,13 +556,13 @@ private fun ScheduleHabitSummaryCard(summary: HabitPeriodSummary) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "待完成 ${summary.remainingDays} 天",
+                        text = "${summary.remainingDays}d left",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (summary.overdueDays > 0) {
                         Text(
-                            text = "漏卡 ${summary.overdueDays} 天",
+                            text = "${summary.overdueDays}d missed",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Medium,
                             color = MaterialTheme.colorScheme.error,
@@ -560,7 +571,7 @@ private fun ScheduleHabitSummaryCard(summary: HabitPeriodSummary) {
                     Spacer(modifier = Modifier.weight(1f))
                     if (summary.nextDueDate != null) {
                         Text(
-                            text = "下次 ${summary.nextDueDate}",
+                            text = "Next: ${summary.nextDueDate}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
@@ -579,9 +590,9 @@ private fun ScheduleDayCard(
     onDecrementCheckin: (ScheduleHabitItem) -> Unit,
 ) {
     val dayBadgeText = when {
-        day.isToday -> "今天"
-        day.isPast -> "已过"
-        else -> "计划中"
+        day.isToday -> "Today"
+        day.isPast -> "Past"
+        else -> "Upcoming"
     }
     val dayBadgeBg = when {
         day.isToday -> MaterialTheme.colorScheme.primaryContainer
@@ -672,25 +683,26 @@ private fun ScheduleDayHabitRow(
         remindTime = item.remindTime,
         forceStartTime = item.forceStartTime,
         forceEndTime = item.forceEndTime,
+        reminderMode = item.reminderMode,
     )
     val (statusLabel, statusBg, statusFg) = when (item.status) {
         "completed" -> if (item.isLate) {
-            Triple("超时补卡", StatusLateAmber.copy(alpha = 0.14f), StatusLateAmber)
+            Triple("Overdue Make-up", StatusLateAmber.copy(alpha = 0.14f), StatusLateAmber)
         } else {
-            Triple("已完成", StatusDoneGreen.copy(alpha = 0.14f), StatusDoneGreen)
+            Triple("Done", StatusDoneGreen.copy(alpha = 0.14f), StatusDoneGreen)
         }
         "overdue" -> Triple(
-            "漏卡",
+            "Missed",
             StatusOverdueRed.copy(alpha = 0.14f),
             StatusOverdueRed,
         )
         "today" -> Triple(
-            "今日",
+            "Due today",
             StatusTodayBlue.copy(alpha = 0.14f),
             StatusTodayBlue,
         )
         else -> Triple(
-            "计划中",
+            "Upcoming",
             MaterialTheme.colorScheme.surfaceVariant,
             MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -752,7 +764,7 @@ private fun ScheduleDayHabitRow(
                     }
                     if (item.targetPerDay > 1) {
                         if (isNotEmpty()) append(" · ")
-                        append("进度 ${item.count}/${item.targetPerDay}")
+                        append("${item.count}/${item.targetPerDay}")
                     }
                     if (item.note.isNotBlank()) {
                         if (isNotEmpty()) append(" · ")
@@ -767,11 +779,21 @@ private fun ScheduleDayHabitRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            val itemReminderBadge = formatReminderBadge(
-                enabled = item.reminderEnabled,
-                times = item.reminderTimes,
-                mode = item.reminderMode,
+            val itemEffectiveTimes = effectiveReminderTimes(
+                mode = item.mode,
+                reminderEnabled = item.reminderEnabled,
+                reminderTimes = item.reminderTimes,
+                remindTime = item.remindTime,
             )
+            val itemReminderBadge = if (itemEffectiveTimes.isEmpty()) {
+                null
+            } else {
+                formatReminderBadge(
+                    enabled = true,
+                    times = itemEffectiveTimes,
+                    mode = item.reminderMode,
+                )
+            }
             if (itemReminderBadge != null) {
                 Surface(
                     shape = RoundedCornerShape(6.dp),
@@ -804,7 +826,7 @@ private fun ScheduleDayHabitRow(
                         modifier = Modifier.size(14.dp),
                     )
                     Text(
-                        text = "计划中",
+                        text = "Upcoming",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -819,9 +841,9 @@ private fun ScheduleDayHabitRow(
                         else -> Icons.Rounded.RadioButtonUnchecked
                     },
                     contentDescription = when {
-                        needsStrictStart -> "开始执行"
-                        item.completed -> "取消打卡"
-                        else -> "完成打卡"
+                        needsStrictStart -> "Start Execution"
+                        item.completed -> "Undo check-in"
+                        else -> "Check in"
                     },
                     tint = when {
                         needsStrictStart -> MaterialTheme.colorScheme.primary
@@ -840,7 +862,7 @@ private fun ScheduleDayHabitRow(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.RemoveCircleOutline,
-                        contentDescription = "减少一次",
+                        contentDescription = "Decrease count",
                         modifier = Modifier.size(20.dp),
                     )
                 }
@@ -856,7 +878,7 @@ private fun ScheduleDayHabitRow(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.AddCircleOutline,
-                        contentDescription = "增加一次",
+                        contentDescription = "Increase count",
                         tint = habitColor,
                         modifier = Modifier.size(20.dp),
                     )

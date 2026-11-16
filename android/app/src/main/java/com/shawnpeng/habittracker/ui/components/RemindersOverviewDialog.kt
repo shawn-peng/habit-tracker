@@ -37,9 +37,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.shawnpeng.habittracker.data.HABIT_MODE_OPTIONS
 import com.shawnpeng.habittracker.data.HabitReminderItem
 import com.shawnpeng.habittracker.data.RemindersOverview
 import com.shawnpeng.habittracker.data.formatReminderBadge
+import com.shawnpeng.habittracker.data.formatTime12h
 import com.shawnpeng.habittracker.data.parseHabitColor
 
 @Composable
@@ -78,12 +80,12 @@ fun RemindersOverviewDialog(
                             MaterialTheme.colorScheme.primary
                         },
                     )
-                    Text("提醒与闹钟中心", fontWeight = FontWeight.Bold)
+                    Text("Reminders & Alarms", fontWeight = FontWeight.Bold)
                 }
                 IconButton(onClick = onRefresh, enabled = !isLoading) {
                     Icon(
                         imageVector = Icons.Rounded.Refresh,
-                        contentDescription = "刷新提醒",
+                        contentDescription = "Refresh reminders",
                     )
                 }
             }
@@ -109,12 +111,16 @@ fun RemindersOverviewDialog(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "暂停所有提醒与闹钟",
+                                text = "Mute all reminders & alarms",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.SemiBold,
                             )
                             Text(
-                                text = if (remindersMuted) "已静音，仅保留后台设置" else "开启中，将按计划触发通知或闹钟",
+                                text = if (remindersMuted) {
+                                    "Muted on this device; schedules stay saved"
+                                } else {
+                                    "Active; notifications and alarms will ring on schedule"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -132,17 +138,17 @@ fun RemindersOverviewDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         ReminderMetricPill(
-                            label = "启用习惯",
+                            label = "Enabled",
                             value = overview.enabledHabitsCount.toString(),
                             modifier = Modifier.weight(1f),
                         )
                         ReminderMetricPill(
-                            label = "闹钟模式",
+                            label = "Alarms",
                             value = overview.alarmHabitsCount.toString(),
                             modifier = Modifier.weight(1f),
                         )
                         ReminderMetricPill(
-                            label = "今日待触发",
+                            label = "Due Today",
                             value = overview.pendingTodayTriggers.toString(),
                             modifier = Modifier.weight(1f),
                         )
@@ -165,7 +171,7 @@ fun RemindersOverviewDialog(
 
                     overview == null || overview.items.isEmpty() -> {
                         Text(
-                            text = "尚未为任何习惯启用提醒或闹钟。\n可在创建或编辑习惯时开启「提醒与闹钟」。",
+                            text = "No reminders or alarms configured yet.\nSelect Mode 1, 2, or 3 under Habit Mode & Alerts when creating or editing a habit.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(vertical = 12.dp),
@@ -186,7 +192,7 @@ fun RemindersOverviewDialog(
         },
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("关闭")
+                Text("Close")
             }
         },
     )
@@ -229,17 +235,19 @@ private fun ReminderOverviewItemCard(
     onSyncSystemClock: () -> Unit,
 ) {
     val accent = parseHabitColor(item.color)
+    val modeShortLabel = HABIT_MODE_OPTIONS.firstOrNull { it.key == item.mode }?.shortLabel
+    val timesForBadge = item.reminderTimes.ifEmpty { listOfNotNull(item.remindTime) }
     val badge = formatReminderBadge(
-        enabled = item.reminderEnabled,
-        times = item.reminderTimes,
+        enabled = item.reminderEnabled || timesForBadge.isNotEmpty(),
+        times = timesForBadge,
         mode = item.reminderMode,
     )
     val nextTriggerText = if (item.nextTriggerDate != null && item.nextTriggerTime != null) {
-        "下次触发：${item.nextTriggerDate} ${item.nextTriggerTime}"
+        "Next trigger: ${item.nextTriggerDate} ${formatTime12h(item.nextTriggerTime)}"
     } else if (item.completedToday) {
-        "今日打卡已完成"
+        "Completed today"
     } else {
-        "暂未安排近期触发"
+        "No upcoming trigger scheduled"
     }
 
     Surface(
@@ -271,13 +279,16 @@ private fun ReminderOverviewItemCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (badge != null) {
-                        Text(
-                            text = "$badge · 延时 ${item.reminderSnoozeMinutes} 分钟",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
+                    val metaParts = listOfNotNull(
+                        modeShortLabel,
+                        badge,
+                        "Snooze ${item.reminderSnoozeMinutes}m",
+                    )
+                    Text(
+                        text = metaParts.joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
                 }
             }
 
@@ -288,7 +299,7 @@ private fun ReminderOverviewItemCard(
             )
             if (item.reminderMessage.isNotBlank()) {
                 Text(
-                    text = "提示语：${item.reminderMessage}",
+                    text = "Note: ${item.reminderMessage}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -305,11 +316,11 @@ private fun ReminderOverviewItemCard(
                     onClick = onSyncSystemClock,
                     modifier = Modifier.height(34.dp),
                 ) {
-                    Text("同步到系统闹钟", style = MaterialTheme.typography.labelSmall)
+                    Text("Sync to Clock App", style = MaterialTheme.typography.labelSmall)
                 }
                 Spacer(modifier = Modifier.width(6.dp))
                 TextButton(onClick = onEdit) {
-                    Text("编辑")
+                    Text("Edit")
                 }
             }
         }

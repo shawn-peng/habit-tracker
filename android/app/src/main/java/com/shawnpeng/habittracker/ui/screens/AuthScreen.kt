@@ -176,9 +176,9 @@ fun AuthScreen(
 
                     Text(
                         text = when {
-                            isVerifyEmail -> "输入发送到你邮箱的 6 位数字验证码以激活账号"
-                            isForgotPassword -> "输入注册邮箱获取 6 位验证码以设置新密码"
-                            else -> "连接 FastAPI + MongoDB 后端，同步你的每日习惯与连胜记录"
+                            isVerifyEmail -> "Enter the 6-digit verification code sent to your email to activate your account"
+                            isForgotPassword -> "Enter your registered email to receive a 6-digit password reset code"
+                            else -> "Connect to the FastAPI + MongoDB backend to sync your daily habits & streaks"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -187,13 +187,13 @@ fun AuthScreen(
 
                     if (isVerifyEmail) {
                         Text(
-                            text = "验证注册邮箱",
+                            text = "Verify Email",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
                         )
                     } else if (isForgotPassword) {
                         Text(
-                            text = "重置密码",
+                            text = "Reset Password",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -205,7 +205,7 @@ fun AuthScreen(
                                     isRegister = false
                                     onClearFeedback()
                                 },
-                                text = { Text("登录") },
+                                text = { Text("Sign In") },
                             )
                             Tab(
                                 selected = isRegister,
@@ -213,7 +213,7 @@ fun AuthScreen(
                                     isRegister = true
                                     onClearFeedback()
                                 },
-                                text = { Text("注册账号") },
+                                text = { Text("Create Account") },
                             )
                         }
                     }
@@ -242,15 +242,15 @@ fun AuthScreen(
                         ) {
                             AssistChip(
                                 onClick = { serverUrl = DEFAULT_EMULATOR_URL },
-                                label = { Text("模拟器 10.0.2.2") },
+                                label = { Text("Emulator 10.0.2.2") },
                             )
                             AssistChip(
                                 onClick = { serverUrl = "http://192.168.1.50:8000" },
-                                label = { Text("局域网示例") },
+                                label = { Text("LAN Example") },
                             )
                         }
                         Text(
-                            text = "Android 模拟器访问本机后端请用 http://10.0.2.2:8000；真机请填电脑局域网 IP（如 http://192.168.x.x:8000）。",
+                            text = "Use http://10.0.2.2:8000 in the Android Emulator, or your computer's LAN IP (e.g. http://192.168.x.x:8000) on a physical device.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -260,7 +260,7 @@ fun AuthScreen(
                         OutlinedTextField(
                             value = name,
                             onValueChange = { name = it },
-                            label = { Text("姓名") },
+                            label = { Text("Full Name") },
                             leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                             singleLine = true,
@@ -271,7 +271,7 @@ fun AuthScreen(
                     OutlinedTextField(
                         value = email,
                         onValueChange = { email = it },
-                        label = { Text("邮箱") },
+                        label = { Text("Email") },
                         leadingIcon = { Icon(Icons.Rounded.Email, contentDescription = null) },
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Email,
@@ -292,14 +292,14 @@ fun AuthScreen(
                         OutlinedTextField(
                             value = password,
                             onValueChange = { password = it },
-                            label = { Text("密码") },
+                            label = { Text("Password") },
                             leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { passwordVisible = !passwordVisible }) {
                                     Icon(
                                         imageVector = if (passwordVisible) Icons.Rounded.VisibilityOff
                                         else Icons.Rounded.Visibility,
-                                        contentDescription = if (passwordVisible) "隐藏密码" else "显示密码",
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password",
                                     )
                                 }
                             },
@@ -335,7 +335,7 @@ fun AuthScreen(
                                         onClearFeedback()
                                     },
                                 ) {
-                                    Text("忘记密码？")
+                                    Text("Forgot password?")
                                 }
                             }
                         }
@@ -356,14 +356,14 @@ fun AuthScreen(
                         OutlinedTextField(
                             value = newPassword,
                             onValueChange = { newPassword = it },
-                            label = { Text("新密码（至少 6 位）") },
+                            label = { Text("New Password (at least 6 chars)") },
                             leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { newPasswordVisible = !newPasswordVisible }) {
                                     Icon(
                                         imageVector = if (newPasswordVisible) Icons.Rounded.VisibilityOff
                                         else Icons.Rounded.Visibility,
-                                        contentDescription = if (newPasswordVisible) "隐藏密码" else "显示密码",
+                                        contentDescription = if (newPasswordVisible) "Hide password" else "Show password",
                                     )
                                 }
                             },
@@ -383,14 +383,14 @@ fun AuthScreen(
                         OutlinedTextField(
                             value = confirmPassword,
                             onValueChange = { confirmPassword = it },
-                            label = { Text("确认新密码") },
+                            label = { Text("Confirm New Password") },
                             leadingIcon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { newPasswordVisible = !newPasswordVisible }) {
                                     Icon(
                                         imageVector = if (newPasswordVisible) Icons.Rounded.VisibilityOff
                                         else Icons.Rounded.Visibility,
-                                        contentDescription = if (newPasswordVisible) "隐藏密码" else "显示密码",
+                                        contentDescription = if (newPasswordVisible) "Hide password" else "Show password",
                                     )
                                 }
                             },
@@ -482,11 +482,11 @@ fun AuthScreen(
                         } else {
                             Text(
                                 text = when {
-                                    isVerifyEmail -> "验证邮箱并登录"
-                                    isForgotPassword && !hasResetCode -> "发送 6 位验证码"
-                                    isForgotPassword -> "重置密码并登录"
-                                    isRegister -> "创建账号"
-                                    else -> "登录"
+                                    isVerifyEmail -> "Verify Email & Sign In"
+                                    isForgotPassword && !hasResetCode -> "Send 6-Digit Code"
+                                    isForgotPassword -> "Reset Password & Sign In"
+                                    isRegister -> "Create Account"
+                                    else -> "Sign In"
                                 },
                                 fontWeight = FontWeight.SemiBold,
                             )
@@ -501,7 +501,7 @@ fun AuthScreen(
                             },
                             enabled = !isSubmitting,
                         ) {
-                            Text("重新发送验证码")
+                            Text("Resend Code")
                         }
 
                         TextButton(
@@ -514,7 +514,7 @@ fun AuthScreen(
                             },
                             enabled = !isSubmitting,
                         ) {
-                            Text("返回登录")
+                            Text("Back to Sign In")
                         }
                     } else if (isForgotPassword) {
                         if (!hasResetCode) {
@@ -525,14 +525,14 @@ fun AuthScreen(
                                 },
                                 enabled = !isSubmitting,
                             ) {
-                                Text("已有验证码？直接填写")
+                                Text("Already have a code? Enter it")
                             }
                         } else {
                             TextButton(
                                 onClick = { onRequestPasswordReset(serverUrl, email) },
                                 enabled = !isSubmitting,
                             ) {
-                                Text("重新发送验证码")
+                                Text("Resend Code")
                             }
                         }
 
@@ -544,7 +544,7 @@ fun AuthScreen(
                             },
                             enabled = !isSubmitting,
                         ) {
-                            Text("返回登录")
+                            Text("Back to Sign In")
                         }
                     } else if (isRegister) {
                         TextButton(
@@ -556,7 +556,7 @@ fun AuthScreen(
                             },
                             enabled = !isSubmitting,
                         ) {
-                            Text("已有注册验证码？去验证邮箱")
+                            Text("Already have a code? Verify Email")
                         }
                     }
                 }
@@ -580,7 +580,7 @@ private fun NumericCodeField(
                 onValueChange(digitsOnly)
             }
         },
-        label = { Text("6 位数字验证码") },
+        label = { Text("6-Digit Verification Code") },
         leadingIcon = { Icon(Icons.Rounded.Verified, contentDescription = null) },
         keyboardOptions = KeyboardOptions(
             keyboardType = KeyboardType.Number,

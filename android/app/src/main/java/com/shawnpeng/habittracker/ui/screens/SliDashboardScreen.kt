@@ -88,7 +88,7 @@ fun SliDashboardScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "个人习惯 SLI 看板",
+                        text = "Personal SLI & Error Budget",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                     )
@@ -96,7 +96,7 @@ fun SliDashboardScreen(
                 }
 
                 Text(
-                    text = "基于 SRE 可靠性指标、错误预算与燃烧率的习惯达成分析",
+                    text = "SRE reliability, error budgets, and burn-rate diagnostics",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -106,7 +106,7 @@ fun SliDashboardScreen(
                         FilterChip(
                             selected = selectedWindowDays == days,
                             onClick = { onSelectWindow(days) },
-                            label = { Text("$days 天") },
+                            label = { Text("${days}d") },
                         )
                     }
                 }
@@ -131,15 +131,15 @@ fun SliDashboardScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     SliKpiCard(
-                        title = "整体 SLI",
+                        title = "Overall SLI",
                         value = "${dash.overallSli}%",
-                        subtitle = "目标 ${dash.overallTargetSlo}%",
+                        subtitle = "SLO ${dash.overallTargetSlo}%",
                         icon = Icons.Rounded.Speed,
                         accent = statusColor(dash.overallStatus),
                         modifier = Modifier.weight(1f),
                     )
                     SliKpiCard(
-                        title = "错误预算",
+                        title = "Error Budget",
                         value = "${dash.overallErrorBudgetRemainingPct}%",
                         subtitle = "${formatSignedOneDecimal(dash.overallErrorBudgetRemainingDays)}d / ${dash.overallErrorBudgetAllowedDays}d",
                         icon = Icons.Rounded.CheckCircle,
@@ -147,7 +147,7 @@ fun SliDashboardScreen(
                         modifier = Modifier.weight(1f),
                     )
                     SliKpiCard(
-                        title = "燃烧率",
+                        title = "Burn Rate",
                         value = "${dash.overallBurnRate}x",
                         subtitle = "7d ${dash.overallBurnRate7d}x",
                         icon = Icons.Rounded.LocalFireDepartment,
@@ -170,12 +170,12 @@ fun SliDashboardScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "SLO 达标概览（${dash.windowDays} 天窗口）",
+                            text = "SLO Compliance (${dash.windowDays}d)",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                         )
                         Text(
-                            text = "达标 ${dash.healthyCount} · 预警 ${dash.warningCount} · 违约 ${dash.breachedCount}",
+                            text = "${dash.healthyCount} OK · ${dash.warningCount} Risk · ${dash.breachedCount} Breach",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -206,19 +206,19 @@ fun SliDashboardScreen(
                         )
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
-                                text = "SRE 诊断洞察",
+                                text = "SRE Diagnostics",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                             )
                             val burnLine = if (!dash.topBurnHabitTitle.isNullOrBlank() && dash.topBurnRate != null) {
-                                "最高燃烧率习惯：${dash.topBurnHabitTitle}（${dash.topBurnRate}x）"
+                                "Highest burn: ${dash.topBurnHabitTitle} (${dash.topBurnRate}x)"
                             } else {
-                                "所有习惯燃烧率均为 0.0x，当前窗口无缺卡。"
+                                "All habits are at 0.0x burn rate — zero misses in this window."
                             }
                             val weakLine = if (!dash.weakestWeekday.isNullOrBlank() && dash.weakestWeekdaySli != null) {
-                                "最薄弱星期：${localizeWeekdayLabel(dash.weakestWeekday)}（SLI ${dash.weakestWeekdaySli}%）"
+                                "Weakest day: ${localizeWeekdayLabel(dash.weakestWeekday)} (${dash.weakestWeekdaySli}% SLI)"
                             } else {
-                                "所有已排期星期的可靠度均达到 100%。"
+                                "All scheduled weekdays are at 100% reliability."
                             }
                             Text(
                                 text = burnLine,
@@ -253,7 +253,7 @@ fun SliDashboardScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "滚动 SLI 趋势（${dash.windowDays} 天）",
+                            text = "Rolling SLI Trend (${dash.windowDays}d)",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                         )
@@ -266,7 +266,7 @@ fun SliDashboardScreen(
 
                     if (dash.trend.isEmpty()) {
                         Text(
-                            text = "暂无趋势数据",
+                            text = "No trend data available",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -342,7 +342,7 @@ fun SliDashboardScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Text(
-                            text = "星期可靠性分布",
+                            text = "Reliability by Weekday",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                         )
@@ -392,7 +392,7 @@ fun SliDashboardScreen(
 
         item {
             Text(
-                text = "各习惯 SLI 与错误预算明细",
+                text = "Per-Habit SLI & Error Budget",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -406,7 +406,7 @@ fun SliDashboardScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 ) {
                     Text(
-                        text = "创建习惯并开始打卡后，即可查看各习惯的 SLI、目标 SLO、错误预算与燃烧率诊断。",
+                        text = "Create habits and start checking in to view per-habit SLI, target SLO, error budgets, and burn-rate diagnostics.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(24.dp),
@@ -493,7 +493,7 @@ private fun HabitSliCard(
                     IconButton(onClick = onEditSlo) {
                         Icon(
                             imageVector = Icons.Rounded.Edit,
-                            contentDescription = "调整目标 SLO",
+                            contentDescription = "Edit target SLO",
                             modifier = Modifier.size(18.dp),
                         )
                     }
@@ -523,14 +523,14 @@ private fun HabitSliCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "预算剩余 ${item.errorBudgetRemainingPct}%（缺卡 ${item.errorBudgetUsedDays}/${item.errorBudgetAllowedDays}d，余 ${formatSignedOneDecimal(item.errorBudgetRemainingDays)}d）",
+                    text = "Budget ${item.errorBudgetRemainingPct}% (${item.errorBudgetUsedDays}/${item.errorBudgetAllowedDays}d missed, ${formatSignedOneDecimal(item.errorBudgetRemainingDays)}d left)",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "燃烧 ${item.burnRate}x · 7d ${item.burnRate7d}x",
+                    text = "Burn ${item.burnRate}x · 7d ${item.burnRate7d}x",
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                     color = statusColor(item.status),
@@ -553,14 +553,14 @@ private fun EditSloDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = "调整目标 SLO · ${item.title}",
+                text = "Edit Target SLO · ${item.title}",
                 fontWeight = FontWeight.Bold,
             )
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "选择预设目标或输入自定义可靠性目标（1% - 100%）：",
+                    text = "Pick a preset or enter a custom reliability target (1% - 100%):",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -586,7 +586,7 @@ private fun EditSloDialog(
                         sloText = it
                         errorMsg = null
                     },
-                    label = { Text("目标 SLO (%)") },
+                    label = { Text("Target SLO (%)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier.fillMaxWidth(),
@@ -605,18 +605,18 @@ private fun EditSloDialog(
                 onClick = {
                     val parsed = sloText.trim().toDoubleOrNull()
                     if (parsed == null || parsed !in 1.0..100.0) {
-                        errorMsg = "目标 SLO 需在 1 到 100 之间"
+                        errorMsg = "Target SLO must be between 1 and 100"
                         return@TextButton
                     }
                     onConfirm(round(parsed * 10.0) / 10.0)
                 },
             ) {
-                Text("保存")
+                Text("Save")
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("取消")
+                Text("Cancel")
             }
         },
     )
@@ -675,10 +675,10 @@ private fun SliKpiCard(
 private fun SliStatusBadge(status: String) {
     val fg = statusColor(status)
     val label = when (status) {
-        "healthy" -> "达标"
-        "warning" -> "预警"
-        "breached" -> "违约"
-        else -> "暂无数据"
+        "healthy" -> "HEALTHY"
+        "warning" -> "AT RISK"
+        "breached" -> "BREACHED"
+        else -> "NO DATA"
     }
     Surface(
         shape = RoundedCornerShape(8.dp),
@@ -715,13 +715,13 @@ private fun statusColor(status: String): Color = when (status) {
 }
 
 private fun localizeWeekdayLabel(label: String): String = when (label) {
-    "Mon" -> "周一"
-    "Tue" -> "周二"
-    "Wed" -> "周三"
-    "Thu" -> "周四"
-    "Fri" -> "周五"
-    "Sat" -> "周六"
-    "Sun" -> "周日"
+    "Mon" -> "Mon"
+    "Tue" -> "Tue"
+    "Wed" -> "Wed"
+    "Thu" -> "Thu"
+    "Fri" -> "Fri"
+    "Sat" -> "Sat"
+    "Sun" -> "Sun"
     else -> label
 }
 

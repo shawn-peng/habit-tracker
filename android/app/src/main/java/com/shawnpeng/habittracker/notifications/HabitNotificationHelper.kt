@@ -17,6 +17,7 @@ import androidx.core.content.ContextCompat
 import com.shawnpeng.habittracker.MainActivity
 import com.shawnpeng.habittracker.R
 import com.shawnpeng.habittracker.data.Habit
+import com.shawnpeng.habittracker.data.formatTime12h
 import kotlinx.serialization.json.Json
 
 object HabitNotificationHelper {
@@ -36,10 +37,10 @@ object HabitNotificationHelper {
         if (manager.getNotificationChannel(CHANNEL_REMINDERS) == null) {
             val reminderChannel = NotificationChannel(
                 CHANNEL_REMINDERS,
-                "习惯提醒",
+                "Habit Reminders",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
-                description = "常规习惯定时提醒通知"
+                description = "Scheduled habit reminder notifications"
                 enableVibration(true)
             }
             manager.createNotificationChannel(reminderChannel)
@@ -54,10 +55,10 @@ object HabitNotificationHelper {
                 .build()
             val alarmChannel = NotificationChannel(
                 CHANNEL_ALARMS,
-                "强提醒闹钟",
+                "Habit Alarms",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
-                description = "习惯强提醒闹钟铃声与震动"
+                description = "High-priority habit alarm ringtone and vibration"
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0L, 500L, 250L, 500L, 250L, 800L)
                 setSound(alarmUri, audioAttrs)
@@ -102,7 +103,7 @@ object HabitNotificationHelper {
 
         val messageBody = buildString {
             if (timeLabel.isNotBlank()) {
-                append("计划时间 $timeLabel · ")
+                append("Scheduled for ${formatTime12h(timeLabel)} · ")
             }
             val customMsg = habit.reminderMessage.trim()
             if (customMsg.isNotEmpty()) {
@@ -110,7 +111,7 @@ object HabitNotificationHelper {
             } else if (habit.description.isNotBlank()) {
                 append(habit.description.trim())
             } else {
-                append("点击通知打开应用完成今日打卡")
+                append("Tap to open Habit Tracker and complete today's check-in")
             }
         }
 
@@ -148,7 +149,18 @@ object HabitNotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val title = if (isAlarm) "⏰ 习惯闹钟 · ${habit.title}" else "🔔 习惯提醒 · ${habit.title}"
+        val primaryActionLabel = if (
+            habit.mode == "strict" &&
+            !habit.forceStartTime.isNullOrBlank() &&
+            timeLabel.isNotBlank() &&
+            timeLabel <= habit.forceStartTime
+        ) {
+            "Start / Check In"
+        } else {
+            "Check In"
+        }
+
+        val title = if (isAlarm) "⏰ Habit Alarm · ${habit.title}" else "🔔 Habit Reminder · ${habit.title}"
         val builder = NotificationCompat.Builder(appContext, channelId)
             .setSmallIcon(R.drawable.ic_stat_alarm)
             .setContentTitle(title)
@@ -160,8 +172,8 @@ object HabitNotificationHelper {
             )
             .setAutoCancel(!isAlarm)
             .setContentIntent(openPendingIntent)
-            .addAction(0, "立即打卡", checkinPending)
-            .addAction(0, "稍后 ${snoozeMinutes} 分钟", snoozePending)
+            .addAction(0, primaryActionLabel, checkinPending)
+            .addAction(0, "Snooze ${snoozeMinutes}m", snoozePending)
 
         if (isAlarm) {
             val dismissIntent = Intent(appContext, HabitAlarmReceiver::class.java).apply {
@@ -174,7 +186,7 @@ object HabitNotificationHelper {
                 dismissIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
-            builder.addAction(0, "关闭闹钟", dismissPending)
+            builder.addAction(0, "Dismiss", dismissPending)
         }
 
         runCatching {

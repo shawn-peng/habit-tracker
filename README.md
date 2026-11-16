@@ -4,8 +4,7 @@ A full-stack cross-platform **Habit & Routine Tracker** powered by:
 - **Backend Server:** Python **FastAPI** + **MongoDB** (`PyMongo AsyncMongoClient`) + **Argon2 / JWT Auth** (`backend/`)
 - **Native Android App:** **Kotlin + Jetpack Compose + Material 3** (`android/`) connecting directly to the FastAPI backend
 - **Cross-Platform Client:** **Flet 1.0+** + async **`httpx`** targeting **iPhone (iOS)**, **Mac (macOS)**, **Android**, and **Web** (`frontend/`).
-- **Reminders & Alarms:** Per-habit multiple `HH:MM` schedules, Notification vs. Ringing Alarm modes, snooze intervals, custom messages, `GET /api/habits/reminders` center, Flet live due-reminder alerts (dialog + check-in / snooze / dismiss), and native Android `AlarmManager` notifications + System Clock handoff.
-- **Habit Modes:** Configurable per-habit modes (`free`, `strict` Mode 1: remind → mandatory start → force complete with pre-start guard & violation detection, `window`, `reminder`) with separate accounting for late makeups across stats, streaks, and SLI.
+- **Habit Modes, Reminders & Alarms:** Unified per-habit modes (`free`, `strict` Mode 1: remind → mandatory start → force complete with pre-start guard & violation detection, `window` Mode 2: remind → force end, `reminder` Mode 3: multi-time alerts & ringing alarms) with **12-hour AM/PM** pickers, Notification vs. Ringing Alarm delivery, snooze intervals, custom messages, `GET /api/habits/reminders` center, Flet live due-reminder dialogs, native Android `AlarmManager` + System Clock handoff, and separate late-makeup accounting across stats, streaks, and SLI.
 - **Personal SLI & Error Budget Dashboard (`SLI`):** SRE-style reliability analytics (`GET /api/stats/sli`) with configurable per-habit `target_slo`, rolling `7d/30d/90d` SLIs, error budget remaining & multi-window burn rates, rolling SLI trend chart, and weekday reliability diagnostics across both clients.
 
 ---

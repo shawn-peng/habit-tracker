@@ -72,12 +72,12 @@ fun HabitsScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "管理习惯",
+                        text = "Manage Habits",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text = "自定义重复周期、每日目标与主题色",
+                        text = "Customize schedules, daily targets, and colors",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -88,7 +88,7 @@ fun HabitsScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "已归档",
+                        text = "Archived",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -111,9 +111,9 @@ fun HabitsScreen(
                 ) {
                     Text(
                         text = if (showArchived) {
-                            "暂无习惯记录，点击右下角 + 创建一个吧！"
+                            "No habits found — tap + below to create one!"
                         } else {
-                            "暂无活跃习惯，点击右下角 + 新增，或打开「已归档」查看历史习惯。"
+                            "No active habits yet. Tap + below to add one, or toggle Archived to view history."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -139,9 +139,9 @@ fun HabitsScreen(
     pendingDelete?.let { target ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("确认删除习惯？", fontWeight = FontWeight.Bold) },
+            title = { Text("Delete Habit?", fontWeight = FontWeight.Bold) },
             text = {
-                Text("将永久删除「${target.title}」及其历史打卡记录，且无法恢复。如果只是暂时暂停，建议改用归档。")
+                Text("This permanently deletes \"${target.title}\" and all check-in history. To pause it temporarily, use Archive instead.")
             },
             confirmButton = {
                 TextButton(
@@ -150,12 +150,12 @@ fun HabitsScreen(
                         pendingDelete = null
                     },
                 ) {
-                    Text("永久删除", color = MaterialTheme.colorScheme.error)
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { pendingDelete = null }) {
-                    Text("取消")
+                    Text("Cancel")
                 }
             },
         )
@@ -175,6 +175,7 @@ private fun ManageHabitCard(
         remindTime = habit.remindTime,
         forceStartTime = habit.forceStartTime,
         forceEndTime = habit.forceEndTime,
+        reminderMode = habit.reminderMode,
     )
     val reminderBadge = formatReminderBadge(habit)
     val freqText = formatFrequencySummary(
@@ -185,8 +186,8 @@ private fun ManageHabitCard(
         monthlyWeek = habit.monthlyWeek,
         monthlyWeekday = habit.monthlyWeekday,
     )
-    val targetUnitLabel = if (habit.frequencyType == "monthly") "单次目标" else "每日目标"
-    val titleSuffix = if (habit.archived) " (已归档)" else ""
+    val targetUnitLabel = if (habit.frequencyType == "monthly") "due day" else "day"
+    val titleSuffix = if (habit.archived) " (Archived)" else ""
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -222,7 +223,7 @@ private fun ManageHabitCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = "$freqText · $targetUnitLabel ${habit.targetPerDay} 次 · SLO ${habit.targetSlo}%",
+                        text = "$freqText · Goal ${habit.targetPerDay}/$targetUnitLabel · SLO ${habit.targetSlo}%",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -268,7 +269,7 @@ private fun ManageHabitCard(
                 IconButton(onClick = onEdit) {
                     Icon(
                         imageVector = Icons.Rounded.Edit,
-                        contentDescription = "编辑",
+                        contentDescription = "Edit",
                     )
                 }
                 IconButton(onClick = onToggleArchive) {
@@ -278,13 +279,13 @@ private fun ManageHabitCard(
                         } else {
                             Icons.Rounded.Archive
                         },
-                        contentDescription = if (habit.archived) "取消归档" else "归档",
+                        contentDescription = if (habit.archived) "Unarchive" else "Archive",
                     )
                 }
                 IconButton(onClick = onDeleteRequest) {
                     Icon(
                         imageVector = Icons.Rounded.DeleteOutline,
-                        contentDescription = "删除",
+                        contentDescription = "Delete",
                         tint = MaterialTheme.colorScheme.error,
                     )
                 }

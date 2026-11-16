@@ -116,7 +116,7 @@ class ReminderHelperTests(unittest.TestCase):
                     "reminder_times": ["08:30"],
                 }
             ),
-            "🔔 08:30",
+            "🔔 8:30 AM",
         )
         self.assertEqual(
             main.format_reminder_badge(
@@ -126,7 +126,7 @@ class ReminderHelperTests(unittest.TestCase):
                     "reminder_times": ["07:00", "12:30", "21:00"],
                 }
             ),
-            "⏰ 07:00, 12:30 (+1)",
+            "⏰ 7:00 AM, 12:30 PM (+1)",
         )
 
     def test_is_habit_scheduled_on_date(self) -> None:
@@ -385,9 +385,10 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         text_fields["Habit Title"].value = "Evening Reading"
-        reminder_switch = switches["Enable Reminders & Alarms"]
-        reminder_switch.value = True
-        reminder_switch.on_change(None)
+        self.assertNotIn("Enable Reminders & Alarms", switches)
+        mode_dd = dropdowns["Habit Mode"]
+        mode_dd.value = "reminder"
+        mode_dd.on_select(None)
 
         # Invalid custom time blocks save
         text_fields["Add Time (HH:MM)"].value = "99:99"
@@ -395,8 +396,9 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(err_text.visible)
         app.api.create_habit.assert_not_awaited()
 
-        # Valid time + alarm mode + snooze + custom message saves all 5 fields
-        text_fields["Add Time (HH:MM)"].value = "21:15"
+        # Valid 12h AM/PM time + alarm mode + snooze + custom message saves all fields
+        text_fields["Add Time (HH:MM)"].value = "09:15"
+        dropdowns["Add Time AM/PM"].value = "PM"
         dropdowns["Reminder Style"].value = "alarm"
         dropdowns["Snooze Duration"].value = "30"
         text_fields["Custom Reminder Message (optional)"].value = "Read 20 pages"
@@ -404,11 +406,32 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
         await save_btn.on_click(None)
         app.api.create_habit.assert_awaited_once()
         payload = app.api.create_habit.await_args.args[0]
+        self.assertEqual(payload["mode"], "reminder")
+        self.assertEqual(payload["remind_time"], "09:00")
         self.assertTrue(payload["reminder_enabled"])
         self.assertEqual(payload["reminder_times"], ["09:00", "21:15"])
         self.assertEqual(payload["reminder_mode"], "alarm")
         self.assertEqual(payload["reminder_snooze_minutes"], 30)
         self.assertEqual(payload["reminder_message"], "Read 20 pages")
+
+        # Strict mode habits also compute effective reminder badges & due triggers
+        self.assertEqual(
+            main.effective_habit_reminder_times(
+                {"mode": "strict", "remind_time": "08:30"}
+            ),
+            ["08:30"],
+        )
+        self.assertEqual(
+            main.format_reminder_badge(
+                {"mode": "strict", "remind_time": "08:30", "reminder_mode": "alarm"}
+            ),
+            "⏰ 8:30 AM",
+        )
+
+        # 24h bare time input still works when AM/PM defaults to AM
+        self.assertEqual(main.resolve_time_with_meridiem("21:15", "AM"), "21:15")
+        self.assertEqual(main.resolve_time_with_meridiem("12:00", "AM"), "00:00")
+        self.assertEqual(main.resolve_time_with_meridiem("12:30", "PM"), "12:30")
 
 
 if __name__ == "__main__":

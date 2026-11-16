@@ -60,10 +60,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.HabitToday
+import com.shawnpeng.habittracker.data.effectiveReminderTimes
 import com.shawnpeng.habittracker.data.evaluateLocalHabitStatus
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
 import com.shawnpeng.habittracker.data.formatReminderBadge
+import com.shawnpeng.habittracker.data.formatTime12h
 import com.shawnpeng.habittracker.data.parseHabitColor
 import java.time.LocalDate
 import java.time.LocalTime
@@ -105,7 +107,7 @@ fun TodayScreen(
     var noteTargetHabit by remember { mutableStateOf<HabitToday?>(null) }
 
     val dateFormatter = remember {
-        DateTimeFormatter.ofPattern("yyyy年M月d日 E", Locale.CHINESE)
+        DateTimeFormatter.ofPattern("EEE, MMM d, yyyy", Locale.ENGLISH)
     }
 
     LazyColumn(
@@ -121,11 +123,11 @@ fun TodayScreen(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { onShiftDate(-1) }) {
-                        Icon(Icons.Rounded.ChevronLeft, contentDescription = "前一天")
+                        Icon(Icons.Rounded.ChevronLeft, contentDescription = "Previous day")
                     }
                     Column {
                         Text(
-                            text = if (isToday) "今天" else selectedDate.format(dateFormatter),
+                            text = if (isToday) "Today" else selectedDate.format(dateFormatter),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                         )
@@ -139,7 +141,7 @@ fun TodayScreen(
                         onClick = { onShiftDate(1) },
                         enabled = !isToday,
                     ) {
-                        Icon(Icons.Rounded.ChevronRight, contentDescription = "后一天")
+                        Icon(Icons.Rounded.ChevronRight, contentDescription = "Next day")
                     }
                 }
 
@@ -153,7 +155,7 @@ fun TodayScreen(
                                 modifier = Modifier.size(16.dp),
                             )
                         },
-                        label = { Text("回到今天") },
+                        label = { Text("Today") },
                     )
                 }
             }
@@ -177,13 +179,13 @@ fun TodayScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "今日打卡进度",
+                            text = "Daily Routine Progress",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onPrimaryContainer,
                         )
                         Text(
-                            text = "$doneCount / $totalScheduled 已完成",
+                            text = "$doneCount / $totalScheduled completed",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
@@ -209,7 +211,7 @@ fun TodayScreen(
                                     color = Color(0xFFFEF3C7),
                                 ) {
                                     Text(
-                                        text = "超时补卡 $lateCount 项（单独统计）",
+                                        text = "Overdue Make-up: $lateCount (excluded)",
                                         style = MaterialTheme.typography.labelSmall,
                                         fontWeight = FontWeight.SemiBold,
                                         color = Color(0xFFB45309),
@@ -223,7 +225,7 @@ fun TodayScreen(
                                     color = MaterialTheme.colorScheme.errorContainer,
                                 ) {
                                     Text(
-                                        text = "超时违规 $violationCount 项",
+                                        text = "Violations: $violationCount",
                                         style = MaterialTheme.typography.labelSmall,
                                         fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.onErrorContainer,
@@ -242,10 +244,10 @@ fun TodayScreen(
                 val hasViolation = violatedTitles.isNotEmpty()
                 val bannerText = buildList {
                     if (violatedTitles.isNotEmpty()) {
-                        add("⚠️ 超时违规（支持补卡）：${violatedTitles.take(3).joinToString("、")}")
+                        add("⚠️ Overdue (make-up available): ${violatedTitles.take(3).joinToString(", ")}")
                     }
                     if (remindingTitles.isNotEmpty()) {
-                        add("🔔 正在提醒：${remindingTitles.take(3).joinToString("、")}")
+                        add("🔔 Reminding now: ${remindingTitles.take(3).joinToString(", ")}")
                     }
                 }.joinToString("\n")
                 Card(
@@ -318,7 +320,7 @@ fun TodayScreen(
                             tint = MaterialTheme.colorScheme.outline,
                         )
                         Text(
-                            text = "还没有习惯记录，点击右下角 + 创建你的第一个日常习惯吧！",
+                            text = "No habits yet — tap + below to create your first daily routine!",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
@@ -343,7 +345,7 @@ fun TodayScreen(
                 item {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "今日非计划习惯（可额外打卡）",
+                        text = "Unscheduled Today (Optional)",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -393,22 +395,30 @@ private fun TodayHabitCard(
         remindTime = habit.remindTime,
         forceStartTime = habit.forceStartTime,
         forceEndTime = habit.forceEndTime,
+        reminderMode = habit.reminderMode,
     )
-    val reminderBadge = formatReminderBadge(
-        enabled = habit.reminderEnabled,
-        times = habit.reminderTimes,
-        mode = habit.reminderMode,
+    val effectiveTimes = effectiveReminderTimes(
+        mode = habit.mode,
+        archived = habit.archived,
+        reminderEnabled = habit.reminderEnabled,
+        reminderTimes = habit.reminderTimes,
+        remindTime = habit.remindTime,
     )
+    val reminderBadge = if (effectiveTimes.isEmpty()) {
+        null
+    } else {
+        formatReminderBadge(enabled = true, times = effectiveTimes, mode = habit.reminderMode)
+    }
     val isMonthly = habit.frequencyType == "monthly"
-    val streakUnit = if (isMonthly) "月" else "天"
+    val streakUnit = if (isMonthly) "mo" else "d"
     val subtitleParts = buildList {
         if (modeSummary != null) {
             add(modeSummary)
         }
         if (localStatus.dayStatus == "in_progress" && !habit.startedAtTime.isNullOrBlank()) {
-            add("已于 ${habit.startedAtTime} 开始")
+            add("Started at ${formatTime12h(habit.startedAtTime)}")
         } else if (localStatus.dayStatus == "violation") {
-            add(if (localStatus.violationReason == "missed_start") "未按时开始" else "未按时完成")
+            add(if (localStatus.violationReason == "missed_start") "Missed Start Time" else "Missed End Time")
         }
         if (isMonthly) {
             add(
@@ -423,27 +433,27 @@ private fun TodayHabitCard(
             )
         }
         if (habit.targetPerDay > 1) {
-            add("${habit.count} / ${habit.targetPerDay} 次")
+            add("${habit.count} / ${habit.targetPerDay} today")
         }
         if (habit.description.isNotBlank()) {
             add(habit.description)
         }
         if (habit.note.isNotBlank()) {
-            add("笔记: ${habit.note}")
+            add("Note: ${habit.note}")
         }
     }
-    val subtitleText = if (subtitleParts.isEmpty()) "每日打卡" else subtitleParts.joinToString(" · ")
+    val subtitleText = if (subtitleParts.isEmpty()) "Daily goal" else subtitleParts.joinToString(" · ")
 
     val statusChipSpec: Triple<String, Color, Color>? = if (
         habit.mode != "free" || localStatus.dayStatus == "violation" || localStatus.dayStatus == "late_makeup"
     ) {
         when (localStatus.dayStatus) {
-            "reminding" -> Triple("开始提醒中", Color(0xFFDBEAFE), Color(0xFF1D4ED8))
-            "in_progress" -> Triple("执行中", Color(0xFFE0E7FF), Color(0xFF4338CA))
-            "on_time" -> Triple("准时完成", Color(0xFFDCFCE7), Color(0xFF15803D))
-            "violation" -> Triple("超时违规", Color(0xFFFEE2E2), Color(0xFFB91C1C))
-            "late_makeup" -> Triple("超时补卡", Color(0xFFFEF3C7), Color(0xFFB45309))
-            else -> Triple(if (habit.mode == "strict") "待开始" else "待打卡", Color(0xFFF1F5F9), Color(0xFF475569))
+            "reminding" -> Triple("Reminding", Color(0xFFDBEAFE), Color(0xFF1D4ED8))
+            "in_progress" -> Triple("In Progress", Color(0xFFE0E7FF), Color(0xFF4338CA))
+            "on_time" -> Triple("On Time", Color(0xFFDCFCE7), Color(0xFF15803D))
+            "violation" -> Triple("Violation", Color(0xFFFEE2E2), Color(0xFFB91C1C))
+            "late_makeup" -> Triple("Overdue Make-up", Color(0xFFFEF3C7), Color(0xFFB45309))
+            else -> Triple(if (habit.mode == "strict") "Pending Start" else "Pending", Color(0xFFF1F5F9), Color(0xFF475569))
         }
     } else {
         null
@@ -543,7 +553,7 @@ private fun TodayHabitCard(
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.LocalFireDepartment,
-                            contentDescription = "连胜天数",
+                            contentDescription = "Streak",
                             modifier = Modifier.size(14.dp),
                             tint = if (habit.currentStreak > 0) {
                                 MaterialTheme.colorScheme.tertiary
@@ -567,7 +577,7 @@ private fun TodayHabitCard(
                 IconButton(onClick = onOpenNote) {
                     Icon(
                         imageVector = Icons.Rounded.EditNote,
-                        contentDescription = "当日备注",
+                        contentDescription = "Today's note",
                         tint = if (habit.note.isNotBlank()) {
                             MaterialTheme.colorScheme.primary
                         } else {
@@ -580,7 +590,7 @@ private fun TodayHabitCard(
                     IconButton(onClick = onDecrementCheckin) {
                         Icon(
                             imageVector = Icons.Rounded.RemoveCircleOutline,
-                            contentDescription = "减少一次",
+                            contentDescription = "Decrease count",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -599,7 +609,7 @@ private fun TodayHabitCard(
                             )
                             Spacer(modifier = Modifier.width(2.dp))
                             Text(
-                                text = "开始",
+                                text = "Start",
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -621,7 +631,7 @@ private fun TodayHabitCard(
                             )
                             Spacer(modifier = Modifier.width(2.dp))
                             Text(
-                                text = "补卡",
+                                text = "Make-up",
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -641,7 +651,7 @@ private fun TodayHabitCard(
                             }
                             Icon(
                                 imageVector = icon,
-                                contentDescription = "打卡",
+                                contentDescription = "Check in",
                                 tint = tint,
                                 modifier = Modifier.size(30.dp),
                             )
@@ -663,24 +673,24 @@ private fun CheckinNoteDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("打卡笔记 · ${habit.title}", fontWeight = FontWeight.Bold) },
+        title = { Text("Check-in Note · ${habit.title}", fontWeight = FontWeight.Bold) },
         text = {
             OutlinedTextField(
                 value = noteText,
                 onValueChange = { noteText = it },
-                label = { Text("今日感想或记录（选填）") },
+                label = { Text("Today's reflection or note (optional)") },
                 maxLines = 4,
                 modifier = Modifier.fillMaxWidth(),
             )
         },
         confirmButton = {
             TextButton(onClick = { onSave(noteText) }) {
-                Text("保存")
+                Text("Save")
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("取消")
+                Text("Cancel")
             }
         },
     )

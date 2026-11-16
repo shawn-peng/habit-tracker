@@ -3,12 +3,14 @@ package com.shawnpeng.habittracker.notifications
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.shawnpeng.habittracker.data.ApiException
 import com.shawnpeng.habittracker.data.CheckinRequest
 import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.SessionPreferences
 import com.shawnpeng.habittracker.data.isHabitScheduledOnDate
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -97,18 +99,43 @@ class HabitAlarmReceiver : BroadcastReceiver() {
                         }
                         val token = prefs.getToken()
                         if (!token.isNullOrBlank() && effectiveHabitId.isNotBlank()) {
+                            val nowTime = LocalTime.now()
+                            val nowHhmm =
+                                "${nowTime.hour.toString().padStart(2, '0')}:${nowTime.minute.toString().padStart(2, '0')}"
                             val apiAction = if ((targetHabit?.targetPerDay ?: 1) <= 1) {
                                 "toggle"
                             } else {
                                 "increment"
                             }
+                            val authedApi = HabitApiClient(initialBaseUrl = prefs.getServerUrl()).apply {
+                                authToken = token
+                            }
                             val result = runCatching {
-                                HabitApiClient(initialBaseUrl = prefs.getServerUrl()).apply {
-                                    authToken = token
-                                }.checkinHabit(
-                                    habitId = effectiveHabitId,
-                                    request = CheckinRequest(date = todayIso, action = apiAction),
-                                )
+                                try {
+                                    authedApi.checkinHabit(
+                                        habitId = effectiveHabitId,
+                                        request = CheckinRequest(
+                                            date = todayIso,
+                                            action = apiAction,
+                                            clientToday = todayIso,
+                                            clientTime = nowHhmm,
+                                        ),
+                                    )
+                                } catch (exc: ApiException) {
+                                    if (exc.statusCode == 400 && targetHabit?.mode == "strict") {
+                                        authedApi.checkinHabit(
+                                            habitId = effectiveHabitId,
+                                            request = CheckinRequest(
+                                                date = todayIso,
+                                                action = "start",
+                                                clientToday = todayIso,
+                                                clientTime = nowHhmm,
+                                            ),
+                                        )
+                                    } else {
+                                        throw exc
+                                    }
+                                }
                             }.getOrNull()
                             if (result != null) {
                                 prefs.markHabitCompletedForDate(

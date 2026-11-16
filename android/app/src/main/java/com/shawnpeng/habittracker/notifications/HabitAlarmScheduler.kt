@@ -8,7 +8,7 @@ import android.os.Build
 import android.provider.AlarmClock
 import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.computeNextTriggerDateTime
-import com.shawnpeng.habittracker.data.normalizeReminderTimes
+import com.shawnpeng.habittracker.data.effectiveReminderTimes
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
@@ -259,7 +259,7 @@ class AndroidHabitAlarmScheduler(context: Context) : HabitAlarmController {
         )
 
         fun buildSystemClockAlarmIntent(habit: Habit): Intent? {
-            val firstTime = normalizeReminderTimes(habit.reminderTimes).firstOrNull() ?: return null
+            val firstTime = effectiveReminderTimes(habit).firstOrNull() ?: return null
             val parts = firstTime.split(":")
             val hour = parts.getOrNull(0)?.toIntOrNull() ?: return null
             val minute = parts.getOrNull(1)?.toIntOrNull() ?: return null
@@ -269,7 +269,7 @@ class AndroidHabitAlarmScheduler(context: Context) : HabitAlarmController {
                 putExtra(AlarmClock.EXTRA_MINUTES, minute)
                 putExtra(
                     AlarmClock.EXTRA_MESSAGE,
-                    habit.reminderMessage.trim().ifEmpty { "${habit.title}（习惯打卡）" },
+                    habit.reminderMessage.trim().ifEmpty { "${habit.title} (Habit Check-in)" },
                 )
                 putExtra(AlarmClock.EXTRA_SKIP_UI, false)
                 if (habit.frequencyType == "weekdays" && habit.weekdays.isNotEmpty()) {
