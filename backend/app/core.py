@@ -498,8 +498,97 @@ HabitMode = Literal["free", "strict", "window", "reminder"]
 HabitDayStatus = Literal[
     "pending", "reminding", "in_progress", "on_time", "violation", "late_makeup"
 ]
+HistoryEditStatus = Literal["on_time", "late_makeup", "clear"]
+HistoryDayState = Literal[
+    "on_time",
+    "late_makeup",
+    "missed",
+    "violation",
+    "in_progress",
+    "reminding",
+    "pending",
+    "unscheduled",
+    "before_created",
+    "future",
+]
 ViolationReason = Literal["missed_start", "missed_end"]
 VALID_HABIT_MODES = ("free", "strict", "window", "reminder")
+
+
+def _parse_optional_iso_date(raw: object) -> date | None:
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return date.fromisoformat(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_habit_created_date(
+    habit: dict,
+    client_today_date: date | None = None,
+) -> date | None:
+    """Resolve a habit's creation date in client local time, respecting synthetic test dates."""
+    explicit_created = _parse_optional_iso_date(habit.get("created_date"))
+    if explicit_created is not None:
+        return (
+            min(explicit_created, client_today_date)
+            if client_today_date is not None
+            else explicit_created
+        )
+
+    created_at = habit.get("created_at")
+    if isinstance(created_at, datetime):
+        raw_date = created_at.date()
+    elif isinstance(created_at, date):
+        raw_date = created_at
+    else:
+        return None
+
+    if client_today_date is not None:
+        # Preserve synthetic tests that create habits at wall-clock now() and pass past client_today.
+        if raw_date > client_today_date + timedelta(days=1):
+            return None
+        return min(raw_date, client_today_date)
+    return raw_date
+
+
+def format_habit_created_date(
+    habit: dict,
+    fallback_today: date | None = None,
+) -> str:
+    """Return YYYY-MM-DD creation date string for HabitOut serialization."""
+    explicit_created = _parse_optional_iso_date(habit.get("created_date"))
+    if explicit_created is not None:
+        if (
+            fallback_today is not None
+            and explicit_created == fallback_today + timedelta(days=1)
+        ):
+            return fallback_today.isoformat()
+        return explicit_created.isoformat()
+
+    created_at = habit.get("created_at")
+    if isinstance(created_at, datetime):
+        raw_date = created_at.date()
+    elif isinstance(created_at, date):
+        raw_date = created_at
+    else:
+        return ""
+
+    if fallback_today is not None and raw_date == fallback_today + timedelta(days=1):
+        return fallback_today.isoformat()
+    return raw_date.isoformat()
+
+
+def format_habit_created_time(habit: dict) -> str | None:
+    """Return normalized HH:MM creation time string for HabitOut serialization."""
+    raw = habit.get("created_time")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return normalize_hhmm(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def normalize_hhmm(value: str | None) -> str | None:
@@ -635,6 +724,7 @@ def evaluate_habit_day_status(
     client_today_str: str,
     client_time: str,
     scheduled: bool | None = None,
+    can_edit: bool = True,
 ) -> HabitDayEvaluation:
     """Evaluate the mode-aware daily lifecycle status for a habit check-in."""
     mode, remind_time, force_start_time, force_end_time = extract_habit_mode_fields(
@@ -657,7 +747,7 @@ def evaluate_habit_day_status(
         scheduled = is_scheduled_on(habit, date.fromisoformat(target_date_str))
 
     if completed:
-        if mode in ("strict", "window") and stored_is_late:
+        if stored_is_late:
             return HabitDayEvaluation(
                 day_status="late_makeup",
                 violation_reason=stored_violation,
@@ -671,6 +761,16 @@ def evaluate_habit_day_status(
             violation_reason=None,
             started_at_time=started_at_time,
             started_on_time=started_on_time,
+            is_late=False,
+            can_start=False,
+        )
+
+    if not can_edit:
+        return HabitDayEvaluation(
+            day_status="pending",
+            violation_reason=None,
+            started_at_time=started_at_time,
+            started_on_time=False,
             is_late=False,
             can_start=False,
         )
@@ -820,6 +920,21 @@ class HabitCreate(BaseModel):
     reminder_mode: ReminderMode = "notification"
     reminder_snooze_minutes: int = Field(default=10, ge=1, le=120)
     reminder_message: str = Field(default="", max_length=200)
+    created_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    created_time: str | None = None
+
+    @field_validator("created_date")
+    @classmethod
+    def validate_created_date(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        date.fromisoformat(v)
+        return v
+
+    @field_validator("created_time")
+    @classmethod
+    def validate_created_time(cls, v: str | None) -> str | None:
+        return normalize_hhmm(v)
 
     @field_validator("weekdays")
     @classmethod
@@ -995,6 +1110,8 @@ class HabitOut(BaseModel):
     reminder_snooze_minutes: int = 10
     reminder_message: str = ""
     archived: bool
+    created_date: str = ""
+    created_time: str | None = None
     created_at: datetime
 
 
@@ -1012,13 +1129,15 @@ class HabitTodayOut(HabitOut):
     started_on_time: bool = False
     is_late: bool = False
     can_start: bool = False
+    can_edit: bool = True
 
 
 class CheckinRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    action: Literal["increment", "decrement", "toggle", "set", "start"] = "increment"
+    action: Literal["increment", "decrement", "toggle", "set", "start", "edit"] = "increment"
     count: int | None = Field(default=None, ge=0, le=1000)
     note: str | None = Field(default=None, max_length=300)
+    status_override: HistoryEditStatus | None = None
     client_today: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     client_time: str | None = None
 
@@ -1080,16 +1199,58 @@ class ScheduleHabitItemOut(BaseModel):
     force_end_time: str | None = None
     started_on_time: bool = False
     is_late: bool = False
+    violation_reason: ViolationReason | None = None
     reminder_enabled: bool = False
     reminder_times: list[str] = Field(default_factory=list)
     reminder_mode: ReminderMode = "notification"
     reminder_snooze_minutes: int = 10
     reminder_message: str = ""
+    created_date: str = ""
     date: str
     count: int
     completed: bool
     note: str = ""
     status: Literal["today", "upcoming", "overdue", "completed"]
+
+
+class HabitHistoryDayOut(BaseModel):
+    date: str
+    day: int
+    weekday: int
+    weekday_label: str
+    scheduled: bool
+    editable: bool
+    is_today: bool
+    count: int = 0
+    completed: bool = False
+    is_late: bool = False
+    started_on_time: bool = False
+    started_at_time: str | None = None
+    violation_reason: ViolationReason | None = None
+    note: str = ""
+    state: HistoryDayState
+
+
+class HabitHistoryOut(BaseModel):
+    habit: HabitOut
+    month: str
+    start_date: str
+    end_date: str
+    first_weekday: int
+    created_date: str
+    today: str
+    can_prev_month: bool
+    can_next_month: bool
+    current_streak: int
+    best_streak: int
+    completion_rate_30d: float
+    total_completions: int
+    late_completions: int
+    month_scheduled: int
+    month_completed_on_time: int
+    month_late_makeups: int
+    month_missed: int
+    days: list[HabitHistoryDayOut]
 
 
 class ScheduleDayOut(BaseModel):
@@ -1341,12 +1502,7 @@ def compute_30d_completion_rate(
     completed_dates: set[str],
     reference_date: date,
 ) -> float:
-    created_at = habit.get("created_at")
-    created_date = (
-        created_at.date()
-        if hasattr(created_at, "date")
-        else reference_date - timedelta(days=29)
-    )
+    created_date = _habit_created_date(habit, reference_date - timedelta(days=29))
     start_date = max(reference_date - timedelta(days=29), created_date)
 
     scheduled = 0
@@ -1451,13 +1607,17 @@ def build_period_schedule(
     ] = {}
     for h in habits:
         hid = str(h["_id"])
-        raw_created = h.get("created_at")
-        # Clamp UTC created_at against local today_date so evening creations count for today.
-        effective_created[hid] = (
-            min(raw_created.date(), today_date)
-            if hasattr(raw_created, "date")
-            else start_date
-        )
+        resolved_created = resolve_habit_created_date(h, today_date)
+        if resolved_created is not None:
+            effective_created[hid] = resolved_created
+        else:
+            raw_created = h.get("created_at")
+            # Clamp UTC created_at against local today_date so evening creations count for today.
+            effective_created[hid] = (
+                min(raw_created.date(), today_date)
+                if hasattr(raw_created, "date")
+                else start_date
+            )
         reminder_meta_by_id[hid] = extract_reminder_fields(h)
         mode_meta_by_id[hid] = extract_habit_mode_fields(h)
         habit_acc[hid] = {
@@ -1510,6 +1670,10 @@ def build_period_schedule(
 
             r_enabled, r_times, r_mode, r_snooze, r_msg = reminder_meta_by_id[hid]
             h_mode, h_remind, h_start, h_end = mode_meta_by_id[hid]
+            raw_viol = chk.get("violation_reason") if chk else None
+            viol_reason: ViolationReason | None = (
+                raw_viol if raw_viol in ("missed_start", "missed_end") else None
+            )
             day_items.append(
                 ScheduleHabitItemOut(
                     habit_id=hid,
@@ -1530,11 +1694,13 @@ def build_period_schedule(
                     force_end_time=h_end,
                     started_on_time=bool(chk.get("started_on_time", False)) if chk else False,
                     is_late=bool(chk.get("is_late", False)) if chk else False,
+                    violation_reason=viol_reason,
                     reminder_enabled=r_enabled,
                     reminder_times=r_times,
                     reminder_mode=r_mode,
                     reminder_snooze_minutes=r_snooze,
                     reminder_message=r_msg,
+                    created_date=effective_created[hid].isoformat(),
                     date=cursor_iso,
                     count=count,
                     completed=completed,
@@ -1650,6 +1816,9 @@ def build_period_schedule(
 # Personal SLI, Error Budget & Burn Rate Analytics
 # ---------------------------------------------------------------------------
 def _habit_created_date(habit: dict, fallback: date) -> date:
+    explicit_created = _parse_optional_iso_date(habit.get("created_date"))
+    if explicit_created is not None:
+        return explicit_created
     created_at = habit.get("created_at")
     if isinstance(created_at, datetime):
         return created_at.date()
@@ -1658,23 +1827,92 @@ def _habit_created_date(habit: dict, fallback: date) -> date:
     return fallback
 
 
+def _habit_sli_created_date_and_time(
+    habit: dict,
+    reference_date: date,
+    fallback: date,
+) -> tuple[date, str | None]:
+    explicit_created = _parse_optional_iso_date(habit.get("created_date"))
+    if explicit_created is not None:
+        created_d = explicit_created
+    else:
+        created_at = habit.get("created_at")
+        if isinstance(created_at, datetime):
+            raw_d = created_at.date()
+            created_d = (
+                reference_date
+                if raw_d == reference_date + timedelta(days=1)
+                else raw_d
+            )
+        elif isinstance(created_at, date):
+            created_d = created_at
+        else:
+            created_d = fallback
+    return created_d, format_habit_created_time(habit)
+
+
+def is_creation_day_window_passed(habit: dict, created_time: str | None) -> bool:
+    """Return True when a habit was added after its scheduled cutoff time on creation day."""
+    if created_time is None:
+        return False
+    mode, remind_time, force_start_time, force_end_time = extract_habit_mode_fields(
+        habit
+    )
+    if mode == "strict":
+        return bool(force_start_time and created_time > force_start_time)
+    if mode == "window":
+        return bool(force_end_time and created_time > force_end_time)
+    if mode == "reminder":
+        _, r_times, _, _, _ = extract_reminder_fields(habit)
+        latest = r_times[-1] if r_times else remind_time
+        return bool(latest and created_time > latest)
+    return False
+
+
+def habit_sli_start_date(
+    habit: dict,
+    completed_dates: set[str],
+    reference_date: date,
+    fallback: date,
+) -> date:
+    """Return the first date a habit should count in SLI metrics."""
+    created_d, created_t = _habit_sli_created_date_and_time(
+        habit, reference_date, fallback
+    )
+    if (
+        is_creation_day_window_passed(habit, created_t)
+        and created_d.isoformat() not in completed_dates
+    ):
+        return created_d + timedelta(days=1)
+    return created_d
+
+
 def compute_window_sli_counts(
     habit: dict,
     completed_dates: set[str],
     reference_date: date,
     window_days: int,
+    today_violated: bool = False,
 ) -> tuple[int, int]:
-    """Count (scheduled_days, completed_days) over the trailing window bounded by creation date."""
+    """Count (scheduled_days, completed_days) over the trailing window bounded by SLI start date."""
     window_start = reference_date - timedelta(days=window_days - 1)
-    effective_start = max(window_start, _habit_created_date(habit, window_start))
+    sli_start = habit_sli_start_date(
+        habit, completed_dates, reference_date, fallback=window_start
+    )
+    effective_violated = today_violated and (reference_date >= sli_start)
+    effective_start = max(window_start, sli_start)
 
     scheduled = 0
     completed = 0
     cursor = effective_start
     while cursor <= reference_date:
         if is_scheduled_on(habit, cursor):
+            is_done = cursor.isoformat() in completed_dates
+            if cursor == reference_date and not is_done and not effective_violated:
+                cursor += timedelta(days=1)
+                continue
             scheduled += 1
-            if cursor.isoformat() in completed_dates:
+            if is_done:
                 completed += 1
         cursor += timedelta(days=1)
     return scheduled, completed
@@ -1736,18 +1974,41 @@ def compute_habit_sli(
 ) -> HabitSliItem:
     hid = str(habit.get("_id", habit.get("id", "")))
     target_slo = round(float(habit.get("target_slo", 85.0)), 1)
+    sli_start = habit_sli_start_date(
+        habit,
+        completed_dates,
+        reference_date,
+        fallback=reference_date - timedelta(days=window_days - 1),
+    )
+    effective_violated = today_violated and (reference_date >= sli_start)
 
     sched_w, comp_w = compute_window_sli_counts(
-        habit, completed_dates, reference_date, window_days
+        habit,
+        completed_dates,
+        reference_date,
+        window_days,
+        today_violated=effective_violated,
     )
     sched_7, comp_7 = compute_window_sli_counts(
-        habit, completed_dates, reference_date, 7
+        habit,
+        completed_dates,
+        reference_date,
+        7,
+        today_violated=effective_violated,
     )
     sched_30, comp_30 = compute_window_sli_counts(
-        habit, completed_dates, reference_date, 30
+        habit,
+        completed_dates,
+        reference_date,
+        30,
+        today_violated=effective_violated,
     )
     sched_90, comp_90 = compute_window_sli_counts(
-        habit, completed_dates, reference_date, 90
+        habit,
+        completed_dates,
+        reference_date,
+        90,
+        today_violated=effective_violated,
     )
 
     current_sli = _sli_percentage(sched_w, comp_w)
@@ -1772,7 +2033,7 @@ def compute_habit_sli(
         item_status = "healthy"
 
     curr_streak, _ = compute_streaks(
-        habit, completed_dates, reference_date, today_violated=today_violated
+        habit, completed_dates, reference_date, today_violated=effective_violated
     )
 
     return HabitSliItem(
@@ -1807,12 +2068,59 @@ def build_sli_dashboard(
     window_days: int = 30,
     violated_habit_ids: set[str] | None = None,
 ) -> SliDashboardOut:
+    if not habits:
+        empty_weekdays = [
+            WeekdaySliPoint(
+                weekday=wd,
+                label=WEEKDAY_LABELS[wd],
+                scheduled_count=0,
+                completed_count=0,
+                sli=0.0,
+            )
+            for wd in range(7)
+        ]
+        return SliDashboardOut(
+            window_days=window_days,
+            active_habits_count=0,
+            overall_sli=0.0,
+            overall_target_slo=85.0,
+            overall_status="no_data",
+            healthy_count=0,
+            warning_count=0,
+            breached_count=0,
+            overall_error_budget_allowed_days=0.0,
+            overall_error_budget_used_days=0,
+            overall_error_budget_remaining_days=0.0,
+            overall_error_budget_remaining_pct=100.0,
+            overall_burn_rate=0.0,
+            overall_burn_rate_7d=0.0,
+            weakest_weekday=None,
+            weakest_weekday_sli=None,
+            top_burn_habit_title=None,
+            top_burn_rate=None,
+            trend=[],
+            weekday_sli=empty_weekdays,
+            habits=[],
+        )
+
+    window_start = reference_date - timedelta(days=window_days - 1)
+    habit_meta: list[tuple[str, dict, date, bool]] = []
+    for h in habits:
+        hid = str(h.get("_id", h.get("id", "")))
+        c_dates = completed_by_habit.get(hid, set())
+        sli_start = habit_sli_start_date(
+            h, c_dates, reference_date, fallback=window_start
+        )
+        is_violated = bool(
+            violated_habit_ids and hid in violated_habit_ids
+        ) and (reference_date >= sli_start)
+        habit_meta.append((hid, h, sli_start, is_violated))
+
     habit_items: list[HabitSliItem] = []
     total_sched_7 = 0
     total_comp_7 = 0
 
-    for h in habits:
-        hid = str(h.get("_id", h.get("id", "")))
+    for hid, h, _sli_start, is_violated in habit_meta:
         c_dates = completed_by_habit.get(hid, set())
         habit_items.append(
             compute_habit_sli(
@@ -1820,10 +2128,12 @@ def build_sli_dashboard(
                 c_dates,
                 reference_date,
                 window_days=window_days,
-                today_violated=bool(violated_habit_ids and hid in violated_habit_ids),
+                today_violated=is_violated,
             )
         )
-        s7, c7 = compute_window_sli_counts(h, c_dates, reference_date, 7)
+        s7, c7 = compute_window_sli_counts(
+            h, c_dates, reference_date, 7, today_violated=is_violated
+        )
         total_sched_7 += s7
         total_comp_7 += c7
 
@@ -1837,37 +2147,40 @@ def build_sli_dashboard(
         )
     )
 
-    all_dates = [
-        reference_date - timedelta(days=offset)
-        for offset in range(window_days - 1, -1, -1)
-    ]
-    window_start = all_dates[0]
-    habit_meta = [
-        (
-            str(h.get("_id", h.get("id", ""))),
-            h,
-            _habit_created_date(h, window_start),
-        )
-        for h in habits
-    ]
-
     def day_counts(target: date) -> tuple[int, int]:
         sched = 0
         comp = 0
         d_iso = target.isoformat()
-        for hid, h, created_d in habit_meta:
-            if target >= created_d and is_scheduled_on(h, target):
-                sched += 1
-                if d_iso in completed_by_habit.get(hid, set()):
-                    comp += 1
+        for hid, h, start_d, is_violated in habit_meta:
+            if target < start_d or not is_scheduled_on(h, target):
+                continue
+            is_done = d_iso in completed_by_habit.get(hid, set())
+            if target == reference_date and not is_done and not is_violated:
+                continue
+            sched += 1
+            if is_done:
+                comp += 1
         return sched, comp
 
-    if window_days <= 14:
-        buckets = [[d] for d in all_dates]
+    earliest_start = min(start_d for _, _, start_d, _ in habit_meta)
+    trend_start = max(window_start, earliest_start)
+    trend_dates = (
+        [
+            trend_start + timedelta(days=offset)
+            for offset in range((reference_date - trend_start).days + 1)
+        ]
+        if trend_start <= reference_date
+        else []
+    )
+
+    if not trend_dates:
+        buckets: list[list[date]] = []
+    elif len(trend_dates) <= 10:
+        buckets = [[d] for d in trend_dates]
     else:
-        n = len(all_dates)
+        n = len(trend_dates)
         buckets = [
-            all_dates[(i * n) // 10 : ((i + 1) * n) // 10]
+            trend_dates[(i * n) // 10 : ((i + 1) * n) // 10]
             for i in range(10)
             if (i * n) // 10 < ((i + 1) * n) // 10
         ]
@@ -1900,7 +2213,7 @@ def build_sli_dashboard(
 
     weekday_sched = [0] * 7
     weekday_comp = [0] * 7
-    for d in all_dates:
+    for d in trend_dates:
         wd = d.weekday()
         s, c = day_counts(d)
         weekday_sched[wd] += s
@@ -1950,31 +2263,6 @@ def build_sli_dashboard(
     else:
         top_burn_habit_title = None
         top_burn_rate = None
-
-    if not habits:
-        return SliDashboardOut(
-            window_days=window_days,
-            active_habits_count=0,
-            overall_sli=0.0,
-            overall_target_slo=85.0,
-            overall_status="no_data",
-            healthy_count=0,
-            warning_count=0,
-            breached_count=0,
-            overall_error_budget_allowed_days=0.0,
-            overall_error_budget_used_days=0,
-            overall_error_budget_remaining_days=0.0,
-            overall_error_budget_remaining_pct=100.0,
-            overall_burn_rate=0.0,
-            overall_burn_rate_7d=0.0,
-            weakest_weekday=None,
-            weakest_weekday_sli=None,
-            top_burn_habit_title=None,
-            top_burn_rate=None,
-            trend=trend,
-            weekday_sli=weekday_sli,
-            habits=[],
-        )
 
     total_sched = sum(item.scheduled_days for item in habit_items)
     total_comp = sum(item.completed_days for item in habit_items)
@@ -2174,4 +2462,173 @@ def build_reminders_overview(
         scheduled_today_count=scheduled_today_count,
         pending_today_triggers=pending_today_triggers,
         items=items,
+    )
+
+
+def build_habit_history(
+    habit: dict,
+    habit_out: HabitOut,
+    month_checkins: dict[str, dict],
+    completed_dates: set[str],
+    late_dates: set[str],
+    year: int,
+    month: int,
+    client_today_date: date,
+    client_time: str,
+    today_checkin: dict | None = None,
+) -> HabitHistoryOut:
+    """Build per-habit monthly check-in history calendar and summary stats."""
+    first_weekday, days_in_month = calendar.monthrange(year, month)
+    start_d = date(year, month, 1)
+    end_d = date(year, month, days_in_month)
+
+    created_d = resolve_habit_created_date(habit, client_today_date)
+    if created_d is None:
+        created_at = habit.get("created_at")
+        if isinstance(created_at, datetime):
+            created_d = created_at.date()
+        elif isinstance(created_at, date):
+            created_d = created_at
+        else:
+            created_d = client_today_date
+    created_d = min(created_d, client_today_date)
+
+    client_today_iso = client_today_date.isoformat()
+    can_prev_month = start_d > created_d.replace(day=1)
+    can_next_month = start_d < client_today_date.replace(day=1)
+
+    days: list[HabitHistoryDayOut] = []
+    month_scheduled = 0
+    month_completed_on_time = 0
+    month_late_makeups = 0
+    month_missed = 0
+
+    for day_num in range(1, days_in_month + 1):
+        d = date(year, month, day_num)
+        d_iso = d.isoformat()
+        chk = month_checkins.get(d_iso)
+        scheduled = is_scheduled_on(habit, d)
+        editable = created_d <= d <= client_today_date
+
+        count = int(chk.get("count", 0)) if chk else 0
+        completed = bool(chk.get("completed", False)) if chk else False
+        is_late = bool(chk.get("is_late", False)) if chk else False
+        started_on_time = bool(chk.get("started_on_time", False)) if chk else False
+        started_at_time = chk.get("started_at_time") if chk else None
+        raw_viol = chk.get("violation_reason") if chk else None
+        violation_reason: ViolationReason | None = (
+            raw_viol if raw_viol in ("missed_start", "missed_end") else None
+        )
+        note = str(chk.get("note", "") or "") if chk else ""
+
+        if d > client_today_date:
+            state: HistoryDayState = "future"
+        elif d < created_d:
+            state = "before_created"
+        else:
+            ev = evaluate_habit_day_status(
+                habit=habit,
+                checkin=chk,
+                target_date_str=d_iso,
+                client_today_str=client_today_iso,
+                client_time=client_time,
+                scheduled=scheduled,
+                can_edit=True,
+            )
+            is_late = ev.is_late
+            violation_reason = ev.violation_reason
+            started_on_time = ev.started_on_time
+            started_at_time = ev.started_at_time
+            if ev.day_status == "on_time":
+                state = "on_time"
+            elif ev.day_status == "late_makeup":
+                state = "late_makeup"
+            elif not scheduled:
+                state = "unscheduled"
+            elif d < client_today_date:
+                state = "missed"
+            else:
+                state = ev.day_status
+
+        if editable and scheduled:
+            month_scheduled += 1
+        if state == "on_time":
+            month_completed_on_time += 1
+        elif state == "late_makeup":
+            month_late_makeups += 1
+        elif state in ("missed", "violation"):
+            month_missed += 1
+
+        days.append(
+            HabitHistoryDayOut(
+                date=d_iso,
+                day=day_num,
+                weekday=d.weekday(),
+                weekday_label=WEEKDAY_LABELS[d.weekday()],
+                scheduled=scheduled,
+                editable=editable,
+                is_today=(d == client_today_date),
+                count=count,
+                completed=completed,
+                is_late=is_late,
+                started_on_time=started_on_time,
+                started_at_time=started_at_time,
+                violation_reason=violation_reason,
+                note=note,
+                state=state,
+            )
+        )
+
+    today_scheduled = is_scheduled_on(habit, client_today_date)
+    resolved_today_chk = (
+        today_checkin
+        if today_checkin is not None
+        else month_checkins.get(client_today_iso)
+    )
+    today_ev = evaluate_habit_day_status(
+        habit=habit,
+        checkin=resolved_today_chk,
+        target_date_str=client_today_iso,
+        client_today_str=client_today_iso,
+        client_time=client_time,
+        scheduled=today_scheduled,
+        can_edit=True,
+    )
+    today_violated = today_scheduled and today_ev.day_status in (
+        "violation",
+        "late_makeup",
+    )
+
+    curr_streak, best_streak = compute_streaks(
+        habit,
+        completed_dates,
+        client_today_date,
+        today_violated=today_violated,
+    )
+    rate_habit = {**habit, "created_date": created_d.isoformat()}
+    rate_30d = compute_30d_completion_rate(
+        rate_habit, completed_dates, client_today_date
+    )
+
+    synced_habit = habit_out.model_copy(update={"created_date": created_d.isoformat()})
+    return HabitHistoryOut(
+        habit=synced_habit,
+        month=f"{year:04d}-{month:02d}",
+        start_date=start_d.isoformat(),
+        end_date=end_d.isoformat(),
+        first_weekday=first_weekday,
+        created_date=created_d.isoformat(),
+        today=client_today_iso,
+        can_prev_month=can_prev_month,
+        can_next_month=can_next_month,
+        current_streak=curr_streak,
+        best_streak=best_streak,
+        completion_rate_30d=rate_30d,
+        total_completions=len(completed_dates),
+        late_completions=len(late_dates),
+        month_scheduled=month_scheduled,
+        month_completed_on_time=month_completed_on_time,
+        month_late_makeups=month_late_makeups,
+        month_missed=month_missed,
+        days=days,
     )

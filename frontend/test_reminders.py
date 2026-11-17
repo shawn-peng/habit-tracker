@@ -363,13 +363,29 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
 
         all_ctrls = list(_walk_controls(dlg))
         text_fields = {
-            c.label: c for c in all_ctrls if isinstance(c, ft.TextField) and c.label
+            (c.label or c.data): c
+            for c in all_ctrls
+            if isinstance(c, ft.TextField) and (c.label or c.data)
         }
         dropdowns = {
             c.label: c for c in all_ctrls if isinstance(c, ft.Dropdown) and c.label
         }
         switches = {
             c.label: c for c in all_ctrls if isinstance(c, ft.Switch) and c.label
+        }
+        meridiems = {
+            c.data["name"]: c.data["toggle"]
+            for c in all_ctrls
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and c.data.get("role") == "meridiem"
+        }
+        meridiem_pills = {
+            (c.data["group"], c.data["meridiem_option"]): c
+            for c in all_ctrls
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and "meridiem_option" in c.data
         }
         buttons = [
             c
@@ -383,6 +399,9 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
             for c in all_ctrls
             if isinstance(c, ft.Text) and c.color == ft.Colors.RED_600
         )
+
+        self.assertIsNone(text_fields["Add Time (HH:MM)"].label)
+        self.assertNotIn("Add Time AM/PM", dropdowns)
 
         text_fields["Habit Title"].value = "Evening Reading"
         self.assertNotIn("Enable Reminders & Alarms", switches)
@@ -398,7 +417,8 @@ class ReminderFlowTests(unittest.IsolatedAsyncioTestCase):
 
         # Valid 12h AM/PM time + alarm mode + snooze + custom message saves all fields
         text_fields["Add Time (HH:MM)"].value = "09:15"
-        dropdowns["Add Time AM/PM"].value = "PM"
+        meridiem_pills[("Add Time AM/PM", "PM")].on_click(None)
+        self.assertEqual(meridiems["Add Time AM/PM"].value, "PM")
         dropdowns["Reminder Style"].value = "alarm"
         dropdowns["Snooze Duration"].value = "30"
         text_fields["Custom Reminder Message (optional)"].value = "Read 20 pages"

@@ -4,6 +4,7 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,8 +20,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -29,14 +33,16 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
@@ -54,7 +60,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import com.shawnpeng.habittracker.data.HABIT_COLOR_SWATCHES
 import com.shawnpeng.habittracker.data.HABIT_MODE_OPTIONS
 import com.shawnpeng.habittracker.data.Habit
@@ -201,6 +209,10 @@ fun HabitFormDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(0.94f)
+            .widthIn(max = 440.dp),
         title = {
             Text(
                 text = if (existing == null) "New Habit" else "Edit Habit",
@@ -212,7 +224,7 @@ fun HabitFormDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 OutlinedTextField(
                     value = title,
@@ -309,9 +321,9 @@ fun HabitFormDialog(
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
+                    FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         HABIT_COLOR_SWATCHES.forEach { swatch ->
                             val isSelected = swatch.hex.equals(selectedColorHex, ignoreCase = true)
@@ -378,487 +390,578 @@ fun HabitFormDialog(
                     }
 
                     if (scheduleType == "weekdays") {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            val workDays = setOf(0, 1, 2, 3, 4)
-                            val weekendDays = setOf(5, 6)
-
-                            FilterChip(
-                                selected = selectedDays == workDays,
-                                onClick = {
-                                    selectedDays = workDays
-                                    validationError = null
-                                },
-                                label = { Text("Weekdays") },
-                            )
-                            FilterChip(
-                                selected = selectedDays == weekendDays,
-                                onClick = {
-                                    selectedDays = weekendDays
-                                    validationError = null
-                                },
-                                label = { Text("Weekends") },
-                            )
-                        }
-
-                        Row(
+                        Surface(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
                         ) {
-                            WEEKDAY_SHORT_LABELS.forEachIndexed { idx, label ->
-                                val active = idx in selectedDays
-                                Box(
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            if (active) MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.surfaceVariant,
-                                        )
-                                        .clickable {
-                                            selectedDays = if (active) {
-                                                selectedDays - idx
-                                            } else {
-                                                selectedDays + idx
-                                            }
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    val workDays = setOf(0, 1, 2, 3, 4)
+                                    val weekendDays = setOf(5, 6)
+
+                                    FilterChip(
+                                        selected = selectedDays == workDays,
+                                        onClick = {
+                                            selectedDays = workDays
                                             validationError = null
                                         },
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Text(
-                                        text = label,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (active) MaterialTheme.colorScheme.onPrimary
-                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        label = { Text("Weekdays") },
                                     )
+                                    FilterChip(
+                                        selected = selectedDays == weekendDays,
+                                        onClick = {
+                                            selectedDays = weekendDays
+                                            validationError = null
+                                        },
+                                        label = { Text("Weekends") },
+                                    )
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    WEEKDAY_SHORT_LABELS.forEachIndexed { idx, label ->
+                                        val active = idx in selectedDays
+                                        Box(
+                                            modifier = Modifier
+                                                .size(34.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    if (active) MaterialTheme.colorScheme.primary
+                                                    else MaterialTheme.colorScheme.surface,
+                                                )
+                                                .clickable {
+                                                    selectedDays = if (active) {
+                                                        selectedDays - idx
+                                                    } else {
+                                                        selectedDays + idx
+                                                    }
+                                                    validationError = null
+                                                },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Text(
+                                                text = label,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (active) MaterialTheme.colorScheme.onPrimary
+                                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else if (scheduleType == "monthly") {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
                         ) {
-                            FilterChip(
-                                selected = monthlyMode == "from_start",
-                                onClick = { monthlyMode = "from_start" },
-                                label = { Text("From Start") },
-                            )
-                            FilterChip(
-                                selected = monthlyMode == "from_end",
-                                onClick = { monthlyMode = "from_end" },
-                                label = { Text("From End") },
-                            )
-                            FilterChip(
-                                selected = monthlyMode == "nth_weekday",
-                                onClick = { monthlyMode = "nth_weekday" },
-                                label = { Text("Day X on Week Y") },
-                            )
-                        }
-
-                        if (monthlyMode == "from_start" || monthlyMode == "from_end") {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                FilledTonalIconButton(
-                                    onClick = { if (monthlyDay > 1) monthlyDay-- },
-                                    enabled = monthlyDay > 1,
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
                                 ) {
-                                    Icon(Icons.Rounded.Remove, contentDescription = "Decrease day")
-                                }
-                                Text(
-                                    text = if (monthlyMode == "from_end") {
-                                        if (monthlyDay == 1) "Last day of month" else "Day $monthlyDay from end"
-                                    } else {
-                                        "Day $monthlyDay of month"
-                                    },
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                )
-                                FilledTonalIconButton(
-                                    onClick = { if (monthlyDay < 31) monthlyDay++ },
-                                    enabled = monthlyDay < 31,
-                                ) {
-                                    Icon(Icons.Rounded.Add, contentDescription = "Increase day")
-                                }
-                            }
-
-                            val presets = if (monthlyMode == "from_end") {
-                                listOf(1, 2, 3, 7)
-                            } else {
-                                listOf(1, 10, 15, 25, 31)
-                            }
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                presets.forEach { presetDay ->
-                                    val presetLabel = if (monthlyMode == "from_end") {
-                                        if (presetDay == 1) "Month end" else "-${presetDay}d"
-                                    } else {
-                                        "Day $presetDay"
-                                    }
                                     FilterChip(
-                                        selected = monthlyDay == presetDay,
-                                        onClick = { monthlyDay = presetDay },
-                                        label = { Text(presetLabel) },
+                                        selected = monthlyMode == "from_start",
+                                        onClick = { monthlyMode = "from_start" },
+                                        label = { Text("From Start") },
+                                    )
+                                    FilterChip(
+                                        selected = monthlyMode == "from_end",
+                                        onClick = { monthlyMode = "from_end" },
+                                        label = { Text("From End") },
+                                    )
+                                    FilterChip(
+                                        selected = monthlyMode == "nth_weekday",
+                                        onClick = { monthlyMode = "nth_weekday" },
+                                        label = { Text("Day X on Week Y") },
                                     )
                                 }
-                            }
 
-                            Text(
-                                text = if (monthlyMode == "from_end") {
-                                    "1 = last day of month, 2 = 2nd-to-last, etc."
-                                } else {
-                                    "Clamped to month-end on shorter months (e.g., Feb 28/29)"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        } else {
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                MONTHLY_WEEK_OPTIONS.forEach { (weekVal, label) ->
-                                    FilterChip(
-                                        selected = monthlyWeek == weekVal,
-                                        onClick = { monthlyWeek = weekVal },
-                                        label = { Text(label) },
-                                    )
-                                }
-                            }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                WEEKDAY_SHORT_LABELS.forEachIndexed { idx, label ->
-                                    val active = monthlyWeekday == idx
-                                    Box(
-                                        modifier = Modifier
-                                            .size(36.dp)
-                                            .clip(CircleShape)
-                                            .background(
-                                                if (active) MaterialTheme.colorScheme.primary
-                                                else MaterialTheme.colorScheme.surfaceVariant,
-                                            )
-                                            .clickable { monthlyWeekday = idx },
-                                        contentAlignment = Alignment.Center,
+                                if (monthlyMode == "from_start" || monthlyMode == "from_end") {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
                                     ) {
+                                        FilledTonalIconButton(
+                                            onClick = { if (monthlyDay > 1) monthlyDay-- },
+                                            enabled = monthlyDay > 1,
+                                        ) {
+                                            Icon(Icons.Rounded.Remove, contentDescription = "Decrease day")
+                                        }
                                         Text(
-                                            text = label,
-                                            style = MaterialTheme.typography.labelMedium,
+                                            text = if (monthlyMode == "from_end") {
+                                                if (monthlyDay == 1) "Last day of month" else "Day $monthlyDay from end"
+                                            } else {
+                                                "Day $monthlyDay of month"
+                                            },
+                                            style = MaterialTheme.typography.titleMedium,
                                             fontWeight = FontWeight.Bold,
-                                            color = if (active) MaterialTheme.colorScheme.onPrimary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
+                                        FilledTonalIconButton(
+                                            onClick = { if (monthlyDay < 31) monthlyDay++ },
+                                            enabled = monthlyDay < 31,
+                                        ) {
+                                            Icon(Icons.Rounded.Add, contentDescription = "Increase day")
+                                        }
+                                    }
+
+                                    val presets = if (monthlyMode == "from_end") {
+                                        listOf(1, 2, 3, 7)
+                                    } else {
+                                        listOf(1, 10, 15, 25, 31)
+                                    }
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        presets.forEach { presetDay ->
+                                            val presetLabel = if (monthlyMode == "from_end") {
+                                                if (presetDay == 1) "Month end" else "-${presetDay}d"
+                                            } else {
+                                                "Day $presetDay"
+                                            }
+                                            FilterChip(
+                                                selected = monthlyDay == presetDay,
+                                                onClick = { monthlyDay = presetDay },
+                                                label = { Text(presetLabel) },
+                                            )
+                                        }
+                                    }
+
+                                    Text(
+                                        text = if (monthlyMode == "from_end") {
+                                            "1 = last day of month, 2 = 2nd-to-last, etc."
+                                        } else {
+                                            "Clamped to month-end on shorter months (e.g., Feb 28/29)"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                } else {
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        MONTHLY_WEEK_OPTIONS.forEach { (weekVal, label) ->
+                                            FilterChip(
+                                                selected = monthlyWeek == weekVal,
+                                                onClick = { monthlyWeek = weekVal },
+                                                label = { Text(label) },
+                                            )
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        WEEKDAY_SHORT_LABELS.forEachIndexed { idx, label ->
+                                            val active = monthlyWeekday == idx
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(34.dp)
+                                                    .clip(CircleShape)
+                                                    .background(
+                                                        if (active) MaterialTheme.colorScheme.primary
+                                                        else MaterialTheme.colorScheme.surface,
+                                                    )
+                                                    .clickable { monthlyWeekday = idx },
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                Text(
+                                                    text = label,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (active) MaterialTheme.colorScheme.onPrimary
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
+
+                                Text(
+                                    text = "Rule preview: ${
+                                        formatFrequencySummary(
+                                            frequencyType = "monthly",
+                                            monthlyMode = monthlyMode,
+                                            monthlyDay = monthlyDay,
+                                            monthlyWeek = monthlyWeek,
+                                            monthlyWeekday = monthlyWeekday,
+                                        )
+                                    }",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
                             }
                         }
-
-                        Text(
-                            text = "Rule preview: ${
-                                formatFrequencySummary(
-                                    frequencyType = "monthly",
-                                    monthlyMode = monthlyMode,
-                                    monthlyDay = monthlyDay,
-                                    monthlyWeek = monthlyWeek,
-                                    monthlyWeekday = monthlyWeekday,
-                                )
-                            }",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
                     }
                 }
 
                 HorizontalDivider()
 
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
                         text = "Habit Mode & Alerts",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        HABIT_MODE_OPTIONS.forEach { opt ->
-                            FilterChip(
-                                selected = habitMode == opt.key,
-                                onClick = {
-                                    habitMode = opt.key
-                                    validationError = null
-                                    if (opt.key != "free" &&
-                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                        !HabitNotificationHelper.hasNotificationPermission(context)
-                                    ) {
-                                        notificationPermissionLauncher.launch(
-                                            Manifest.permission.POST_NOTIFICATIONS,
-                                        )
-                                    }
-                                    if (opt.key == "reminder") {
-                                        val resolvedRemind =
-                                            resolveTimeWithMeridiem(remindTimeText, remindMeridiem)
-                                        if (resolvedRemind != null && reminderTimes.isEmpty()) {
-                                            reminderTimes = listOf(resolvedRemind)
-                                        }
-                                        if (reminderTimes.isEmpty()) {
-                                            reminderTimes = listOf("09:00")
-                                        }
-                                    } else if (opt.key == "strict" || opt.key == "window") {
-                                        if (remindTimeText.isBlank()) {
-                                            val seed = reminderTimes.firstOrNull() ?: "09:00"
-                                            val pair = split24hTo12h(seed, "AM")
-                                            remindTimeText = pair.first
-                                            remindMeridiem = pair.second
-                                        }
-                                        if (opt.key == "strict") {
-                                            if (forceStartTimeText.isBlank()) {
-                                                forceStartTimeText = "09:15"
-                                                startMeridiem = "AM"
-                                            }
-                                            if (forceEndTimeText.isBlank()) {
-                                                forceEndTimeText = "10:30"
-                                                endMeridiem = "AM"
-                                            }
-                                        } else if (forceEndTimeText.isBlank()) {
-                                            forceEndTimeText = "09:00"
-                                            endMeridiem = "PM"
-                                        }
-                                    }
-                                },
-                                label = { Text(opt.label) },
-                            )
-                        }
-                    }
-                    val modeHint = HABIT_MODE_OPTIONS.firstOrNull { it.key == habitMode }?.hint.orEmpty()
-                    if (modeHint.isNotEmpty()) {
-                        Text(
-                            text = modeHint,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    if (habitMode == "strict" || habitMode == "window") {
-                        ModeTimeInputRow(
-                            value = remindTimeText,
-                            onValueChange = {
-                                remindTimeText = it
-                                validationError = null
-                            },
-                            meridiem = remindMeridiem,
-                            onMeridiemChange = {
-                                remindMeridiem = it
-                                validationError = null
-                            },
-                            label = "Remind Time",
-                            placeholder = "09:00",
-                            pickerDescription = "Pick Remind Time",
-                            onOpenPicker = { modeTimePickerTarget = "remind" },
-                        )
-                    }
-                    if (habitMode == "strict") {
-                        ModeTimeInputRow(
-                            value = forceStartTimeText,
-                            onValueChange = {
-                                forceStartTimeText = it
-                                validationError = null
-                            },
-                            meridiem = startMeridiem,
-                            onMeridiemChange = {
-                                startMeridiem = it
-                                validationError = null
-                            },
-                            label = "Force Start",
-                            placeholder = "09:15",
-                            pickerDescription = "Pick Force Start Time",
-                            onOpenPicker = { modeTimePickerTarget = "start" },
-                        )
-                    }
-                    if (habitMode == "strict" || habitMode == "window") {
-                        ModeTimeInputRow(
-                            value = forceEndTimeText,
-                            onValueChange = {
-                                forceEndTimeText = it
-                                validationError = null
-                            },
-                            meridiem = endMeridiem,
-                            onMeridiemChange = {
-                                endMeridiem = it
-                                validationError = null
-                            },
-                            label = "Force End",
-                            placeholder = "10:30",
-                            pickerDescription = "Pick Force End Time",
-                            onOpenPicker = { modeTimePickerTarget = "end" },
-                        )
-                    }
-                    if (habitMode == "reminder") {
-                        Text(
-                            text = "Reminder Times",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        if (reminderTimes.isEmpty()) {
-                            Text(
-                                text = "No reminder times added yet. Pick below or enter HH:MM.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        } else {
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        HABIT_MODE_OPTIONS.chunked(2).forEach { rowItems ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                reminderTimes.forEach { hhmm ->
-                                    val displayLabel = formatTime12h(hhmm)
-                                    InputChip(
-                                        selected = true,
+                                rowItems.forEach { opt ->
+                                    FilterChip(
+                                        modifier = Modifier.weight(1f),
+                                        selected = habitMode == opt.key,
                                         onClick = {
-                                            reminderTimes = reminderTimes.filterNot { it == hhmm }
+                                            habitMode = opt.key
                                             validationError = null
+                                            if (opt.key != "free" &&
+                                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                                !HabitNotificationHelper.hasNotificationPermission(context)
+                                            ) {
+                                                notificationPermissionLauncher.launch(
+                                                    Manifest.permission.POST_NOTIFICATIONS,
+                                                )
+                                            }
+                                            if (opt.key == "reminder") {
+                                                val resolvedRemind =
+                                                    resolveTimeWithMeridiem(remindTimeText, remindMeridiem)
+                                                if (resolvedRemind != null && reminderTimes.isEmpty()) {
+                                                    reminderTimes = listOf(resolvedRemind)
+                                                }
+                                                if (reminderTimes.isEmpty()) {
+                                                    reminderTimes = listOf("09:00")
+                                                }
+                                            } else if (opt.key == "strict" || opt.key == "window") {
+                                                if (remindTimeText.isBlank()) {
+                                                    val seed = reminderTimes.firstOrNull() ?: "09:00"
+                                                    val pair = split24hTo12h(seed, "AM")
+                                                    remindTimeText = pair.first
+                                                    remindMeridiem = pair.second
+                                                }
+                                                if (opt.key == "strict") {
+                                                    if (forceStartTimeText.isBlank()) {
+                                                        forceStartTimeText = "09:15"
+                                                        startMeridiem = "AM"
+                                                    }
+                                                    if (forceEndTimeText.isBlank()) {
+                                                        forceEndTimeText = "10:30"
+                                                        endMeridiem = "AM"
+                                                    }
+                                                } else if (forceEndTimeText.isBlank()) {
+                                                    forceEndTimeText = "09:00"
+                                                    endMeridiem = "PM"
+                                                }
+                                            }
                                         },
-                                        label = { Text(displayLabel) },
-                                        trailingIcon = {
-                                            Icon(
-                                                imageVector = Icons.Rounded.Close,
-                                                contentDescription = "Remove $displayLabel",
-                                                modifier = Modifier.size(16.dp),
+                                        label = {
+                                            Text(
+                                                text = opt.chipLabel,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
                                             )
                                         },
                                     )
                                 }
                             }
                         }
-
-                        Text(
-                            text = "Quick Presets",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            REMINDER_TIME_PRESETS.forEach { preset ->
-                                val selected = preset in reminderTimes
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = {
-                                        if (selected) {
-                                            reminderTimes = reminderTimes.filterNot { it == preset }
-                                        } else {
-                                            addReminderTime(preset)
-                                        }
-                                    },
-                                    label = { Text(formatTime12h(preset)) },
-                                )
-                            }
-                        }
-
-                        OutlinedButton(
-                            onClick = { showTimePickerDialog = true },
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.AccessTime,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp),
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Pick Clock Time")
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = customTimeText,
-                                onValueChange = {
-                                    customTimeText = it
-                                    validationError = null
-                                },
-                                label = { Text("Time (HH:MM)") },
-                                placeholder = { Text("08:30") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
-                            )
-                            MeridiemSelector(
-                                selected = customTimeMeridiem,
-                                onSelect = {
-                                    customTimeMeridiem = it
-                                    validationError = null
-                                },
-                            )
-                            TextButton(
-                                onClick = {
-                                    if (addReminderTime(customTimeText, customTimeMeridiem)) {
-                                        customTimeText = ""
-                                    }
-                                },
-                            ) {
-                                Text("Add")
-                            }
-                        }
                     }
 
-                    if (habitMode != "free") {
-                        Text(
-                            text = "Alert Delivery",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            FilterChip(
-                                selected = reminderMode != "alarm",
-                                onClick = { reminderMode = "notification" },
-                                label = { Text("Notification 🔔") },
-                            )
-                            FilterChip(
-                                selected = reminderMode == "alarm",
-                                onClick = { reminderMode = "alarm" },
-                                label = { Text("Alarm Ring ⏰") },
+                    val modeHint = HABIT_MODE_OPTIONS.firstOrNull { it.key == habitMode }?.hint.orEmpty()
+                    if (habitMode == "free") {
+                        if (modeHint.isNotEmpty()) {
+                            Text(
+                                text = modeHint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-
-                        Text(
-                            text = "Snooze Duration",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                    } else {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
                         ) {
-                            REMINDER_SNOOZE_OPTIONS.forEach { mins ->
-                                FilterChip(
-                                    selected = reminderSnoozeMinutes == mins,
-                                    onClick = { reminderSnoozeMinutes = mins },
-                                    label = { Text("${mins} min") },
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                if (modeHint.isNotEmpty()) {
+                                    Text(
+                                        text = modeHint,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (habitMode == "strict" || habitMode == "window") {
+                                    ModeTimeInputRow(
+                                        value = remindTimeText,
+                                        onValueChange = {
+                                            remindTimeText = it
+                                            validationError = null
+                                        },
+                                        meridiem = remindMeridiem,
+                                        onMeridiemChange = {
+                                            remindMeridiem = it
+                                            validationError = null
+                                        },
+                                        label = "Remind Time",
+                                        stepHint = "Alert trigger",
+                                        placeholder = "09:00",
+                                        pickerDescription = "Pick Remind Time",
+                                        onOpenPicker = { modeTimePickerTarget = "remind" },
+                                    )
+                                }
+                                if (habitMode == "strict") {
+                                    ModeTimeInputRow(
+                                        value = forceStartTimeText,
+                                        onValueChange = {
+                                            forceStartTimeText = it
+                                            validationError = null
+                                        },
+                                        meridiem = startMeridiem,
+                                        onMeridiemChange = {
+                                            startMeridiem = it
+                                            validationError = null
+                                        },
+                                        label = "Force Start Time",
+                                        stepHint = "Must start by",
+                                        placeholder = "09:15",
+                                        pickerDescription = "Pick Force Start Time",
+                                        onOpenPicker = { modeTimePickerTarget = "start" },
+                                    )
+                                }
+                                if (habitMode == "strict" || habitMode == "window") {
+                                    ModeTimeInputRow(
+                                        value = forceEndTimeText,
+                                        onValueChange = {
+                                            forceEndTimeText = it
+                                            validationError = null
+                                        },
+                                        meridiem = endMeridiem,
+                                        onMeridiemChange = {
+                                            endMeridiem = it
+                                            validationError = null
+                                        },
+                                        label = "Force End Time",
+                                        stepHint = "Must finish by",
+                                        placeholder = "10:30",
+                                        pickerDescription = "Pick Force End Time",
+                                        onOpenPicker = { modeTimePickerTarget = "end" },
+                                    )
+                                }
+                                if (habitMode == "reminder") {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = "Scheduled Times",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Medium,
+                                        )
+                                        TextButton(
+                                            onClick = { showTimePickerDialog = true },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.AccessTime,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                text = "Pick Clock",
+                                                style = MaterialTheme.typography.labelMedium,
+                                            )
+                                        }
+                                    }
+                                    if (reminderTimes.isEmpty()) {
+                                        Text(
+                                            text = "No reminder times added yet. Pick below or enter HH:MM.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    } else {
+                                        FlowRow(
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            reminderTimes.forEach { hhmm ->
+                                                val displayLabel = formatTime12h(hhmm)
+                                                InputChip(
+                                                    selected = true,
+                                                    onClick = {
+                                                        reminderTimes = reminderTimes.filterNot { it == hhmm }
+                                                        validationError = null
+                                                    },
+                                                    label = { Text(displayLabel) },
+                                                    trailingIcon = {
+                                                        Icon(
+                                                            imageVector = Icons.Rounded.Close,
+                                                            contentDescription = "Remove $displayLabel",
+                                                            modifier = Modifier.size(16.dp),
+                                                        )
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    Text(
+                                        text = "Quick Presets",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        REMINDER_TIME_PRESETS.forEach { preset ->
+                                            val selected = preset in reminderTimes
+                                            FilterChip(
+                                                selected = selected,
+                                                onClick = {
+                                                    if (selected) {
+                                                        reminderTimes = reminderTimes.filterNot { it == preset }
+                                                    } else {
+                                                        addReminderTime(preset)
+                                                    }
+                                                },
+                                                label = { Text(formatTime12h(preset)) },
+                                            )
+                                        }
+                                    }
+
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Text(
+                                            text = "Add Custom Time",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            OutlinedTextField(
+                                                value = customTimeText,
+                                                onValueChange = {
+                                                    customTimeText = it
+                                                    validationError = null
+                                                },
+                                                placeholder = { Text("08:30") },
+                                                singleLine = true,
+                                                trailingIcon = {
+                                                    IconButton(onClick = { showTimePickerDialog = true }) {
+                                                        Icon(
+                                                            imageVector = Icons.Rounded.AccessTime,
+                                                            contentDescription = "Pick Clock Time",
+                                                            modifier = Modifier.size(20.dp),
+                                                        )
+                                                    }
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            MeridiemSelector(
+                                                selected = customTimeMeridiem,
+                                                onSelect = {
+                                                    customTimeMeridiem = it
+                                                    validationError = null
+                                                },
+                                            )
+                                            FilledTonalButton(
+                                                onClick = {
+                                                    if (addReminderTime(customTimeText, customTimeMeridiem)) {
+                                                        customTimeText = ""
+                                                    }
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 14.dp),
+                                            ) {
+                                                Text("Add")
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalDivider()
+
+                                Text(
+                                    text = "Alert Delivery",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    FilterChip(
+                                        selected = reminderMode != "alarm",
+                                        onClick = { reminderMode = "notification" },
+                                        label = { Text("Notification 🔔") },
+                                    )
+                                    FilterChip(
+                                        selected = reminderMode == "alarm",
+                                        onClick = { reminderMode = "alarm" },
+                                        label = { Text("Alarm Ring ⏰") },
+                                    )
+                                }
+
+                                Text(
+                                    text = "Snooze Duration",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    REMINDER_SNOOZE_OPTIONS.forEach { mins ->
+                                        FilterChip(
+                                            selected = reminderSnoozeMinutes == mins,
+                                            onClick = { reminderSnoozeMinutes = mins },
+                                            label = { Text("${mins}m") },
+                                        )
+                                    }
+                                }
+
+                                OutlinedTextField(
+                                    value = reminderMessage,
+                                    onValueChange = { if (it.length <= 160) reminderMessage = it },
+                                    label = { Text("Custom Reminder Message (optional)") },
+                                    placeholder = { Text("e.g., Drink water or focus for 20 minutes") },
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
                                 )
                             }
                         }
-
-                        OutlinedTextField(
-                            value = reminderMessage,
-                            onValueChange = { if (it.length <= 160) reminderMessage = it },
-                            label = { Text("Custom Reminder Message (optional)") },
-                            placeholder = { Text("e.g., Drink water or focus for 20 minutes") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
                     }
                 }
 
@@ -1101,13 +1204,39 @@ private fun MeridiemSelector(
     selected: String,
     onSelect: (String) -> Unit,
 ) {
-    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        listOf("AM", "PM").forEach { option ->
-            FilterChip(
-                selected = selected.equals(option, ignoreCase = true),
-                onClick = { onSelect(option) },
-                label = { Text(option) },
-            )
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            listOf("AM", "PM").forEach { option ->
+                val active = selected.equals(option, ignoreCase = true)
+                Box(
+                    modifier = Modifier
+                        .width(36.dp)
+                        .height(40.dp)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(
+                            if (active) MaterialTheme.colorScheme.primary
+                            else Color.Transparent,
+                        )
+                        .clickable { onSelect(option) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = option,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
@@ -1119,29 +1248,56 @@ private fun ModeTimeInputRow(
     meridiem: String,
     onMeridiemChange: (String) -> Unit,
     label: String,
+    stepHint: String,
     placeholder: String,
     pickerDescription: String,
     onOpenPicker: () -> Unit,
 ) {
-    Row(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            label = { Text(label) },
-            placeholder = { Text(placeholder) },
-            singleLine = true,
-            modifier = Modifier.weight(1f),
-        )
-        MeridiemSelector(
-            selected = meridiem,
-            onSelect = onMeridiemChange,
-        )
-        FilledTonalIconButton(onClick = onOpenPicker) {
-            Icon(Icons.Rounded.AccessTime, contentDescription = pickerDescription)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = stepHint,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                placeholder = { Text(placeholder) },
+                singleLine = true,
+                trailingIcon = {
+                    IconButton(onClick = onOpenPicker) {
+                        Icon(
+                            imageVector = Icons.Rounded.AccessTime,
+                            contentDescription = pickerDescription,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            )
+            MeridiemSelector(
+                selected = meridiem,
+                onSelect = onMeridiemChange,
+            )
         }
     }
 }

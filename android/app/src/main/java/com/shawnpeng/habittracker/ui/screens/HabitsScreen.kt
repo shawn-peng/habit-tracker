@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Unarchive
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -43,9 +44,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.Habit
+import com.shawnpeng.habittracker.data.formatCompanionReminderBadge
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
-import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.parseHabitColor
 
 @Composable
@@ -53,6 +54,7 @@ fun HabitsScreen(
     habits: List<Habit>,
     showArchived: Boolean,
     onToggleShowArchived: (Boolean) -> Unit,
+    onOpenHistory: (Habit) -> Unit,
     onEditHabit: (Habit) -> Unit,
     onToggleArchive: (Habit) -> Unit,
     onDeleteHabit: (Habit) -> Unit,
@@ -128,6 +130,7 @@ fun HabitsScreen(
             items(habits, key = { it.id }) { habit ->
                 ManageHabitCard(
                     habit = habit,
+                    onOpenHistory = { onOpenHistory(habit) },
                     onEdit = { onEditHabit(habit) },
                     onToggleArchive = { onToggleArchive(habit) },
                     onDeleteRequest = { pendingDelete = habit },
@@ -165,6 +168,7 @@ fun HabitsScreen(
 @Composable
 private fun ManageHabitCard(
     habit: Habit,
+    onOpenHistory: () -> Unit,
     onEdit: () -> Unit,
     onToggleArchive: () -> Unit,
     onDeleteRequest: () -> Unit,
@@ -177,7 +181,7 @@ private fun ManageHabitCard(
         forceEndTime = habit.forceEndTime,
         reminderMode = habit.reminderMode,
     )
-    val reminderBadge = formatReminderBadge(habit)
+    val reminderBadge = formatCompanionReminderBadge(habit)
     val freqText = formatFrequencySummary(
         frequencyType = habit.frequencyType,
         weekdays = habit.weekdays,
@@ -266,6 +270,12 @@ private fun ManageHabitCard(
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpenHistory) {
+                    Icon(
+                        imageVector = Icons.Rounded.History,
+                        contentDescription = "Check-in history",
+                    )
+                }
                 IconButton(onClick = onEdit) {
                     Icon(
                         imageVector = Icons.Rounded.Edit,

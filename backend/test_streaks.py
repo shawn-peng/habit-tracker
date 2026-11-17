@@ -301,9 +301,9 @@ def test_habit_sli_healthy_warning_and_breached_math():
     # 3 misses in the last 7 days -> 17/20 = 85.0% (>= 80% SLO), 1.0/4.0 budget left (25.0%),
     # 7d miss rate = 3/7 -> burn_rate_7d = 2.14x -> warning
     completed_warning = set(all_20_days) - {
-        all_20_days[-1],
         all_20_days[-2],
         all_20_days[-3],
+        all_20_days[-4],
     }
     item_warning = compute_habit_sli(habit, completed_warning, ref, window_days=30)
     assert item_warning.current_sli == 85.0
@@ -349,8 +349,23 @@ def test_habit_sli_100_percent_slo_finite_burn_cap():
     assert perfect.burn_rate == 0.0
     assert perfect.error_budget_remaining_pct == 100.0
 
-    # >=1 miss at 100% SLO -> finite burn rate cap 10.0, 0.0% budget left, breached
-    missed_one = days_7 - {ref.isoformat()}
+    # Today uncompleted with today_violated=False preserves same-day grace -> 6/6 = 100.0% healthy
+    pending_today = days_7 - {ref.isoformat()}
+    grace = compute_habit_sli(habit, pending_today, ref, window_days=7, today_violated=False)
+    assert grace.scheduled_days == 6
+    assert grace.completed_days == 6
+    assert grace.current_sli == 100.0
+    assert grace.status == "healthy"
+
+    # Today uncompleted with today_violated=True breaches immediately
+    violated_today = compute_habit_sli(habit, pending_today, ref, window_days=7, today_violated=True)
+    assert violated_today.scheduled_days == 7
+    assert violated_today.missed_days == 1
+    assert violated_today.burn_rate == 10.0
+    assert violated_today.status == "breached"
+
+    # >=1 miss (yesterday) at 100% SLO -> finite burn rate cap 10.0, 0.0% budget left, breached
+    missed_one = days_7 - {(ref - timedelta(days=1)).isoformat()}
     breached = compute_habit_sli(habit, missed_one, ref, window_days=7)
     assert breached.error_budget_allowed_days == 0.0
     assert breached.error_budget_remaining_days == -1.0
@@ -367,8 +382,7 @@ def test_build_sli_dashboard_windows_empty_and_diagnostics():
     assert empty_dash.active_habits_count == 0
     assert empty_dash.overall_status == "no_data"
     assert empty_dash.overall_target_slo == 85.0
-    assert len(empty_dash.trend) == 10
-    assert all(not pt.has_activity for pt in empty_dash.trend)
+    assert empty_dash.trend == []
     assert len(empty_dash.weekday_sli) == 7
     assert empty_dash.habits == []
 
@@ -1851,3 +1865,271 @@ def test_reminders_crud_schedule_and_overview_endpoint():
         assert bad_time.status_code == 400
     finally:
         app.dependency_overrides.clear()
+
+
+def test_sli_starts_after_habit_added_with_same_day_grace_and_cutoff():
+    # Case A: Free habit created today starts in same-day grace and counts once checked in
+    user_oid = ObjectId()
+    fake_db = _FakeDb()
+    app.dependency_overrides[get_db] = lambda: fake_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+    try:
+        client = TestClient(app)
+        free_resp = client.post(
+            "/api/habits",
+            json={
+                "title": "Evening Journal",
+                "mode": "free",
+                "created_date": "2026-11-17",
+                "created_time": "10:00",
+            },
+        )
+        assert free_resp.status_code == 201
+        free_h = free_resp.json()
+        assert free_h["created_date"] == "2026-11-17"
+        assert free_h["created_time"] == "10:00"
+
+        sli_pending = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "10:05", "window_days": 30},
+        ).json()
+        assert len(sli_pending["trend"]) == 1
+        assert sli_pending["trend"][0]["start_date"] == "2026-11-17"
+        assert sli_pending["trend"][0]["has_activity"] is False
+        assert sli_pending["habits"][0]["scheduled_days"] == 0
+        assert sli_pending["habits"][0]["current_sli"] == 100.0
+        assert sli_pending["habits"][0]["status"] == "healthy"
+
+        chk_resp = client.post(
+            f"/api/habits/{free_h['id']}/checkin",
+            json={
+                "date": "2026-11-17",
+                "action": "toggle",
+                "client_today": "2026-11-17",
+                "client_time": "10:15",
+            },
+        )
+        assert chk_resp.status_code == 200
+
+        sli_done = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "10:15", "window_days": 30},
+        ).json()
+        assert len(sli_done["trend"]) == 1
+        assert sli_done["trend"][0]["has_activity"] is True
+        assert sli_done["trend"][0]["sli"] == 100.0
+        assert sli_done["habits"][0]["scheduled_days"] == 1
+        assert sli_done["habits"][0]["completed_days"] == 1
+        assert sli_done["habits"][0]["current_sli"] == 100.0
+    finally:
+        app.dependency_overrides.clear()
+
+    # Case B: Timed habits added after today's cutoff skip creation day unless completed
+    fake_db_b = _FakeDb()
+    app.dependency_overrides[get_db] = lambda: fake_db_b
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+    try:
+        client = TestClient(app)
+        strict_id = client.post(
+            "/api/habits",
+            json={
+                "title": "Morning Focus",
+                "mode": "strict",
+                "remind_time": "07:30",
+                "force_start_time": "08:00",
+                "force_end_time": "09:00",
+                "created_date": "2026-11-17",
+                "created_time": "14:00",
+            },
+        ).json()["id"]
+        window_id = client.post(
+            "/api/habits",
+            json={
+                "title": "Morning Stretch",
+                "mode": "window",
+                "remind_time": "07:30",
+                "force_end_time": "08:30",
+                "created_date": "2026-11-17",
+                "created_time": "14:00",
+            },
+        ).json()["id"]
+        reminder_id = client.post(
+            "/api/habits",
+            json={
+                "title": "Vitamins",
+                "mode": "reminder",
+                "remind_time": "08:00",
+                "created_date": "2026-11-17",
+                "created_time": "14:00",
+            },
+        ).json()["id"]
+
+        same_day = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "14:05", "window_days": 30},
+        ).json()
+        assert same_day["overall_status"] == "healthy"
+        assert same_day["trend"] == []
+        assert all(
+            h["scheduled_days"] == 0 and h["status"] == "healthy"
+            for h in same_day["habits"]
+        )
+
+        next_morning = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-18", "client_time": "07:00", "window_days": 30},
+        ).json()
+        assert len(next_morning["trend"]) == 1
+        assert next_morning["trend"][0]["start_date"] == "2026-11-18"
+        assert all(
+            h["scheduled_days"] == 0 and h["status"] == "healthy"
+            for h in next_morning["habits"]
+        )
+
+        next_late = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-18", "client_time": "09:30", "window_days": 30},
+        ).json()
+        by_id_late = {h["habit_id"]: h for h in next_late["habits"]}
+        assert by_id_late[strict_id]["scheduled_days"] == 1
+        assert by_id_late[strict_id]["missed_days"] == 1
+        assert by_id_late[strict_id]["status"] == "breached"
+        assert by_id_late[window_id]["scheduled_days"] == 1
+        assert by_id_late[window_id]["missed_days"] == 1
+        assert by_id_late[window_id]["status"] == "breached"
+        assert by_id_late[reminder_id]["scheduled_days"] == 0
+        assert by_id_late[reminder_id]["status"] == "healthy"
+
+        # If reminder habit is completed on creation day anyway, it counts 1/1 = 100.0%
+        client.post(
+            f"/api/habits/{reminder_id}/checkin",
+            json={
+                "date": "2026-11-17",
+                "action": "toggle",
+                "client_today": "2026-11-17",
+                "client_time": "14:10",
+            },
+        )
+        same_day_done = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "14:10", "window_days": 30},
+        ).json()
+        rem_item = next(
+            h for h in same_day_done["habits"] if h["habit_id"] == reminder_id
+        )
+        assert rem_item["scheduled_days"] == 1
+        assert rem_item["completed_days"] == 1
+        assert rem_item["current_sli"] == 100.0
+    finally:
+        app.dependency_overrides.clear()
+
+    # Case C: Timed strict habit added BEFORE cutoff stays pending until force_start_time, then breaches
+    fake_db_c = _FakeDb()
+    app.dependency_overrides[get_db] = lambda: fake_db_c
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+    try:
+        client = TestClient(app)
+        resp = client.post(
+            "/api/habits",
+            json={
+                "title": "Afternoon Sprint",
+                "mode": "strict",
+                "remind_time": "15:00",
+                "force_start_time": "15:30",
+                "force_end_time": "17:00",
+                "created_date": "2026-11-17",
+                "created_time": "14:00",
+            },
+        )
+        assert resp.status_code == 201
+
+        before_start = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "14:30", "window_days": 30},
+        ).json()
+        assert len(before_start["trend"]) == 1
+        assert before_start["habits"][0]["scheduled_days"] == 0
+        assert before_start["habits"][0]["status"] == "healthy"
+
+        after_start = client.get(
+            "/api/stats/sli",
+            params={"today": "2026-11-17", "client_time": "15:45", "window_days": 30},
+        ).json()
+        assert after_start["habits"][0]["scheduled_days"] == 1
+        assert after_start["habits"][0]["missed_days"] == 1
+        assert after_start["habits"][0]["current_sli"] == 0.0
+        assert after_start["habits"][0]["status"] == "breached"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_sli_trend_starts_at_earliest_habit_and_clamps_utc_evening():
+    ref = date(2026, 11, 17)
+
+    # 4-day-old habit on 30d window -> 4 daily bars starting 2026-11-14
+    habit_4d = {
+        "_id": "h4",
+        "title": "Walk",
+        "frequency_type": "daily",
+        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+        "target_slo": 85.0,
+        "created_date": "2026-11-14",
+    }
+    dash_4d = build_sli_dashboard(
+        [habit_4d],
+        {"h4": {"2026-11-14", "2026-11-15", "2026-11-16"}},
+        ref,
+        window_days=30,
+    )
+    assert len(dash_4d.trend) == 4
+    assert dash_4d.trend[0].start_date == "2026-11-14"
+    assert dash_4d.trend[-1].end_date == "2026-11-17"
+
+    # 20-day-old habit on 30d window -> 10 buckets starting 20 days ago (2026-10-29)
+    habit_20d = {
+        "_id": "h20",
+        "title": "Study",
+        "frequency_type": "daily",
+        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+        "target_slo": 85.0,
+        "created_date": "2026-10-29",
+    }
+    dash_20d = build_sli_dashboard(
+        [habit_20d],
+        {"h20": {(ref - timedelta(days=i)).isoformat() for i in range(20)}},
+        ref,
+        window_days=30,
+    )
+    assert len(dash_20d.trend) == 10
+    assert dash_20d.trend[0].start_date == "2026-10-29"
+    assert dash_20d.trend[-1].end_date == "2026-11-17"
+
+    # Legacy UTC evening creation (2026-11-18T03:00Z = 1 day ahead of local 2026-11-17) clamps to today
+    habit_utc_evening = {
+        "_id": "h_utc",
+        "title": "Late Night Habit",
+        "frequency_type": "daily",
+        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+        "target_slo": 85.0,
+        "created_at": datetime(2026, 11, 18, 3, 0, tzinfo=timezone.utc),
+    }
+    dash_utc = build_sli_dashboard([habit_utc_evening], {}, ref, window_days=30)
+    assert len(dash_utc.trend) == 1
+    assert dash_utc.trend[0].start_date == "2026-11-17"
+    assert dash_utc.habits[0].scheduled_days == 0
+    assert dash_utc.habits[0].status == "healthy"

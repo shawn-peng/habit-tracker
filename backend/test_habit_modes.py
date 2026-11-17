@@ -693,3 +693,422 @@ def test_merged_habit_mode_and_reminders_sync():
         assert [it["habit_id"] for it in ov_after.json()["items"]] == [rem_h["id"]]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_checkin_history_edit_overrides_validation_and_streaks_sli():
+    user_oid = ObjectId()
+    uid = str(user_oid)
+    strict_oid = ObjectId()
+    strict_id = str(strict_oid)
+    window_oid = ObjectId()
+    window_id = str(window_oid)
+    created_at = datetime(2026, 11, 12, 8, 0, tzinfo=timezone.utc)
+
+    habits = [
+        {
+            "_id": strict_oid,
+            "user_id": uid,
+            "title": "Morning Focus",
+            "description": "",
+            "color": "#6366F1",
+            "icon": "check_circle",
+            "frequency_type": "daily",
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "target_per_day": 1,
+            "target_slo": 85.0,
+            "mode": "strict",
+            "remind_time": "08:00",
+            "force_start_time": "08:15",
+            "force_end_time": "09:30",
+            "archived": False,
+            "created_date": "2026-11-12",
+            "created_at": created_at,
+        },
+        {
+            "_id": window_oid,
+            "user_id": uid,
+            "title": "Water Glasses",
+            "description": "",
+            "color": "#0EA5E9",
+            "icon": "check_circle",
+            "frequency_type": "daily",
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "target_per_day": 3,
+            "target_slo": 85.0,
+            "mode": "window",
+            "remind_time": "09:00",
+            "force_end_time": "21:00",
+            "archived": False,
+            "created_date": "2026-11-12",
+            "created_at": created_at,
+        },
+    ]
+    checkins = [
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": strict_id,
+            "date": "2026-11-12",
+            "count": 1,
+            "completed": True,
+            "is_late": False,
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": strict_id,
+            "date": "2026-11-13",
+            "count": 1,
+            "completed": True,
+            "is_late": False,
+        },
+    ]
+    fake_db = _FakeDb(habits=habits, checkins=checkins)
+    app.dependency_overrides[get_db] = lambda: fake_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc),
+    }
+
+    try:
+        client = TestClient(app)
+        today_str = "2026-11-15"
+
+        # Viewing pre-creation date returns can_edit=False and pending (no violation)
+        pre_day = client.get(
+            "/api/habits/today",
+            params={
+                "target_date": "2026-11-11",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert pre_day.status_code == 200
+        assert all(item["can_edit"] is False for item in pre_day.json())
+        assert all(item["day_status"] == "pending" for item in pre_day.json())
+
+        # Override missed strict day (Nov 14) to On Time & mark Nov 15 On Time -> 4-day streak
+        fix_nov14 = client.post(
+            f"/api/habits/{strict_id}/checkin",
+            json={
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 1,
+                "note": "Forgot to log yesterday",
+                "status_override": "on_time",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert fix_nov14.status_code == 200
+        f14 = fix_nov14.json()
+        assert f14["completed"] is True
+        assert f14["is_late"] is False
+        assert f14["started_on_time"] is True
+        assert f14["day_status"] == "on_time"
+        assert f14["note"] == "Forgot to log yesterday"
+        assert f14["current_streak"] == 3
+
+        fix_nov15 = client.post(
+            f"/api/habits/{strict_id}/checkin",
+            json={
+                "date": today_str,
+                "action": "edit",
+                "count": 1,
+                "status_override": "on_time",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert fix_nov15.status_code == 200
+        assert fix_nov15.json()["current_streak"] == 4
+
+        sli_full = client.get(
+            "/api/stats/sli",
+            params={"today": today_str, "client_time": "10:00", "window_days": 30},
+        ).json()
+        strict_sli = next(h for h in sli_full["habits"] if h["habit_id"] == strict_id)
+        assert strict_sli["current_sli"] == 100.0
+        assert strict_sli["current_streak"] == 4
+
+        # Downgrade Nov 13 to Overdue Make-up -> excluded from streak & SLI
+        late_nov13 = client.post(
+            f"/api/habits/{strict_id}/checkin",
+            json={
+                "date": "2026-11-13",
+                "action": "edit",
+                "count": 1,
+                "note": "Actually finished late",
+                "status_override": "late_makeup",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert late_nov13.status_code == 200
+        l13 = late_nov13.json()
+        assert l13["completed"] is True
+        assert l13["is_late"] is True
+        assert l13["day_status"] == "late_makeup"
+        assert l13["note"] == "Actually finished late"
+
+        stats_after = client.get(
+            "/api/stats/summary",
+            params={"today": today_str, "client_time": "10:00"},
+        ).json()
+        strict_stat = next(
+            s for s in stats_after["habit_stats"] if s["habit_id"] == strict_id
+        )
+        assert strict_stat["current_streak"] == 2  # Nov 14, 15
+        assert strict_stat["total_completions"] == 3  # Nov 12, 14, 15
+        assert strict_stat["late_completions"] == 1  # Nov 13
+        assert strict_stat["completion_rate_30d"] == 75.0
+
+        # Multi-count edit: partial clear keeps note & count, full clear deletes document
+        partial = client.post(
+            f"/api/habits/{window_id}/checkin",
+            json={
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 2,
+                "note": "2/3 glasses",
+                "status_override": "clear",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert partial.status_code == 200
+        assert partial.json()["completed"] is False
+        assert partial.json()["count"] == 2
+        assert partial.json()["note"] == "2/3 glasses"
+
+        cleared = client.post(
+            f"/api/habits/{window_id}/checkin",
+            json={
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 0,
+                "note": "",
+                "status_override": "clear",
+                "client_today": today_str,
+                "client_time": "10:00",
+            },
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["count"] == 0
+        assert not any(
+            d["habit_id"] == window_id and d["date"] == "2026-11-14"
+            for d in fake_db.checkins.docs
+        )
+
+        # Validation errors -> 400
+        for bad_payload in [
+            {
+                "date": "2026-11-16",
+                "action": "edit",
+                "count": 1,
+                "status_override": "on_time",
+            },
+            {
+                "date": "2026-11-11",
+                "action": "edit",
+                "count": 1,
+                "status_override": "on_time",
+            },
+            {
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 2,
+                "status_override": "on_time",
+            },
+            {
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 0,
+                "status_override": "late_makeup",
+            },
+            {
+                "date": "2026-11-14",
+                "action": "edit",
+                "count": 3,
+                "status_override": "clear",
+            },
+        ]:
+            target_hid = window_id if bad_payload["count"] in (2, 3) else strict_id
+            resp = client.post(
+                f"/api/habits/{target_hid}/checkin",
+                json={
+                    **bad_payload,
+                    "client_today": today_str,
+                    "client_time": "10:00",
+                },
+            )
+            assert resp.status_code == 400
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_habit_history_endpoint_calendar_states_and_bounds():
+    user_oid = ObjectId()
+    uid = str(user_oid)
+    hid_oid = ObjectId()
+    hid = str(hid_oid)
+    oct_oid = ObjectId()
+    oct_id = str(oct_oid)
+
+    habits = [
+        {
+            "_id": hid_oid,
+            "user_id": uid,
+            "title": "MWF Gym",
+            "description": "",
+            "color": "#10B981",
+            "icon": "check_circle",
+            "frequency_type": "weekdays",
+            "weekdays": [0, 2, 4],  # Mon, Wed, Fri
+            "target_per_day": 1,
+            "target_slo": 85.0,
+            "mode": "strict",
+            "remind_time": "09:00",
+            "force_start_time": "09:15",
+            "force_end_time": "11:00",
+            "archived": False,
+            "created_date": "2026-11-04",
+            "created_at": datetime(2026, 11, 4, 8, 0, tzinfo=timezone.utc),
+        },
+        {
+            "_id": oct_oid,
+            "user_id": uid,
+            "title": "October Daily",
+            "description": "",
+            "color": "#6366F1",
+            "icon": "check_circle",
+            "frequency_type": "daily",
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "target_per_day": 1,
+            "target_slo": 85.0,
+            "mode": "free",
+            "archived": False,
+            "created_date": "2026-10-15",
+            "created_at": datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc),
+        },
+    ]
+    checkins = [
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": hid,
+            "date": "2026-11-04",
+            "count": 1,
+            "completed": True,
+            "is_late": False,
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": hid,
+            "date": "2026-11-06",
+            "count": 1,
+            "completed": True,
+            "is_late": True,
+            "violation_reason": "missed_start",
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": hid,
+            "date": "2026-11-11",
+            "count": 1,
+            "completed": True,
+            "is_late": False,
+            "note": "Great session",
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "habit_id": hid,
+            "date": "2026-11-13",
+            "count": 1,
+            "completed": True,
+            "is_late": False,
+        },
+    ]
+    fake_db = _FakeDb(habits=habits, checkins=checkins)
+    app.dependency_overrides[get_db] = lambda: fake_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "_id": user_oid,
+        "name": "Shawn",
+        "email": "shawn@example.com",
+        "created_at": datetime(2026, 10, 1, tzinfo=timezone.utc),
+    }
+
+    try:
+        client = TestClient(app)
+        resp = client.get(
+            f"/api/habits/{hid}/history",
+            params={
+                "month": "2026-11",
+                "client_today": "2026-11-16",
+                "client_time": "09:05",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["created_date"] == "2026-11-04"
+        assert body["can_prev_month"] is False
+        assert body["can_next_month"] is False
+        assert body["month_scheduled"] == 6  # Nov 4, 6, 9, 11, 13, 16
+        assert body["month_completed_on_time"] == 3
+        assert body["month_late_makeups"] == 1
+        assert body["month_missed"] == 1  # Nov 9
+        assert body["total_completions"] == 3
+        assert body["late_completions"] == 1
+        assert body["current_streak"] == 2
+        assert body["best_streak"] == 2
+
+        by_date = {d["date"]: d for d in body["days"]}
+        assert by_date["2026-11-01"]["state"] == "before_created"
+        assert by_date["2026-11-01"]["editable"] is False
+        assert by_date["2026-11-03"]["state"] == "before_created"
+        assert by_date["2026-11-04"]["state"] == "on_time"
+        assert by_date["2026-11-04"]["editable"] is True
+        assert by_date["2026-11-05"]["state"] == "unscheduled"
+        assert by_date["2026-11-06"]["state"] == "late_makeup"
+        assert by_date["2026-11-09"]["state"] == "missed"
+        assert by_date["2026-11-11"]["note"] == "Great session"
+        assert by_date["2026-11-16"]["state"] == "reminding"
+        assert by_date["2026-11-16"]["is_today"] is True
+        assert by_date["2026-11-17"]["state"] == "future"
+        assert by_date["2026-11-17"]["editable"] is False
+
+        # Month navigation bounds for October-created habit
+        nov_oct = client.get(
+            f"/api/habits/{oct_id}/history",
+            params={
+                "month": "2026-11",
+                "client_today": "2026-11-16",
+                "client_time": "09:05",
+            },
+        ).json()
+        assert nov_oct["can_prev_month"] is True
+        assert nov_oct["can_next_month"] is False
+
+        oct_oct = client.get(
+            f"/api/habits/{oct_id}/history",
+            params={
+                "month": "2026-10",
+                "client_today": "2026-11-16",
+                "client_time": "09:05",
+            },
+        ).json()
+        assert oct_oct["can_prev_month"] is False
+        assert oct_oct["can_next_month"] is True
+
+        # Invalid month format rejected
+        assert (
+            client.get(f"/api/habits/{hid}/history?month=2026-13").status_code == 400
+        )
+        assert client.get(f"/api/habits/{hid}/history?month=invalid").status_code == 400
+    finally:
+        app.dependency_overrides.clear()

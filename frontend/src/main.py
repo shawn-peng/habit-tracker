@@ -24,10 +24,10 @@ REMINDER_TIME_PRESETS = ["07:30", "09:00", "12:30", "18:00", "21:30"]
 REMINDER_SNOOZE_OPTIONS = [5, 10, 15, 30, 60]
 
 HABIT_MODE_OPTIONS = [
-    ("free", "Free Mode (Default — No Reminders)"),
-    ("strict", "Mode 1: Strict Control (Remind -> Force Start -> Force End)"),
-    ("window", "Mode 2: Flexible Window (Remind -> Force End)"),
-    ("reminder", "Mode 3: Timed Reminder & Alarm"),
+    ("free", "Free Mode (No Time Limits)"),
+    ("strict", "Mode 1 · Strict Control"),
+    ("window", "Mode 2 · Flexible Window"),
+    ("reminder", "Mode 3 · Timed Reminder & Alarm"),
 ]
 HABIT_MODE_SHORT_LABELS = {
     "free": "Free Mode",
@@ -240,6 +240,36 @@ def format_habit_mode_summary(habit: dict[str, Any]) -> str:
     return f"{label} ({' · '.join(parts)})" if parts else label
 
 
+def extract_local_created_date(
+    habit: dict[str, Any], today_date: date | None = None
+) -> date | None:
+    """Extract a habit's creation date (YYYY-MM-DD) clamped to today_date when provided."""
+    raw_cd = str(habit.get("created_date") or "").strip()[:10]
+    parsed: date | None = None
+    if len(raw_cd) == 10:
+        try:
+            parsed = date.fromisoformat(raw_cd)
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        raw_ca = habit.get("created_at")
+        if isinstance(raw_ca, str) and len(raw_ca.strip()) >= 10:
+            try:
+                parsed = date.fromisoformat(raw_ca.strip()[:10])
+            except ValueError:
+                parsed = None
+        elif isinstance(raw_ca, date):
+            parsed = raw_ca.date() if callable(getattr(raw_ca, "date", None)) else raw_ca
+    if parsed is None:
+        return None
+    if today_date is not None:
+        # Preserve unit tests with synthetic past selected dates vs wall-clock created_at.
+        if not raw_cd and parsed > today_date + timedelta(days=1):
+            return None
+        return min(parsed, today_date)
+    return parsed
+
+
 def evaluate_local_habit_status(
     habit: dict[str, Any],
     target_date_iso: str,
@@ -261,9 +291,12 @@ def evaluate_local_habit_status(
     scheduled = bool(habit.get("scheduled_today", True))
 
     if completed:
-        if mode in ("strict", "window") and is_late:
+        if is_late:
             return ("late_makeup", violation_reason, False, True)
         return ("on_time", None, False, False)
+
+    if not habit.get("can_edit", True):
+        return ("pending", None, False, False)
 
     if not scheduled or target_date_iso > today_iso:
         return (
@@ -368,6 +401,20 @@ def format_reminder_badge(habit: dict[str, Any]) -> str | None:
     if len(times) <= 2:
         return f"{prefix} {', '.join(times)}"
     return f"{prefix} {times[0]}, {times[1]} (+{len(times) - 2})"
+
+
+def format_companion_reminder_badge(habit: dict[str, Any]) -> str | None:
+    """Return a non-redundant reminder/alarm badge when paired with format_habit_mode_summary."""
+    times = effective_habit_reminder_times(habit)
+    if not times:
+        return None
+    mode = habit.get("mode") or "free"
+    if mode in ("strict", "window"):
+        norm_remind = normalize_hhmm(str(habit.get("remind_time") or ""))
+        extra_times = [t for t in times if t != norm_remind]
+        if not extra_times:
+            return "⏰ Alarm" if habit.get("reminder_mode") == "alarm" else None
+    return format_reminder_badge(habit)
 
 
 def find_due_habit_reminders(
@@ -1514,7 +1561,7 @@ class HabitTrackerApp:
     # Reminders & Alarms Runtime Engine + Center Dialog
     # -----------------------------------------------------------------------
     def _build_reminder_badge_chip(self, habit: dict[str, Any]) -> ft.Control | None:
-        badge_text = format_reminder_badge(habit)
+        badge_text = format_companion_reminder_badge(habit)
         if not badge_text:
             return None
         is_alarm = habit.get("reminder_mode") == "alarm"
@@ -2069,18 +2116,29 @@ class HabitTrackerApp:
     # Tab 1: Today's Routine & Check-ins
     # -----------------------------------------------------------------------
     def _build_today_view(self) -> ft.Control:
-        is_today = self.selected_date == date.today()
+        today_obj = date.today()
+        is_today = self.selected_date == today_obj
         date_title = (
             "Today"
             if is_today
             else self.selected_date.strftime("%a, %b %d, %Y")
         )
+        created_dates = [
+            d
+            for h in self.today_habits
+            if (d := extract_local_created_date(h, today_obj)) is not None
+        ]
+        earliest_created = min(created_dates) if created_dates else None
+        can_prev = earliest_created is None or self.selected_date > earliest_created
 
         async def shift_date(delta: int) -> None:
             new_date = self.selected_date + timedelta(days=delta)
-            if new_date <= date.today():
-                self.selected_date = new_date
-                self._activate_current_view()
+            if new_date > today_obj:
+                return
+            if earliest_created is not None and new_date < earliest_created:
+                return
+            self.selected_date = new_date
+            self._activate_current_view()
 
         async def prev_day(_e: Any) -> None:
             await shift_date(-1)
@@ -2088,13 +2146,53 @@ class HabitTrackerApp:
         async def next_day(_e: Any) -> None:
             await shift_date(1)
 
+        async def jump_today(_e: Any) -> None:
+            if self.selected_date != today_obj:
+                self.selected_date = today_obj
+                self._activate_current_view()
+
+        def open_date_picker(_e: Any) -> None:
+            def on_date_picked(ev: Any) -> None:
+                picked = getattr(ev.control, "value", None)
+                if picked is None:
+                    return
+                picked_date = (
+                    picked.date()
+                    if isinstance(picked, date) and callable(getattr(picked, "date", None))
+                    else picked
+                )
+                if picked_date > today_obj:
+                    picked_date = today_obj
+                if earliest_created is not None and picked_date < earliest_created:
+                    picked_date = earliest_created
+                if picked_date != self.selected_date:
+                    self.selected_date = picked_date
+                    self._activate_current_view()
+
+            picker = ft.DatePicker(
+                value=self.selected_date,
+                first_date=earliest_created or (today_obj - timedelta(days=365)),
+                last_date=today_obj,
+                current_date=today_obj,
+                help_text="Jump to date",
+                on_change=on_date_picked,
+            )
+            open_dialog(self.page, picker)
+
         now_dt = datetime.now()
         today_iso = now_dt.date().isoformat()
         now_hhmm = now_dt.strftime("%H:%M")
         selected_iso = self.selected_date.isoformat()
 
+        def _is_item_editable(h: dict[str, Any]) -> bool:
+            if not h.get("can_edit", True):
+                return False
+            created_d = extract_local_created_date(h, now_dt.date())
+            return created_d is None or self.selected_date >= created_d
+
         scheduled_items = [h for h in self.today_habits if h.get("scheduled_today")]
         extra_items = [h for h in self.today_habits if not h.get("scheduled_today")]
+        progress_items = [h for h in scheduled_items if _is_item_editable(h)]
         eval_by_id: dict[str, tuple[str, str | None, bool, bool]] = {
             str(h["id"]): evaluate_local_habit_status(
                 h, selected_iso, today_iso, now_hhmm
@@ -2103,64 +2201,80 @@ class HabitTrackerApp:
         }
         done_count = sum(
             1
-            for h in scheduled_items
+            for h in progress_items
             if eval_by_id[str(h["id"])][0] == "on_time"
         )
         late_count = sum(
             1
-            for h in scheduled_items
+            for h in progress_items
             if eval_by_id[str(h["id"])][0] == "late_makeup"
         )
         violation_count = sum(
             1
-            for h in scheduled_items
+            for h in progress_items
             if eval_by_id[str(h["id"])][0] == "violation"
         )
         reminding_items = [
             h
-            for h in scheduled_items
+            for h in progress_items
             if eval_by_id[str(h["id"])][0] == "reminding"
         ]
         violated_items = [
             h
-            for h in scheduled_items
+            for h in progress_items
             if eval_by_id[str(h["id"])][0] == "violation"
         ]
-        total_sched = len(scheduled_items)
+        total_sched = len(progress_items)
         progress_val = (done_count / total_sched) if total_sched > 0 else 0.0
+
+        date_nav_controls: list[ft.Control] = [
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
+                disabled=not can_prev,
+                on_click=prev_day,
+                tooltip="Previous day",
+            ),
+            ft.Column(
+                [
+                    ft.Text(
+                        date_title,
+                        size=22,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    ft.Text(
+                        self.selected_date.isoformat(),
+                        size=12,
+                        color=ft.Colors.BLUE_GREY_500,
+                    ),
+                ],
+                spacing=2,
+            ),
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_RIGHT_ROUNDED,
+                disabled=is_today,
+                on_click=next_day,
+                tooltip="Next day",
+            ),
+            ft.IconButton(
+                icon=ft.Icons.CALENDAR_MONTH_ROUNDED,
+                on_click=open_date_picker,
+                tooltip="Jump to date",
+            ),
+        ]
+        if not is_today:
+            date_nav_controls.append(
+                ft.TextButton(
+                    content=ft.Text("Today"),
+                    on_click=jump_today,
+                )
+            )
 
         header_row = ft.Row(
             [
                 ft.Row(
-                    [
-                        ft.IconButton(
-                            icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
-                            on_click=prev_day,
-                            tooltip="Previous day",
-                        ),
-                        ft.Column(
-                            [
-                                ft.Text(
-                                    date_title,
-                                    size=22,
-                                    weight=ft.FontWeight.BOLD,
-                                ),
-                                ft.Text(
-                                    self.selected_date.isoformat(),
-                                    size=12,
-                                    color=ft.Colors.BLUE_GREY_500,
-                                ),
-                            ],
-                            spacing=2,
-                        ),
-                        ft.IconButton(
-                            icon=ft.Icons.CHEVRON_RIGHT_ROUNDED,
-                            disabled=is_today,
-                            on_click=next_day,
-                            tooltip="Next day",
-                        ),
-                    ],
+                    date_nav_controls,
                     spacing=4,
+                    wrap=True,
                 ),
                 ft.FilledButton(
                     icon=ft.Icons.ADD_ROUNDED,
@@ -2338,8 +2452,14 @@ class HabitTrackerApp:
         today_iso = now_dt.date().isoformat()
         now_hhmm = now_dt.strftime("%H:%M")
         target_iso = item.get("date") or self.selected_date.isoformat()
+        created_d = extract_local_created_date(item, now_dt.date())
+        can_edit = bool(item.get("can_edit", True)) and (
+            created_d is None or date.fromisoformat(target_iso) >= created_d
+        )
         day_status, violation_reason, can_start, is_late = (
-            evaluate_local_habit_status(item, target_iso, today_iso, now_hhmm)
+            evaluate_local_habit_status(
+                {**item, "can_edit": can_edit}, target_iso, today_iso, now_hhmm
+            )
         )
 
         async def do_checkin(action: str) -> None:
@@ -2407,55 +2527,88 @@ class HabitTrackerApp:
             )
         ]
 
-        if target > 1 and count > 0 and not can_start:
-            controls_right.append(
-                ft.IconButton(
-                    icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
-                    icon_size=22,
-                    tooltip="Decrease count",
-                    on_click=on_decrement,
-                )
+        if not can_edit:
+            created_lbl = (
+                created_d.isoformat()
+                if created_d is not None
+                else str(item.get("created_date") or "")
             )
-
-        if can_start:
             controls_right.append(
-                ft.FilledButton(
-                    content=ft.Text("Start Execution"),
-                    icon=ft.Icons.PLAY_ARROW_ROUNDED,
-                    on_click=on_start_tap,
-                )
-            )
-        elif day_status == "violation":
-            controls_right.append(
-                ft.FilledButton(
-                    content=ft.Text("Overdue Make-up"),
-                    icon=ft.Icons.HISTORY_ROUNDED,
-                    style=ft.ButtonStyle(bgcolor="#DC2626", color=ft.Colors.WHITE),
-                    on_click=on_primary_tap,
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                    border_radius=8,
+                    bgcolor="#F1F5F9",
+                    content=ft.Text(
+                        f"Created {created_lbl}" if created_lbl else "Not started yet",
+                        size=11,
+                        weight=ft.FontWeight.W_600,
+                        color="#64748B",
+                    ),
                 )
             )
         else:
             controls_right.append(
                 ft.IconButton(
-                    icon=(
-                        ft.Icons.CHECK_CIRCLE_ROUNDED
-                        if completed
-                        else (
-                            ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
-                            if target > 1
-                            else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
-                        )
-                    ),
+                    icon=ft.Icons.EDIT_NOTE_ROUNDED,
+                    icon_size=22,
                     icon_color=(
-                        "#D97706"
-                        if is_late
-                        else (color if completed else ft.Colors.BLUE_GREY_400)
+                        "#4F46E5" if item.get("note") else ft.Colors.BLUE_GREY_400
                     ),
-                    icon_size=30,
-                    tooltip="Check in",
-                    on_click=on_primary_tap,
+                    tooltip="Edit check-in",
+                    on_click=lambda _e, target_item=item, dt_iso=target_iso: self._open_checkin_edit_dialog(
+                        target_item, dt_iso
+                    ),
                 )
             )
+            if target > 1 and count > 0 and not can_start:
+                controls_right.append(
+                    ft.IconButton(
+                        icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
+                        icon_size=22,
+                        tooltip="Decrease count",
+                        on_click=on_decrement,
+                    )
+                )
+
+            if can_start:
+                controls_right.append(
+                    ft.FilledButton(
+                        content=ft.Text("Start Execution"),
+                        icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                        on_click=on_start_tap,
+                    )
+                )
+            elif day_status == "violation":
+                controls_right.append(
+                    ft.FilledButton(
+                        content=ft.Text("Overdue Make-up"),
+                        icon=ft.Icons.HISTORY_ROUNDED,
+                        style=ft.ButtonStyle(bgcolor="#DC2626", color=ft.Colors.WHITE),
+                        on_click=on_primary_tap,
+                    )
+                )
+            else:
+                controls_right.append(
+                    ft.IconButton(
+                        icon=(
+                            ft.Icons.CHECK_CIRCLE_ROUNDED
+                            if completed
+                            else (
+                                ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED
+                                if target > 1
+                                else ft.Icons.RADIO_BUTTON_UNCHECKED_ROUNDED
+                            )
+                        ),
+                        icon_color=(
+                            "#D97706"
+                            if is_late
+                            else (color if completed else ft.Colors.BLUE_GREY_400)
+                        ),
+                        icon_size=30,
+                        tooltip="Check in",
+                        on_click=on_primary_tap,
+                    )
+                )
 
         subtitle_parts = []
         mode_summary = format_habit_mode_summary(item)
@@ -2478,6 +2631,8 @@ class HabitTrackerApp:
             subtitle_parts.append(f"{count} / {target} today")
         if item.get("description"):
             subtitle_parts.append(item["description"])
+        if item.get("note"):
+            subtitle_parts.append(f"Note: {item['note']}")
         subtitle = " • ".join(subtitle_parts)
         reminder_badge = self._build_reminder_badge_chip(item)
         title_controls: list[ft.Control] = [
@@ -3082,11 +3237,13 @@ class HabitTrackerApp:
             subtitle_parts.append(mode_summary)
         if target > 1:
             subtitle_parts.append(f"{count} / {target}")
-        rem_badge = format_reminder_badge(item)
+        rem_badge = format_companion_reminder_badge(item)
         if rem_badge:
             subtitle_parts.append(rem_badge)
         if item.get("description"):
             subtitle_parts.append(item["description"])
+        if item.get("note"):
+            subtitle_parts.append(f"Note: {item['note']}")
         subtitle = " • ".join(p for p in subtitle_parts if p)
 
         right_controls: list[ft.Control] = []
@@ -3116,6 +3273,19 @@ class HabitTrackerApp:
                 )
             )
         else:
+            right_controls.append(
+                ft.IconButton(
+                    icon=ft.Icons.EDIT_NOTE_ROUNDED,
+                    icon_size=20,
+                    icon_color=(
+                        "#4F46E5" if item.get("note") else ft.Colors.BLUE_GREY_400
+                    ),
+                    tooltip="Edit check-in",
+                    on_click=lambda _e, target_item=item, dt_iso=target_date: self._open_checkin_edit_dialog(
+                        target_item, dt_iso
+                    ),
+                )
+            )
             if target > 1 and count > 0 and not needs_strict_start:
                 right_controls.append(
                     ft.IconButton(
@@ -3285,7 +3455,10 @@ class HabitTrackerApp:
             except ApiError as err:
                 show_toast(self.page, err.message, is_error=True)
 
-        rem_badge = format_reminder_badge(habit)
+        async def view_history(_e: Any) -> None:
+            await self._open_habit_history_dialog(habit)
+
+        rem_badge = format_companion_reminder_badge(habit)
         mode_summary = format_habit_mode_summary(habit)
         manage_meta = (
             f"{freq} • Goal: {habit.get('target_per_day', 1)}/{goal_unit} "
@@ -3332,6 +3505,11 @@ class HabitTrackerApp:
                     ft.Row(
                         [
                             ft.IconButton(
+                                icon=ft.Icons.HISTORY_ROUNDED,
+                                tooltip="Check-in history",
+                                on_click=view_history,
+                            ),
+                            ft.IconButton(
                                 icon=ft.Icons.EDIT_OUTLINED,
                                 tooltip="Edit habit",
                                 on_click=lambda _e, h=habit: self._open_habit_dialog(h),
@@ -3361,6 +3539,10 @@ class HabitTrackerApp:
 
     def _open_habit_dialog(self, existing: dict[str, Any] | None = None) -> None:
         is_edit = existing is not None
+        page_w = int(self.page.width or 900)
+        dialog_width = 480 if page_w >= 560 else max(310, page_w - 40)
+        is_compact_dialog = dialog_width < 420
+
         initial_freq = existing.get("frequency_type", "daily") if existing else "daily"
         if initial_freq not in ("daily", "weekdays", "monthly"):
             initial_freq = "daily"
@@ -3413,14 +3595,18 @@ class HabitTrackerApp:
             str(existing.get("force_end_time") or "") if existing else ""
         )
 
+        err_label = ft.Text("", color=ft.Colors.RED_600, size=12, visible=False)
+
         title_field = ft.TextField(
             label="Habit Title",
             value=existing["title"] if existing else "",
             hint_text="e.g., Read 20 pages, Pay rent, Monthly review",
+            dense=True,
         )
         desc_field = ft.TextField(
             label="Notes / Motivation (optional)",
             value=existing.get("description", "") if existing else "",
+            dense=True,
         )
         target_field = ft.TextField(
             label=(
@@ -3430,46 +3616,116 @@ class HabitTrackerApp:
             ),
             value=str(existing.get("target_per_day", 1)) if existing else "1",
             keyboard_type=ft.KeyboardType.NUMBER,
+            dense=True,
+            expand=True,
         )
         slo_field = ft.TextField(
             label="Target SLO (%)",
             value=str(existing.get("target_slo", 85.0)) if existing else "85.0",
             keyboard_type=ft.KeyboardType.NUMBER,
             hint_text="e.g., 85, 90, 95",
+            dense=True,
+            expand=True,
+        )
+        target_slo_row: ft.Control = (
+            ft.Column([target_field, slo_field], spacing=10, tight=True)
+            if is_compact_dialog
+            else ft.Row([target_field, slo_field], spacing=12)
         )
 
         selected_color = existing.get("color", "#6366F1") if existing else "#6366F1"
         color_dropdown = ft.Dropdown(
             label="Accent Color",
             value=selected_color,
+            dense=True,
             options=[
                 ft.dropdown.Option(key=hex_code, text=label)
                 for hex_code, label in COLOR_SWATCHES
             ],
         )
 
-        initial_weekdays = set(
-            existing.get("weekdays", [0, 1, 2, 3, 4, 5, 6])
-            if existing
-            else [0, 1, 2, 3, 4, 5, 6]
-        )
-        day_checks = [
-            ft.Checkbox(label=WEEKDAY_LABELS[i], value=(i in initial_weekdays))
-            for i in range(7)
-        ]
-        weekdays_section = ft.Column(
-            [
-                ft.Text("Schedule Days:", size=13, weight=ft.FontWeight.BOLD),
-                ft.Row(day_checks, wrap=True, spacing=6),
-            ],
-            tight=True,
-            spacing=6,
+        selected_weekdays_state: set[int] = {
+            int(d)
+            for d in (
+                existing.get("weekdays", [0, 1, 2, 3, 4, 5, 6])
+                if existing
+                else [0, 1, 2, 3, 4, 5, 6]
+            )
+            if 0 <= int(d) <= 6
+        }
+        weekday_presets_row = ft.Row([], wrap=True, spacing=8, run_spacing=6)
+        weekday_chips_row = ft.Row([], wrap=True, spacing=6, run_spacing=6)
+
+        def rebuild_weekday_chips() -> None:
+            weekday_presets_row.controls = [
+                ft.Chip(
+                    label=ft.Text("Weekdays", size=12),
+                    selected=(selected_weekdays_state == {0, 1, 2, 3, 4}),
+                    show_checkmark=False,
+                    on_select=lambda _e: apply_weekday_preset({0, 1, 2, 3, 4}),
+                ),
+                ft.Chip(
+                    label=ft.Text("Weekends", size=12),
+                    selected=(selected_weekdays_state == {5, 6}),
+                    show_checkmark=False,
+                    on_select=lambda _e: apply_weekday_preset({5, 6}),
+                ),
+            ]
+            weekday_chips_row.controls = [
+                ft.Chip(
+                    label=ft.Text(WEEKDAY_LABELS[i], size=12),
+                    selected=(i in selected_weekdays_state),
+                    show_checkmark=False,
+                    on_select=lambda _e, day_idx=i: toggle_weekday(day_idx),
+                )
+                for i in range(7)
+            ]
+
+        def apply_weekday_preset(preset_days: set[int]) -> None:
+            selected_weekdays_state.clear()
+            selected_weekdays_state.update(preset_days)
+            err_label.visible = False
+            rebuild_weekday_chips()
+            self.page.update()
+
+        def toggle_weekday(day_idx: int) -> None:
+            if day_idx in selected_weekdays_state:
+                selected_weekdays_state.remove(day_idx)
+            else:
+                selected_weekdays_state.add(day_idx)
+            err_label.visible = False
+            rebuild_weekday_chips()
+            self.page.update()
+
+        rebuild_weekday_chips()
+        weekdays_section = ft.Container(
+            padding=12,
+            border_radius=12,
+            bgcolor="#F8FAFC",
+            border=ft.Border.all(1, "#E2E8F0"),
             visible=(initial_freq == "weekdays"),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Schedule Days",
+                        size=12,
+                        weight=ft.FontWeight.W_600,
+                        color=ft.Colors.BLUE_GREY_800,
+                    ),
+                    weekday_presets_row,
+                    weekday_chips_row,
+                ],
+                tight=True,
+                spacing=8,
+            ),
         )
 
         monthly_day_field = ft.TextField(
             value=str(initial_monthly_day),
             keyboard_type=ft.KeyboardType.NUMBER,
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
             visible=(initial_mode in ("from_start", "from_end")),
         )
 
@@ -3488,6 +3744,10 @@ class HabitTrackerApp:
         monthly_week_dropdown = ft.Dropdown(
             label="Week of Month",
             value=str(initial_monthly_week),
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
+            expand=True,
             options=[
                 ft.dropdown.Option(key="1", text="Week 1 (1st)"),
                 ft.dropdown.Option(key="2", text="Week 2 (2nd)"),
@@ -3500,16 +3760,28 @@ class HabitTrackerApp:
         monthly_weekday_dropdown = ft.Dropdown(
             label="Day of Week",
             value=str(initial_monthly_weekday),
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
+            expand=True,
             options=[
                 ft.dropdown.Option(key=str(i), text=name)
                 for i, name in enumerate(WEEKDAY_FULL_NAMES)
             ],
         )
-        nth_weekday_row = ft.Column(
-            [monthly_week_dropdown, monthly_weekday_dropdown],
-            tight=True,
-            spacing=10,
-            visible=(initial_mode == "nth_weekday"),
+        nth_weekday_row: ft.Control = (
+            ft.Column(
+                [monthly_week_dropdown, monthly_weekday_dropdown],
+                tight=True,
+                spacing=10,
+                visible=(initial_mode == "nth_weekday"),
+            )
+            if is_compact_dialog
+            else ft.Row(
+                [monthly_week_dropdown, monthly_weekday_dropdown],
+                spacing=10,
+                visible=(initial_mode == "nth_weekday"),
+            )
         )
 
         def on_monthly_mode_change(_e: Any) -> None:
@@ -3522,6 +3794,9 @@ class HabitTrackerApp:
         monthly_mode_dropdown = ft.Dropdown(
             label="Monthly Rule",
             value=initial_mode,
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
             options=[
                 ft.dropdown.Option(
                     key="from_start", text="From start of month (Day 1–31)"
@@ -3535,11 +3810,17 @@ class HabitTrackerApp:
             ],
             on_select=on_monthly_mode_change,
         )
-        monthly_section = ft.Column(
-            [monthly_mode_dropdown, monthly_day_field, nth_weekday_row],
-            tight=True,
-            spacing=10,
+        monthly_section = ft.Container(
+            padding=12,
+            border_radius=12,
+            bgcolor="#F8FAFC",
+            border=ft.Border.all(1, "#E2E8F0"),
             visible=(initial_freq == "monthly"),
+            content=ft.Column(
+                [monthly_mode_dropdown, monthly_day_field, nth_weekday_row],
+                tight=True,
+                spacing=10,
+            ),
         )
 
         def on_schedule_change(_e: Any) -> None:
@@ -3556,10 +3837,11 @@ class HabitTrackerApp:
         schedule_dropdown = ft.Dropdown(
             label="Schedule Frequency",
             value=initial_freq,
+            dense=True,
             options=[
                 ft.dropdown.Option(key="daily", text="Daily (Every day)"),
-                ft.dropdown.Option(key="weekdays", text="Weekly (Specific weekdays)"),
-                ft.dropdown.Option(key="monthly", text="Monthly Routine Job"),
+                ft.dropdown.Option(key="weekdays", text="Weekly (Selected days)"),
+                ft.dropdown.Option(key="monthly", text="Monthly Routine"),
             ],
             on_select=on_schedule_change,
         )
@@ -3570,25 +3852,65 @@ class HabitTrackerApp:
         init_start_12, init_start_mer = split_24h_to_12h(initial_mode_start, "AM")
         init_end_12, init_end_mer = split_24h_to_12h(initial_mode_end, "PM")
 
-        def make_meridiem_dropdown(label: str, value: str) -> ft.Dropdown:
-            return ft.Dropdown(
-                label=label,
-                value=value if value in ("AM", "PM") else "AM",
-                width=96,
-                options=[
-                    ft.dropdown.Option(key="AM", text="AM"),
-                    ft.dropdown.Option(key="PM", text="PM"),
-                ],
-            )
+        class _MeridiemToggle:
+            def __init__(self, name: str, initial: str = "AM") -> None:
+                self.name = name
+                self.value = initial if initial in ("AM", "PM") else "AM"
+                self._pills: dict[str, tuple[ft.Container, ft.Text]] = {}
+                pill_controls: list[ft.Control] = []
+                for opt in ("AM", "PM"):
+                    txt = ft.Text(opt, size=12)
+                    pill = ft.Container(
+                        width=40,
+                        height=36,
+                        border_radius=7,
+                        alignment=ft.Alignment.CENTER,
+                        data={"meridiem_option": opt, "group": name},
+                        content=txt,
+                        on_click=lambda _e, target_opt=opt: self.set_value(
+                            target_opt, notify=True
+                        ),
+                    )
+                    self._pills[opt] = (pill, txt)
+                    pill_controls.append(pill)
+                self.control = ft.Container(
+                    padding=3,
+                    border_radius=10,
+                    bgcolor="#F1F5F9",
+                    border=ft.Border.all(1, "#CBD5E1"),
+                    data={"role": "meridiem", "name": name, "toggle": self},
+                    content=ft.Row(pill_controls, spacing=2, tight=True),
+                )
+                self._sync_styles()
+
+            def _sync_styles(self) -> None:
+                for opt, (pill, txt) in self._pills.items():
+                    active = self.value == opt
+                    pill.bgcolor = "#4F46E5" if active else ft.Colors.TRANSPARENT
+                    txt.weight = (
+                        ft.FontWeight.BOLD if active else ft.FontWeight.W_600
+                    )
+                    txt.color = (
+                        ft.Colors.WHITE if active else ft.Colors.BLUE_GREY_600
+                    )
+
+            def set_value(self, next_val: str, notify: bool = False) -> None:
+                self.value = "PM" if str(next_val).upper() == "PM" else "AM"
+                self._sync_styles()
+                if notify:
+                    err_label.visible = False
+                    app_page.update()
+
+        app_page = self.page
 
         def open_mode_time_picker(
             field: ft.TextField,
-            meridiem_dd: ft.Dropdown,
+            meridiem_toggle: _MeridiemToggle,
             default_hhmm: str,
             help_text: str,
         ) -> None:
             resolved = (
-                resolve_time_with_meridiem(field.value, meridiem_dd.value)
+                resolve_time_with_meridiem(field.value, meridiem_toggle.value)
                 or default_hhmm
             )
             parts = resolved.split(":")
@@ -3601,7 +3923,7 @@ class HabitTrackerApp:
                         f"{picked.hour:02d}:{picked.minute:02d}", "AM"
                     )
                     field.value = h12_mm
-                    meridiem_dd.value = mer
+                    meridiem_toggle.set_value(mer)
                     err_label.visible = False
                     self.page.update()
 
@@ -3613,105 +3935,138 @@ class HabitTrackerApp:
             )
             open_dialog(self.page, picker)
 
-        remind_time_field = ft.TextField(
-            label="Remind Time (HH:MM)",
-            value=init_remind_12,
-            hint_text="e.g. 09:00",
-            expand=True,
-        )
-        remind_meridiem_dropdown = make_meridiem_dropdown(
-            "Remind AM/PM", init_remind_mer
-        )
-        remind_time_row = ft.Row(
-            [
-                remind_time_field,
-                remind_meridiem_dropdown,
-                ft.IconButton(
-                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
-                    tooltip="Pick Remind Time",
-                    on_click=lambda _e: open_mode_time_picker(
-                        remind_time_field,
-                        remind_meridiem_dropdown,
-                        "09:00",
-                        "Pick remind time",
+        def build_mode_time_block(
+            title_text: str,
+            step_text: str,
+            field_key: str,
+            initial_val: str,
+            hint_val: str,
+            meridiem_name: str,
+            initial_meridiem: str,
+            default_picker_hhmm: str,
+            picker_tooltip: str,
+            picker_help: str,
+            visible: bool = True,
+        ) -> tuple[ft.Column, ft.TextField, _MeridiemToggle]:
+            field = ft.TextField(
+                value=initial_val,
+                hint_text=hint_val,
+                data=field_key,
+                dense=True,
+                filled=True,
+                fill_color=ft.Colors.WHITE,
+                content_padding=ft.Padding.symmetric(horizontal=12, vertical=10),
+                expand=True,
+                visible=visible,
+            )
+            meridiem_toggle = _MeridiemToggle(meridiem_name, initial_meridiem)
+            block = ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(
+                                title_text,
+                                size=12,
+                                weight=ft.FontWeight.W_600,
+                                color=ft.Colors.BLUE_GREY_800,
+                            ),
+                            ft.Text(
+                                step_text,
+                                size=11,
+                                color=ft.Colors.BLUE_GREY_500,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
-                ),
-            ],
-            spacing=6,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
+                    ft.Row(
+                        [
+                            field,
+                            meridiem_toggle.control,
+                            ft.IconButton(
+                                icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                                icon_size=20,
+                                tooltip=picker_tooltip,
+                                bgcolor=ft.Colors.WHITE,
+                                style=ft.ButtonStyle(
+                                    shape=ft.RoundedRectangleBorder(radius=10)
+                                ),
+                                on_click=lambda _e: open_mode_time_picker(
+                                    field,
+                                    meridiem_toggle,
+                                    default_picker_hhmm,
+                                    picker_help,
+                                ),
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                tight=True,
+                spacing=5,
+                visible=visible,
+            )
+            return block, field, meridiem_toggle
 
-        force_start_time_field = ft.TextField(
-            label="Force Start Time (HH:MM)",
-            value=init_start_12,
-            hint_text="e.g. 09:15",
-            expand=True,
-            visible=(initial_habit_mode == "strict"),
+        remind_time_block, remind_time_field, remind_meridiem_toggle = (
+            build_mode_time_block(
+                title_text="Remind Time",
+                step_text="Alert trigger",
+                field_key="Remind Time (HH:MM)",
+                initial_val=init_remind_12,
+                hint_val="09:00",
+                meridiem_name="Remind AM/PM",
+                initial_meridiem=init_remind_mer,
+                default_picker_hhmm="09:00",
+                picker_tooltip="Pick Remind Time",
+                picker_help="Pick remind time",
+                visible=True,
+            )
         )
-        start_meridiem_dropdown = make_meridiem_dropdown(
-            "Start AM/PM", init_start_mer
+        force_start_time_block, force_start_time_field, start_meridiem_toggle = (
+            build_mode_time_block(
+                title_text="Force Start Time",
+                step_text="Must start by",
+                field_key="Force Start Time (HH:MM)",
+                initial_val=init_start_12,
+                hint_val="09:15",
+                meridiem_name="Start AM/PM",
+                initial_meridiem=init_start_mer,
+                default_picker_hhmm="09:15",
+                picker_tooltip="Pick Force Start Time",
+                picker_help="Pick force start time",
+                visible=(initial_habit_mode == "strict"),
+            )
         )
-        force_start_time_row = ft.Row(
-            [
-                force_start_time_field,
-                start_meridiem_dropdown,
-                ft.IconButton(
-                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
-                    tooltip="Pick Force Start Time",
-                    on_click=lambda _e: open_mode_time_picker(
-                        force_start_time_field,
-                        start_meridiem_dropdown,
-                        "09:15",
-                        "Pick force start time",
-                    ),
-                ),
-            ],
-            spacing=6,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            visible=(initial_habit_mode == "strict"),
-        )
-
-        force_end_time_field = ft.TextField(
-            label="Force End Time (HH:MM)",
-            value=init_end_12,
-            hint_text="e.g. 10:30",
-            expand=True,
-            visible=(initial_habit_mode in ("strict", "window")),
-        )
-        end_meridiem_dropdown = make_meridiem_dropdown("End AM/PM", init_end_mer)
-        force_end_time_row = ft.Row(
-            [
-                force_end_time_field,
-                end_meridiem_dropdown,
-                ft.IconButton(
-                    icon=ft.Icons.ACCESS_TIME_ROUNDED,
-                    tooltip="Pick Force End Time",
-                    on_click=lambda _e: open_mode_time_picker(
-                        force_end_time_field,
-                        end_meridiem_dropdown,
-                        "10:30",
-                        "Pick force end time",
-                    ),
-                ),
-            ],
-            spacing=6,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            visible=(initial_habit_mode in ("strict", "window")),
+        force_end_time_block, force_end_time_field, end_meridiem_toggle = (
+            build_mode_time_block(
+                title_text="Force End Time",
+                step_text="Must finish by",
+                field_key="Force End Time (HH:MM)",
+                initial_val=init_end_12,
+                hint_val="10:30",
+                meridiem_name="End AM/PM",
+                initial_meridiem=init_end_mer,
+                default_picker_hhmm="10:30",
+                picker_tooltip="Pick Force End Time",
+                picker_help="Pick force end time",
+                visible=(initial_habit_mode in ("strict", "window")),
+            )
         )
 
         mode_hint_text = ft.Text(
             HABIT_MODE_HINTS.get(initial_habit_mode, ""),
-            size=11,
+            size=12,
             color=ft.Colors.ON_SURFACE_VARIANT,
         )
         strict_window_times_col = ft.Column(
             [
-                remind_time_row,
-                force_start_time_row,
-                force_end_time_row,
+                remind_time_block,
+                force_start_time_block,
+                force_end_time_block,
             ],
             tight=True,
-            spacing=8,
+            spacing=12,
             visible=(initial_habit_mode in ("strict", "window")),
         )
 
@@ -3739,33 +4094,54 @@ class HabitTrackerApp:
             str(existing.get("reminder_message") or "") if existing else ""
         )
 
-        reminder_times_row = ft.Row([], wrap=True, spacing=6, run_spacing=6)
+        reminder_times_row = ft.Row([], wrap=True, spacing=8, run_spacing=8)
         preset_chips_row = ft.Row([], wrap=True, spacing=6, run_spacing=6)
         custom_time_input = ft.TextField(
-            label="Add Time (HH:MM)",
-            hint_text="e.g. 08:30",
+            hint_text="08:30 (HH:MM)",
+            data="Add Time (HH:MM)",
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
+            content_padding=ft.Padding.symmetric(horizontal=12, vertical=10),
             expand=True,
         )
-        custom_time_meridiem_dropdown = make_meridiem_dropdown("Add Time AM/PM", "AM")
+        custom_time_meridiem = _MeridiemToggle("Add Time AM/PM", "AM")
         reminder_mode_dropdown = ft.Dropdown(
             label="Reminder Style",
             value=initial_reminder_mode,
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
+            expand=True,
             options=[
-                ft.dropdown.Option(key="notification", text="Notification Banner"),
-                ft.dropdown.Option(key="alarm", text="Alarm Ring (Dialog + Sound)"),
+                ft.dropdown.Option(key="notification", text="Notification 🔔"),
+                ft.dropdown.Option(key="alarm", text="Alarm Ring ⏰"),
             ],
         )
         snooze_dropdown = ft.Dropdown(
             label="Snooze Duration",
             value=str(initial_snooze),
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
+            width=None if is_compact_dialog else 155,
+            expand=is_compact_dialog,
             options=[
-                ft.dropdown.Option(key=str(m), text=f"{m} minutes")
+                ft.dropdown.Option(key=str(m), text=f"{m} min")
                 for m in snooze_choices
             ],
+        )
+        alert_delivery_row: ft.Control = (
+            ft.Column([reminder_mode_dropdown, snooze_dropdown], spacing=10, tight=True)
+            if is_compact_dialog
+            else ft.Row([reminder_mode_dropdown, snooze_dropdown], spacing=10)
         )
         reminder_msg_field = ft.TextField(
             label="Custom Reminder Message (optional)",
             value=initial_reminder_msg,
+            dense=True,
+            filled=True,
+            fill_color=ft.Colors.WHITE,
             max_length=160,
         )
 
@@ -3790,7 +4166,8 @@ class HabitTrackerApp:
                 ft.Chip(
                     label=ft.Text(format_hhmm_12h(preset)),
                     selected=(preset in reminder_times_state),
-                    on_click=(
+                    show_checkmark=False,
+                    on_select=(
                         lambda _e, t=preset: remove_reminder_time(t)
                         if t in reminder_times_state
                         else add_reminder_time(t)
@@ -3843,9 +4220,11 @@ class HabitTrackerApp:
                 err_label.visible = True
                 self.page.update()
                 return
-            if add_reminder_time(raw_val, meridiem=custom_time_meridiem_dropdown.value):
+            if add_reminder_time(raw_val, meridiem=custom_time_meridiem.value):
                 custom_time_input.value = ""
                 self.page.update()
+
+        custom_time_input.on_submit = on_add_custom_time
 
         def on_pick_clock_time(_e: Any) -> None:
             if reminder_times_state:
@@ -3869,11 +4248,22 @@ class HabitTrackerApp:
 
         multi_reminder_times_col = ft.Column(
             [
-                ft.Text(
-                    "Reminder Times",
-                    size=12,
-                    weight=ft.FontWeight.W_600,
-                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ft.Row(
+                    [
+                        ft.Text(
+                            "Scheduled Times",
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=ft.Colors.BLUE_GREY_800,
+                        ),
+                        ft.TextButton(
+                            icon=ft.Icons.ACCESS_TIME_ROUNDED,
+                            content=ft.Text("Pick Clock", size=12),
+                            on_click=on_pick_clock_time,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 reminder_times_row,
                 ft.Text(
@@ -3882,47 +4272,60 @@ class HabitTrackerApp:
                     color=ft.Colors.ON_SURFACE_VARIANT,
                 ),
                 preset_chips_row,
-                ft.Row(
+                ft.Column(
                     [
-                        custom_time_input,
-                        custom_time_meridiem_dropdown,
-                        ft.OutlinedButton(
-                            content=ft.Text("Add"),
-                            on_click=on_add_custom_time,
+                        ft.Text(
+                            "Add Custom Time",
+                            size=11,
+                            weight=ft.FontWeight.W_600,
+                            color=ft.Colors.BLUE_GREY_600,
                         ),
-                        ft.IconButton(
-                            icon=ft.Icons.ACCESS_TIME_ROUNDED,
-                            tooltip="Pick Clock Time",
-                            on_click=on_pick_clock_time,
+                        ft.Row(
+                            [
+                                custom_time_input,
+                                custom_time_meridiem.control,
+                                ft.FilledTonalButton(
+                                    content=ft.Text("Add"),
+                                    on_click=on_add_custom_time,
+                                ),
+                            ],
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                     ],
-                    spacing=6,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                    spacing=5,
                 ),
             ],
             tight=True,
-            spacing=8,
+            spacing=10,
             visible=(initial_habit_mode == "reminder"),
         )
 
-        mode_settings_section = ft.Column(
-            [
-                mode_hint_text,
-                strict_window_times_col,
-                multi_reminder_times_col,
-                ft.Text(
-                    "Alert Delivery (Notification & Alarm)",
-                    size=12,
-                    weight=ft.FontWeight.W_600,
-                    color=ft.Colors.ON_SURFACE_VARIANT,
-                ),
-                reminder_mode_dropdown,
-                snooze_dropdown,
-                reminder_msg_field,
-            ],
-            tight=True,
-            spacing=8,
+        mode_settings_section = ft.Container(
+            padding=14,
+            border_radius=12,
+            bgcolor="#F8FAFC",
+            border=ft.Border.all(1, "#E2E8F0"),
             visible=(initial_habit_mode != "free"),
+            content=ft.Column(
+                [
+                    mode_hint_text,
+                    strict_window_times_col,
+                    multi_reminder_times_col,
+                    ft.Divider(height=1, color="#E2E8F0"),
+                    ft.Text(
+                        "Alert Delivery",
+                        size=12,
+                        weight=ft.FontWeight.W_600,
+                        color=ft.Colors.BLUE_GREY_800,
+                    ),
+                    alert_delivery_row,
+                    reminder_msg_field,
+                ],
+                tight=True,
+                spacing=12,
+            ),
         )
 
         def on_habit_mode_change(_e: Any) -> None:
@@ -3932,12 +4335,12 @@ class HabitTrackerApp:
             strict_window_times_col.visible = m in ("strict", "window")
             multi_reminder_times_col.visible = m == "reminder"
             force_start_time_field.visible = m == "strict"
-            force_start_time_row.visible = m == "strict"
+            force_start_time_block.visible = m == "strict"
             force_end_time_field.visible = m in ("strict", "window")
-            force_end_time_row.visible = m in ("strict", "window")
+            force_end_time_block.visible = m in ("strict", "window")
             if m == "reminder":
                 resolved_r = resolve_time_with_meridiem(
-                    remind_time_field.value, remind_meridiem_dropdown.value
+                    remind_time_field.value, remind_meridiem_toggle.value
                 )
                 if resolved_r and not reminder_times_state:
                     reminder_times_state.append(resolved_r)
@@ -3949,23 +4352,24 @@ class HabitTrackerApp:
                     seed = reminder_times_state[0] if reminder_times_state else "09:00"
                     h12, mer = split_24h_to_12h(seed, "AM")
                     remind_time_field.value = h12
-                    remind_meridiem_dropdown.value = mer
+                    remind_meridiem_toggle.set_value(mer)
                 if m == "strict":
                     if not (force_start_time_field.value or "").strip():
                         force_start_time_field.value = "09:15"
-                        start_meridiem_dropdown.value = "AM"
+                        start_meridiem_toggle.set_value("AM")
                     if not (force_end_time_field.value or "").strip():
                         force_end_time_field.value = "10:30"
-                        end_meridiem_dropdown.value = "AM"
+                        end_meridiem_toggle.set_value("AM")
                 elif m == "window" and not (force_end_time_field.value or "").strip():
                     force_end_time_field.value = "09:00"
-                    end_meridiem_dropdown.value = "PM"
+                    end_meridiem_toggle.set_value("PM")
             err_label.visible = False
             self.page.update()
 
         habit_mode_dropdown = ft.Dropdown(
             label="Habit Mode",
             value=initial_habit_mode,
+            dense=True,
             options=[
                 ft.dropdown.Option(key=k, text=label)
                 for k, label in HABIT_MODE_OPTIONS
@@ -3974,7 +4378,6 @@ class HabitTrackerApp:
         )
         rebuild_reminder_chips()
 
-        err_label = ft.Text("", color=ft.Colors.RED_600, size=12, visible=False)
         dialog = ft.AlertDialog(modal=True)
 
         async def save_habit(_e: Any) -> None:
@@ -3987,7 +4390,7 @@ class HabitTrackerApp:
 
             freq_type = schedule_dropdown.value or "daily"
             if freq_type == "weekdays":
-                chosen_days = [i for i, cb in enumerate(day_checks) if cb.value]
+                chosen_days = sorted(selected_weekdays_state)
                 if not chosen_days:
                     err_label.value = "Pick at least one day of the week"
                     err_label.visible = True
@@ -4052,9 +4455,9 @@ class HabitTrackerApp:
                     remind_time_field.value,
                     force_start_time_field.value,
                     force_end_time_field.value,
-                    remind_meridiem=remind_meridiem_dropdown.value,
-                    start_meridiem=start_meridiem_dropdown.value,
-                    end_meridiem=end_meridiem_dropdown.value,
+                    remind_meridiem=remind_meridiem_toggle.value,
+                    start_meridiem=start_meridiem_toggle.value,
+                    end_meridiem=end_meridiem_toggle.value,
                 )
                 if mode_err:
                     err_label.value = mode_err
@@ -4067,7 +4470,7 @@ class HabitTrackerApp:
                 pending_time_raw = (custom_time_input.value or "").strip()
                 if pending_time_raw:
                     norm_pending = resolve_time_with_meridiem(
-                        pending_time_raw, custom_time_meridiem_dropdown.value
+                        pending_time_raw, custom_time_meridiem.value
                     )
                     if norm_pending is None:
                         err_label.value = "Reminder time must be HH:MM or H:MM AM/PM"
@@ -4124,6 +4527,9 @@ class HabitTrackerApp:
                     await self.api.update_habit(existing["id"], payload)
                     self._snoozed_alarms.pop(existing["id"], None)
                 else:
+                    now_create = datetime.now()
+                    payload["created_date"] = now_create.date().isoformat()
+                    payload["created_time"] = now_create.strftime("%H:%M")
                     await self.api.create_habit(payload)
                 close_dialog(self.page, dialog)
                 self._invalidate_tabs(range(5))
@@ -4136,13 +4542,12 @@ class HabitTrackerApp:
 
         dialog.title = ft.Text("Edit Habit" if is_edit else "New Habit")
         dialog.content = ft.Container(
-            width=380,
+            width=dialog_width,
             content=ft.Column(
                 [
                     title_field,
                     desc_field,
-                    target_field,
-                    slo_field,
+                    target_slo_row,
                     color_dropdown,
                     schedule_dropdown,
                     weekdays_section,
@@ -4153,7 +4558,7 @@ class HabitTrackerApp:
                     err_label,
                 ],
                 tight=True,
-                spacing=10,
+                spacing=14,
                 scroll=ft.ScrollMode.AUTO,
             ),
         )
@@ -4168,6 +4573,732 @@ class HabitTrackerApp:
             ),
         ]
         open_dialog(self.page, dialog)
+
+    def _open_checkin_edit_dialog(
+        self,
+        item: dict[str, Any],
+        target_date_iso: str,
+        on_saved: Any = None,
+    ) -> None:
+        hid = str(item.get("id") or item.get("habit_id") or "")
+        title = str(item.get("title") or "Habit")
+        target = max(1, int(item.get("target_per_day", 1)))
+        init_count = int(item.get("count", 0))
+        init_completed = bool(item.get("completed", False)) or init_count >= target
+        init_is_late = bool(item.get("is_late", False))
+        init_note = str(item.get("note") or "")
+        scheduled_flag = item.get("scheduled", item.get("scheduled_today", True))
+
+        page_w = int(self.page.width or 900)
+        dialog_width = 430 if page_w >= 520 else max(300, page_w - 40)
+
+        if init_completed and init_is_late:
+            initial_status = "late_makeup"
+        elif init_completed:
+            initial_status = "on_time"
+        else:
+            initial_status = "clear"
+
+        status_state = {"value": initial_status}
+        err_text = ft.Text("", color=ft.Colors.RED_600, size=12, visible=False)
+        count_field = ft.TextField(
+            label="Count",
+            value=str(init_count),
+            keyboard_type=ft.KeyboardType.NUMBER,
+            dense=True,
+            width=100,
+        )
+        note_field = ft.TextField(
+            label="Check-in Note (optional)",
+            value=init_note,
+            hint_text="Add a reflection or reason for edit",
+            max_length=300,
+            multiline=True,
+            max_lines=3,
+            dense=True,
+        )
+        status_chips_row = ft.Row([], wrap=True, spacing=8, run_spacing=8)
+
+        status_options = [
+            ("on_time", "On Time", "#DCFCE7"),
+            ("late_makeup", "Overdue Make-up", "#FEF3C7"),
+            ("clear", "Not Completed", "#E2E8F0"),
+        ]
+
+        def _parse_count_or_default(default_val: int = 0) -> int:
+            try:
+                return max(0, int((count_field.value or "").strip()))
+            except ValueError:
+                return default_val
+
+        def rebuild_status_chips() -> None:
+            status_chips_row.controls = [
+                ft.Chip(
+                    label=ft.Text(label, size=12),
+                    selected=(status_state["value"] == key),
+                    selected_color=sel_bg,
+                    show_checkmark=False,
+                    data={"status_option": key},
+                    on_select=lambda _e, chosen=key: on_status_select(chosen),
+                )
+                for key, label, sel_bg in status_options
+            ]
+
+        def on_status_select(chosen: str) -> None:
+            status_state["value"] = chosen
+            cur_count = _parse_count_or_default(0)
+            if chosen in ("on_time", "late_makeup") and cur_count < target:
+                count_field.value = str(target)
+            elif chosen == "clear" and cur_count >= target:
+                count_field.value = "0"
+            err_text.visible = False
+            rebuild_status_chips()
+            self.page.update()
+
+        def step_count(delta: int) -> None:
+            cur = _parse_count_or_default(0)
+            nxt = max(0, min(1000, cur + delta))
+            count_field.value = str(nxt)
+            if nxt >= target and status_state["value"] == "clear":
+                status_state["value"] = "on_time"
+            elif nxt < target and status_state["value"] != "clear":
+                status_state["value"] = "clear"
+            err_text.visible = False
+            rebuild_status_chips()
+            self.page.update()
+
+        def on_count_change(_e: Any) -> None:
+            raw = (count_field.value or "").strip()
+            if not raw:
+                return
+            try:
+                val = int(raw)
+            except ValueError:
+                return
+            if val >= target and status_state["value"] == "clear":
+                status_state["value"] = "on_time"
+                rebuild_status_chips()
+                self.page.update()
+            elif 0 <= val < target and status_state["value"] != "clear":
+                status_state["value"] = "clear"
+                rebuild_status_chips()
+                self.page.update()
+
+        count_field.on_change = on_count_change
+        rebuild_status_chips()
+
+        dialog = ft.AlertDialog(modal=True)
+        save_btn = ft.FilledButton(content=ft.Text("Save"))
+        clear_btn = ft.TextButton(
+            content=ft.Text("Clear Day", color=ft.Colors.RED_600),
+            visible=(init_count > 0 or bool(init_note)),
+        )
+
+        async def _submit_edit(
+            chosen_status: str,
+            count_val: int,
+            note_val: str,
+            toast_msg: str,
+        ) -> None:
+            save_btn.disabled = True
+            clear_btn.disabled = True
+            err_text.visible = False
+            self.page.update()
+            try:
+                updated = await self.api.checkin_habit(
+                    habit_id=hid,
+                    target_date=target_date_iso,
+                    action="edit",
+                    count=count_val,
+                    note=note_val,
+                    status_override=chosen_status,
+                )
+                close_dialog(self.page, dialog)
+                if on_saved is not None:
+                    self._invalidate_tabs({0, 1, 3, 4})
+                    res = on_saved(updated)
+                    if asyncio.iscoroutine(res):
+                        await res
+                    await self.refresh_current_tab(force=True)
+                    self.render_shell()
+                elif (
+                    self.selected_tab == 0
+                    and self.selected_date.isoformat() == target_date_iso
+                    and isinstance(updated, dict)
+                    and updated.get("id")
+                ):
+                    self.today_habits = [
+                        updated if h.get("id") == updated.get("id") else h
+                        for h in self.today_habits
+                    ]
+                    self._invalidate_tabs({1, 3, 4})
+                    self._tab_generations[0] = self._tab_generations.get(0, 0) + 1
+                    self._store_cache_entry(
+                        self._current_tab_key(0),
+                        self.today_habits,
+                        self._tab_generations[0],
+                    )
+                    self.render_shell()
+                else:
+                    self._invalidate_tabs({0, 1, 3, 4})
+                    await self.refresh_current_tab(force=True)
+                    self.render_shell()
+                show_toast(self.page, toast_msg)
+            except ApiError as err:
+                save_btn.disabled = False
+                clear_btn.disabled = False
+                err_text.value = err.message
+                err_text.visible = True
+                self.page.update()
+
+        async def handle_save(_e: Any) -> None:
+            raw_cnt = (count_field.value or "").strip()
+            try:
+                count_val = int(raw_cnt)
+            except ValueError:
+                err_text.value = "Count must be a non-negative integer"
+                err_text.visible = True
+                self.page.update()
+                return
+            if not (0 <= count_val <= 1000):
+                err_text.value = "Count must be between 0 and 1000"
+                err_text.visible = True
+                self.page.update()
+                return
+            chosen_status = status_state["value"]
+            if chosen_status in ("on_time", "late_makeup") and count_val < target:
+                err_text.value = f"Completed status requires count >= {target}"
+                err_text.visible = True
+                self.page.update()
+                return
+            if chosen_status == "clear" and count_val >= target:
+                err_text.value = (
+                    f"Count must be less than {target} for Not Completed"
+                )
+                err_text.visible = True
+                self.page.update()
+                return
+            await _submit_edit(
+                chosen_status,
+                count_val,
+                (note_field.value or "").strip(),
+                f"Updated check-in for {target_date_iso}",
+            )
+
+        async def handle_clear(_e: Any) -> None:
+            await _submit_edit(
+                "clear",
+                0,
+                "",
+                f"Cleared check-in for {target_date_iso}",
+            )
+
+        save_btn.on_click = handle_save
+        clear_btn.on_click = handle_clear
+
+        meta_line = (
+            f"{target_date_iso} • Scheduled"
+            if scheduled_flag
+            else f"{target_date_iso} • Unscheduled day"
+        )
+        dialog.title = ft.Column(
+            [
+                ft.Text(f"Edit Check-in · {title}", size=18, weight=ft.FontWeight.BOLD),
+                ft.Text(meta_line, size=12, color=ft.Colors.BLUE_GREY_500),
+            ],
+            spacing=2,
+            tight=True,
+        )
+        dialog.content = ft.Container(
+            width=dialog_width,
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Completion Status",
+                        size=12,
+                        weight=ft.FontWeight.W_600,
+                        color=ft.Colors.BLUE_GREY_800,
+                    ),
+                    status_chips_row,
+                    ft.Text(
+                        "On Time counts toward streaks & SLI; Overdue Make-up records completion without streak credit.",
+                        size=11,
+                        color=ft.Colors.BLUE_GREY_500,
+                    ),
+                    ft.Row(
+                        [
+                            ft.IconButton(
+                                icon=ft.Icons.REMOVE_ROUNDED,
+                                tooltip="Decrease count",
+                                on_click=lambda _e: step_count(-1),
+                            ),
+                            count_field,
+                            ft.IconButton(
+                                icon=ft.Icons.ADD_ROUNDED,
+                                tooltip="Increase count",
+                                on_click=lambda _e: step_count(1),
+                            ),
+                            ft.Text(
+                                f"/ {target} target",
+                                size=12,
+                                color=ft.Colors.BLUE_GREY_600,
+                            ),
+                        ],
+                        spacing=6,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    note_field,
+                    err_text,
+                ],
+                tight=True,
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+        )
+        dialog.actions = [
+            clear_btn,
+            ft.TextButton(
+                content=ft.Text("Cancel"),
+                on_click=lambda _e: close_dialog(self.page, dialog),
+            ),
+            save_btn,
+        ]
+        open_dialog(self.page, dialog)
+
+    async def _open_habit_history_dialog(
+        self,
+        habit: dict[str, Any],
+        initial_month: str | None = None,
+    ) -> None:
+        hid = str(habit.get("id") or habit.get("habit_id") or "")
+        if not hid:
+            return
+
+        page_w = int(self.page.width or 900)
+        dialog_width = 520 if page_w >= 620 else max(310, page_w - 40)
+        state: dict[str, Any] = {
+            "month": initial_month or date.today().strftime("%Y-%m"),
+            "data": None,
+        }
+        body_col = ft.Column([], tight=True, spacing=12)
+        dialog = ft.AlertDialog(modal=True)
+        title_text = ft.Text(
+            f"History · {habit.get('title', 'Habit')}",
+            size=18,
+            weight=ft.FontWeight.BOLD,
+        )
+        title_dot = ft.Container(
+            width=12,
+            height=24,
+            border_radius=6,
+            bgcolor=habit.get("color", "#6366F1"),
+        )
+
+        state_palette = {
+            "on_time": ("#DCFCE7", "#22C55E", "#15803D", "On Time"),
+            "late_makeup": ("#FEF3C7", "#F59E0B", "#B45309", "Make-up"),
+            "missed": ("#FEE2E2", "#EF4444", "#B91C1C", "Missed"),
+            "violation": ("#FEE2E2", "#EF4444", "#B91C1C", "Violation"),
+            "in_progress": ("#DBEAFE", "#3B82F6", "#1D4ED8", "In Progress"),
+            "reminding": ("#DBEAFE", "#3B82F6", "#1D4ED8", "Reminding"),
+            "pending": ("#F8FAFC", "#CBD5E1", "#334155", "Pending"),
+            "unscheduled": ("#F8FAFC", "#E2E8F0", "#94A3B8", "Rest Day"),
+            "before_created": ("#F1F5F9", "#E2E8F0", "#CBD5E1", "Before Created"),
+            "future": ("#F1F5F9", "#E2E8F0", "#CBD5E1", "Upcoming"),
+        }
+
+        def render_history_content(data: dict[str, Any]) -> None:
+            habit_meta = data.get("habit") or habit
+            h_color = habit_meta.get("color", habit.get("color", "#6366F1"))
+            title_dot.bgcolor = h_color
+            title_text.value = (
+                f"History · {habit_meta.get('title', habit.get('title', 'Habit'))}"
+            )
+            is_monthly = habit_meta.get("frequency_type") == "monthly"
+            streak_unit = "mo" if is_monthly else "d"
+            target_per_day = max(1, int(habit_meta.get("target_per_day", 1)))
+
+            summary_chips = ft.Row(
+                [
+                    self._history_stat_pill(
+                        f"Streak {data.get('current_streak', 0)}{streak_unit}",
+                        "#FEF3C7",
+                        "#B45309",
+                    ),
+                    self._history_stat_pill(
+                        f"Best {data.get('best_streak', 0)}{streak_unit}",
+                        "#EEF2FF",
+                        "#4338CA",
+                    ),
+                    self._history_stat_pill(
+                        f"30d {data.get('completion_rate_30d', 0.0)}%",
+                        "#DCFCE7",
+                        "#15803D",
+                    ),
+                    self._history_stat_pill(
+                        f"On-time {data.get('total_completions', 0)}",
+                        "#F1F5F9",
+                        "#334155",
+                    ),
+                    self._history_stat_pill(
+                        f"Make-ups {data.get('late_completions', 0)}",
+                        "#FEF3C7",
+                        "#B45309",
+                    ),
+                    self._history_stat_pill(
+                        f"Created {data.get('created_date', '')}",
+                        "#F1F5F9",
+                        "#64748B",
+                    ),
+                ],
+                wrap=True,
+                spacing=6,
+                run_spacing=6,
+            )
+
+            month_str = str(data.get("month") or state["month"])
+            state["month"] = month_str
+            try:
+                month_dt = date.fromisoformat(f"{month_str}-01")
+                month_label = month_dt.strftime("%B %Y")
+            except ValueError:
+                month_label = month_str
+            today_month = str(data.get("today") or date.today().isoformat())[:7]
+
+            async def shift_hist_month(delta_m: int) -> None:
+                cur_dt = date.fromisoformat(f"{state['month']}-01")
+                nxt_dt = self._shift_month(cur_dt, delta_m)
+                await load_month(nxt_dt.strftime("%Y-%m"), refresh_open=True)
+
+            async def prev_hist_month(_e: Any) -> None:
+                await shift_hist_month(-1)
+
+            async def next_hist_month(_e: Any) -> None:
+                await shift_hist_month(1)
+
+            async def jump_current_month(_e: Any) -> None:
+                await load_month(today_month, refresh_open=True)
+
+            month_nav = ft.Row(
+                [
+                    ft.Row(
+                        [
+                            ft.IconButton(
+                                icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
+                                disabled=not bool(data.get("can_prev_month", False)),
+                                tooltip="Previous month",
+                                on_click=prev_hist_month,
+                            ),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        month_label,
+                                        size=15,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    ft.Text(
+                                        f"{data.get('month_completed_on_time', 0)}/{data.get('month_scheduled', 0)} on-time"
+                                        + (
+                                            f" · {data.get('month_late_makeups', 0)} make-up"
+                                            if data.get("month_late_makeups", 0) > 0
+                                            else ""
+                                        )
+                                        + (
+                                            f" · {data.get('month_missed', 0)} missed"
+                                            if data.get("month_missed", 0) > 0
+                                            else ""
+                                        ),
+                                        size=11,
+                                        color=ft.Colors.BLUE_GREY_500,
+                                    ),
+                                ],
+                                spacing=1,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.CHEVRON_RIGHT_ROUNDED,
+                                disabled=not bool(data.get("can_next_month", False)),
+                                tooltip="Next month",
+                                on_click=next_hist_month,
+                            ),
+                        ],
+                        spacing=2,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.TextButton(
+                        content=ft.Text("Current"),
+                        visible=(month_str != today_month),
+                        on_click=jump_current_month,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            )
+
+            weekday_header = ft.Row(
+                [
+                    ft.Container(
+                        expand=True,
+                        alignment=ft.Alignment.CENTER,
+                        content=ft.Text(
+                            lbl,
+                            size=11,
+                            weight=ft.FontWeight.BOLD,
+                            color=ft.Colors.BLUE_GREY_500,
+                        ),
+                    )
+                    for lbl in WEEKDAY_LABELS
+                ],
+                spacing=4,
+            )
+
+            first_wd = int(data.get("first_weekday", 0))
+            cells: list[ft.Control] = [
+                ft.Container(expand=True, height=40) for _ in range(first_wd)
+            ]
+
+            def open_day_editor(day_obj: dict[str, Any]) -> None:
+                merged_item = {
+                    **habit_meta,
+                    "id": hid,
+                    "count": day_obj.get("count", 0),
+                    "completed": day_obj.get("completed", False),
+                    "is_late": day_obj.get("is_late", False),
+                    "note": day_obj.get("note", ""),
+                    "scheduled_today": day_obj.get("scheduled", True),
+                    "scheduled": day_obj.get("scheduled", True),
+                }
+
+                async def on_day_saved(_updated: Any) -> None:
+                    await load_month(state["month"], refresh_open=True)
+
+                self._open_checkin_edit_dialog(
+                    merged_item,
+                    day_obj["date"],
+                    on_saved=on_day_saved,
+                )
+
+            day_entries = data.get("days", [])
+            for d_obj in day_entries:
+                st = str(d_obj.get("state") or "pending")
+                bg, border_c, fg, _ = state_palette.get(
+                    st, state_palette["pending"]
+                )
+                editable = bool(d_obj.get("editable", False))
+                is_today_cell = bool(d_obj.get("is_today", False))
+                has_note = bool(str(d_obj.get("note") or "").strip())
+                cell_label = (
+                    f"{d_obj['day']}•" if has_note else str(d_obj["day"])
+                )
+                cell = ft.Container(
+                    expand=True,
+                    height=40,
+                    border_radius=8,
+                    bgcolor=bg,
+                    opacity=1.0 if editable else 0.55,
+                    border=(
+                        ft.Border.all(2, "#4F46E5")
+                        if is_today_cell
+                        else (
+                            ft.Border.all(1, border_c)
+                            if editable
+                            else None
+                        )
+                    ),
+                    alignment=ft.Alignment.CENTER,
+                    tooltip=(
+                        f"{d_obj['date']} · Tap to edit"
+                        if editable
+                        else f"{d_obj['date']} · Locked"
+                    ),
+                    data={
+                        "history_date": d_obj["date"],
+                        "state": st,
+                        "editable": editable,
+                    },
+                    on_click=(
+                        (lambda _e, target_d=d_obj: open_day_editor(target_d))
+                        if editable
+                        else None
+                    ),
+                    content=ft.Text(
+                        cell_label,
+                        size=12,
+                        weight=(
+                            ft.FontWeight.BOLD
+                            if (editable and d_obj.get("scheduled"))
+                            else ft.FontWeight.NORMAL
+                        ),
+                        color=fg,
+                    ),
+                )
+                cells.append(cell)
+
+            while len(cells) % 7 != 0:
+                cells.append(ft.Container(expand=True, height=40))
+
+            week_rows = [
+                ft.Row(cells[i : i + 7], spacing=4)
+                for i in range(0, len(cells), 7)
+            ]
+
+            legend_row = ft.Row(
+                [
+                    self._history_stat_pill("On time", "#DCFCE7", "#15803D"),
+                    self._history_stat_pill("Make-up", "#FEF3C7", "#B45309"),
+                    self._history_stat_pill("Missed", "#FEE2E2", "#B91C1C"),
+                    self._history_stat_pill("Pending", "#F8FAFC", "#475569"),
+                    self._history_stat_pill("Locked", "#F1F5F9", "#94A3B8"),
+                ],
+                wrap=True,
+                spacing=6,
+                run_spacing=6,
+            )
+
+            log_days = [
+                d_obj
+                for d_obj in reversed(day_entries)
+                if d_obj.get("editable")
+                and (
+                    d_obj.get("scheduled")
+                    or int(d_obj.get("count", 0)) > 0
+                    or bool(str(d_obj.get("note") or "").strip())
+                )
+            ]
+            log_controls: list[ft.Control] = [
+                ft.Text(
+                    f"Month Activity Log ({len(log_days)})",
+                    size=13,
+                    weight=ft.FontWeight.BOLD,
+                )
+            ]
+            if not log_days:
+                log_controls.append(
+                    ft.Text(
+                        "No editable scheduled days in this month.",
+                        size=12,
+                        color=ft.Colors.BLUE_GREY_500,
+                    )
+                )
+            else:
+                for d_obj in log_days:
+                    st = str(d_obj.get("state") or "pending")
+                    s_bg, _, s_fg, s_lbl = state_palette.get(
+                        st, state_palette["pending"]
+                    )
+                    detail_parts: list[str] = [s_lbl]
+                    if target_per_day > 1 or int(d_obj.get("count", 0)) > 0:
+                        detail_parts.append(
+                            f"{int(d_obj.get('count', 0))}/{target_per_day}"
+                        )
+                    if str(d_obj.get("note") or "").strip():
+                        detail_parts.append(f"Note: {str(d_obj['note']).strip()}")
+                    log_controls.append(
+                        ft.Container(
+                            padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                            border_radius=10,
+                            bgcolor="#F8FAFC",
+                            content=ft.Row(
+                                [
+                                    ft.Column(
+                                        [
+                                            ft.Row(
+                                                [
+                                                    ft.Text(
+                                                        f"{d_obj['date']} ({d_obj['weekday_label']})",
+                                                        size=12,
+                                                        weight=ft.FontWeight.BOLD,
+                                                    ),
+                                                    self._history_stat_pill(
+                                                        s_lbl, s_bg, s_fg
+                                                    ),
+                                                ],
+                                                spacing=6,
+                                                wrap=True,
+                                            ),
+                                            ft.Text(
+                                                " · ".join(detail_parts[1:])
+                                                if len(detail_parts) > 1
+                                                else "Tap edit to adjust status or note",
+                                                size=11,
+                                                color=ft.Colors.BLUE_GREY_600,
+                                            ),
+                                        ],
+                                        spacing=3,
+                                        expand=True,
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.EDIT_OUTLINED,
+                                        icon_size=18,
+                                        tooltip="Edit history entry",
+                                        on_click=lambda _e, target_d=d_obj: open_day_editor(
+                                            target_d
+                                        ),
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                        )
+                    )
+
+            body_col.controls = [
+                summary_chips,
+                ft.Divider(height=1),
+                month_nav,
+                weekday_header,
+                *week_rows,
+                legend_row,
+                ft.Divider(height=1),
+                *log_controls,
+            ]
+
+        async def load_month(month_val: str, refresh_open: bool = False) -> bool:
+            try:
+                resp = await self.api.get_habit_history(hid, month=month_val)
+            except ApiError as err:
+                show_toast(self.page, err.message, is_error=True)
+                return False
+            state["data"] = resp
+            render_history_content(resp)
+            if refresh_open:
+                self.page.update()
+            return True
+
+        if not await load_month(state["month"], refresh_open=False):
+            return
+
+        dialog.title = ft.Row(
+            [title_dot, title_text],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        dialog.content = ft.Container(
+            width=dialog_width,
+            content=ft.Column(
+                [body_col],
+                tight=True,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+        )
+        dialog.actions = [
+            ft.TextButton(
+                content=ft.Text("Close"),
+                on_click=lambda _e: close_dialog(self.page, dialog),
+            )
+        ]
+        open_dialog(self.page, dialog)
+
+    @staticmethod
+    def _history_stat_pill(text: str, bgcolor: str, color: str) -> ft.Control:
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=8, vertical=3),
+            border_radius=8,
+            bgcolor=bgcolor,
+            content=ft.Text(
+                text,
+                size=11,
+                weight=ft.FontWeight.BOLD,
+                color=color,
+            ),
+        )
 
     # -----------------------------------------------------------------------
     # Tab 3: Streaks & Completion Analytics
@@ -4273,6 +5404,18 @@ class HabitTrackerApp:
             ),
         )
 
+        def make_history_handler(target_hs: dict[str, Any]):
+            async def _handler(_e: Any) -> None:
+                await self._open_habit_history_dialog(
+                    {
+                        "id": target_hs["habit_id"],
+                        "title": target_hs["title"],
+                        "color": target_hs.get("color", "#6366F1"),
+                    }
+                )
+
+            return _handler
+
         leaderboard_items: list[ft.Control] = [
             ft.Text("Habit Streaks Breakdown", size=17, weight=ft.FontWeight.BOLD)
         ]
@@ -4318,21 +5461,32 @@ class HabitTrackerApp:
                                 ],
                                 spacing=10,
                             ),
-                            ft.Column(
+                            ft.Row(
                                 [
-                                    ft.Text(
-                                        f"Current: {hs['current_streak']}{unit}",
-                                        weight=ft.FontWeight.BOLD,
-                                        color="#D97706",
+                                    ft.Column(
+                                        [
+                                            ft.Text(
+                                                f"Current: {hs['current_streak']}{unit}",
+                                                weight=ft.FontWeight.BOLD,
+                                                color="#D97706",
+                                            ),
+                                            ft.Text(
+                                                f"Best: {hs['best_streak']}{unit}",
+                                                size=12,
+                                                color=ft.Colors.BLUE_GREY_500,
+                                            ),
+                                        ],
+                                        horizontal_alignment=ft.CrossAxisAlignment.END,
+                                        spacing=2,
                                     ),
-                                    ft.Text(
-                                        f"Best: {hs['best_streak']}{unit}",
-                                        size=12,
-                                        color=ft.Colors.BLUE_GREY_500,
+                                    ft.IconButton(
+                                        icon=ft.Icons.HISTORY_ROUNDED,
+                                        tooltip="Check-in history",
+                                        on_click=make_history_handler(hs),
                                     ),
                                 ],
-                                horizontal_alignment=ft.CrossAxisAlignment.END,
-                                spacing=2,
+                                spacing=4,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,

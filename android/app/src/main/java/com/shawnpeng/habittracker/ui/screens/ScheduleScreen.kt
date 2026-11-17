@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.DoneAll
+import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.PlayCircleOutline
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
@@ -60,10 +61,12 @@ import com.shawnpeng.habittracker.data.PeriodSchedule
 import com.shawnpeng.habittracker.data.ScheduleDay
 import com.shawnpeng.habittracker.data.ScheduleHabitItem
 import com.shawnpeng.habittracker.data.effectiveReminderTimes
+import com.shawnpeng.habittracker.data.formatCompanionReminderBadge
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
 import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.parseHabitColor
+import com.shawnpeng.habittracker.ui.components.CheckinEditDialog
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -84,9 +87,11 @@ fun ScheduleScreen(
     onResetCurrent: () -> Unit,
     onPrimaryCheckin: (ScheduleHabitItem) -> Unit,
     onDecrementCheckin: (ScheduleHabitItem) -> Unit,
+    onEditCheckin: (ScheduleHabitItem, String, Int, String) -> Unit,
 ) {
     var statusFilter by remember { mutableStateOf("todo") }
     var groupBy by remember { mutableStateOf("day") }
+    var editingItem by remember { mutableStateOf<ScheduleHabitItem?>(null) }
 
     val todayDate = LocalDate.now()
     val isCurrentPeriod = remember(period, anchorDate, todayDate) {
@@ -297,10 +302,29 @@ fun ScheduleScreen(
                         items = matchingItems,
                         onPrimaryCheckin = onPrimaryCheckin,
                         onDecrementCheckin = onDecrementCheckin,
+                        onEditItem = { editingItem = it },
                     )
                 }
             }
         }
+    }
+
+    editingItem?.let { target ->
+        CheckinEditDialog(
+            title = target.title,
+            dateIso = target.date,
+            scheduled = true,
+            targetPerDay = target.targetPerDay,
+            initialCount = target.count,
+            initialCompleted = target.completed,
+            initialIsLate = target.isLate,
+            initialNote = target.note,
+            onDismiss = { editingItem = null },
+            onSave = { statusOverride, count, note ->
+                onEditCheckin(target, statusOverride, count, note)
+                editingItem = null
+            },
+        )
     }
 }
 
@@ -588,6 +612,7 @@ private fun ScheduleDayCard(
     items: List<ScheduleHabitItem>,
     onPrimaryCheckin: (ScheduleHabitItem) -> Unit,
     onDecrementCheckin: (ScheduleHabitItem) -> Unit,
+    onEditItem: (ScheduleHabitItem) -> Unit,
 ) {
     val dayBadgeText = when {
         day.isToday -> "Today"
@@ -656,6 +681,7 @@ private fun ScheduleDayCard(
                     canCheckin = !day.isFuture,
                     onPrimaryCheckin = { onPrimaryCheckin(item) },
                     onDecrementCheckin = { onDecrementCheckin(item) },
+                    onEdit = { onEditItem(item) },
                 )
             }
         }
@@ -668,6 +694,7 @@ private fun ScheduleDayHabitRow(
     canCheckin: Boolean,
     onPrimaryCheckin: () -> Unit,
     onDecrementCheckin: () -> Unit,
+    onEdit: () -> Unit,
 ) {
     val habitColor = parseHabitColor(item.color)
     val nowTime = LocalTime.now()
@@ -779,21 +806,13 @@ private fun ScheduleDayHabitRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            val itemEffectiveTimes = effectiveReminderTimes(
+            val itemReminderBadge = formatCompanionReminderBadge(
                 mode = item.mode,
                 reminderEnabled = item.reminderEnabled,
                 reminderTimes = item.reminderTimes,
                 remindTime = item.remindTime,
+                reminderMode = item.reminderMode,
             )
-            val itemReminderBadge = if (itemEffectiveTimes.isEmpty()) {
-                null
-            } else {
-                formatReminderBadge(
-                    enabled = true,
-                    times = itemEffectiveTimes,
-                    mode = item.reminderMode,
-                )
-            }
             if (itemReminderBadge != null) {
                 Surface(
                     shape = RoundedCornerShape(6.dp),
@@ -832,56 +851,73 @@ private fun ScheduleDayHabitRow(
                     )
                 }
             }
-        } else if (needsStrictStart || item.targetPerDay <= 1) {
-            IconButton(onClick = onPrimaryCheckin) {
-                Icon(
-                    imageVector = when {
-                        needsStrictStart -> Icons.Rounded.PlayCircleOutline
-                        item.completed -> Icons.Rounded.CheckCircle
-                        else -> Icons.Rounded.RadioButtonUnchecked
-                    },
-                    contentDescription = when {
-                        needsStrictStart -> "Start Execution"
-                        item.completed -> "Undo check-in"
-                        else -> "Check in"
-                    },
-                    tint = when {
-                        needsStrictStart -> MaterialTheme.colorScheme.primary
-                        item.isLate -> StatusLateAmber
-                        item.completed -> habitColor
-                        else -> MaterialTheme.colorScheme.outline
-                    },
-                )
-            }
         } else {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
-                    onClick = onDecrementCheckin,
-                    enabled = item.count > 0,
+                    onClick = onEdit,
                     modifier = Modifier.size(34.dp),
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.RemoveCircleOutline,
-                        contentDescription = "Decrease count",
+                        imageVector = Icons.Rounded.EditNote,
+                        contentDescription = "Edit check-in",
+                        tint = if (item.note.isNotBlank()) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                         modifier = Modifier.size(20.dp),
                     )
                 }
-                Text(
-                    text = "${item.count}/${item.targetPerDay}",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(horizontal = 2.dp),
-                )
-                IconButton(
-                    onClick = onPrimaryCheckin,
-                    modifier = Modifier.size(34.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.AddCircleOutline,
-                        contentDescription = "Increase count",
-                        tint = habitColor,
-                        modifier = Modifier.size(20.dp),
+                if (needsStrictStart || item.targetPerDay <= 1) {
+                    IconButton(onClick = onPrimaryCheckin) {
+                        Icon(
+                            imageVector = when {
+                                needsStrictStart -> Icons.Rounded.PlayCircleOutline
+                                item.completed -> Icons.Rounded.CheckCircle
+                                else -> Icons.Rounded.RadioButtonUnchecked
+                            },
+                            contentDescription = when {
+                                needsStrictStart -> "Start Execution"
+                                item.completed -> "Undo check-in"
+                                else -> "Check in"
+                            },
+                            tint = when {
+                                needsStrictStart -> MaterialTheme.colorScheme.primary
+                                item.isLate -> StatusLateAmber
+                                item.completed -> habitColor
+                                else -> MaterialTheme.colorScheme.outline
+                            },
+                        )
+                    }
+                } else {
+                    IconButton(
+                        onClick = onDecrementCheckin,
+                        enabled = item.count > 0,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.RemoveCircleOutline,
+                            contentDescription = "Decrease count",
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Text(
+                        text = "${item.count}/${item.targetPerDay}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 2.dp),
                     )
+                    IconButton(
+                        onClick = onPrimaryCheckin,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.AddCircleOutline,
+                            contentDescription = "Increase count",
+                            tint = habitColor,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
                 }
             }
         }

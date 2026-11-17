@@ -171,6 +171,7 @@ class HabitApiClient(
             put("action", request.action)
             request.count?.let { put("count", it) }
             request.note?.let { put("note", it) }
+            if (!request.statusOverride.isNullOrBlank()) put("status_override", request.statusOverride)
             if (!request.clientToday.isNullOrBlank()) put("client_today", request.clientToday)
             if (!request.clientTime.isNullOrBlank()) put("client_time", request.clientTime)
         }.toString()
@@ -178,6 +179,23 @@ class HabitApiClient(
             method = "POST",
             pathSegments = listOf("api", "habits", habitId, "checkin"),
             jsonBody = body,
+        )
+    }
+
+    suspend fun getHabitHistory(
+        habitId: String,
+        month: String? = null,
+        clientToday: String? = null,
+        clientTime: String? = null,
+    ): HabitHistory {
+        return executeJson(
+            method = "GET",
+            pathSegments = listOf("api", "habits", habitId, "history"),
+            queryParams = buildMap {
+                if (!month.isNullOrBlank()) put("month", month)
+                if (!clientToday.isNullOrBlank()) put("client_today", clientToday)
+                if (!clientTime.isNullOrBlank()) put("client_time", clientTime)
+            },
         )
     }
 

@@ -2,10 +2,12 @@ package com.shawnpeng.habittracker.data
 
 import androidx.compose.ui.graphics.Color
 import java.time.DayOfWeek
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.YearMonth
+import java.time.ZoneOffset
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -108,6 +110,8 @@ data class Habit(
     @SerialName("reminder_mode") val reminderMode: String = "notification",
     @SerialName("reminder_snooze_minutes") val reminderSnoozeMinutes: Int = 10,
     @SerialName("reminder_message") val reminderMessage: String = "",
+    @SerialName("created_date") val createdDate: String = "",
+    @SerialName("created_time") val createdTime: String? = null,
     @SerialName("created_at") val createdAt: String = "",
 )
 
@@ -136,6 +140,8 @@ data class HabitToday(
     @SerialName("reminder_mode") val reminderMode: String = "notification",
     @SerialName("reminder_snooze_minutes") val reminderSnoozeMinutes: Int = 10,
     @SerialName("reminder_message") val reminderMessage: String = "",
+    @SerialName("created_date") val createdDate: String = "",
+    @SerialName("created_time") val createdTime: String? = null,
     @SerialName("created_at") val createdAt: String = "",
     val date: String,
     @SerialName("scheduled_today") val scheduledToday: Boolean = true,
@@ -150,6 +156,7 @@ data class HabitToday(
     @SerialName("started_on_time") val startedOnTime: Boolean = false,
     @SerialName("is_late") val isLate: Boolean = false,
     @SerialName("can_start") val canStart: Boolean = false,
+    @SerialName("can_edit") val canEdit: Boolean = true,
 )
 
 @Serializable
@@ -175,6 +182,8 @@ data class HabitCreateRequest(
     @SerialName("reminder_mode") val reminderMode: String = "notification",
     @SerialName("reminder_snooze_minutes") val reminderSnoozeMinutes: Int = 10,
     @SerialName("reminder_message") val reminderMessage: String = "",
+    @SerialName("created_date") val createdDate: String? = null,
+    @SerialName("created_time") val createdTime: String? = null,
 )
 
 @Serializable
@@ -209,6 +218,7 @@ data class CheckinRequest(
     val action: String = "increment",
     val count: Int? = null,
     val note: String? = null,
+    @SerialName("status_override") val statusOverride: String? = null,
     @SerialName("client_today") val clientToday: String? = null,
     @SerialName("client_time") val clientTime: String? = null,
 )
@@ -339,6 +349,7 @@ data class ScheduleHabitItem(
     @SerialName("force_end_time") val forceEndTime: String? = null,
     @SerialName("started_on_time") val startedOnTime: Boolean = false,
     @SerialName("is_late") val isLate: Boolean = false,
+    @SerialName("violation_reason") val violationReason: String? = null,
     val date: String,
     val count: Int = 0,
     val completed: Boolean = false,
@@ -349,6 +360,49 @@ data class ScheduleHabitItem(
     @SerialName("reminder_mode") val reminderMode: String = "notification",
     @SerialName("reminder_snooze_minutes") val reminderSnoozeMinutes: Int = 10,
     @SerialName("reminder_message") val reminderMessage: String = "",
+    @SerialName("created_date") val createdDate: String = "",
+)
+
+@Serializable
+data class HabitHistoryDay(
+    val date: String,
+    val day: Int,
+    val weekday: Int,
+    @SerialName("weekday_label") val weekdayLabel: String = "",
+    val scheduled: Boolean = true,
+    val editable: Boolean = true,
+    @SerialName("is_today") val isToday: Boolean = false,
+    val count: Int = 0,
+    val completed: Boolean = false,
+    @SerialName("is_late") val isLate: Boolean = false,
+    @SerialName("started_on_time") val startedOnTime: Boolean = false,
+    @SerialName("started_at_time") val startedAtTime: String? = null,
+    @SerialName("violation_reason") val violationReason: String? = null,
+    val note: String = "",
+    val state: String = "pending",
+)
+
+@Serializable
+data class HabitHistory(
+    val habit: Habit,
+    val month: String,
+    @SerialName("start_date") val startDate: String,
+    @SerialName("end_date") val endDate: String,
+    @SerialName("first_weekday") val firstWeekday: Int = 0,
+    @SerialName("created_date") val createdDate: String = "",
+    val today: String,
+    @SerialName("can_prev_month") val canPrevMonth: Boolean = false,
+    @SerialName("can_next_month") val canNextMonth: Boolean = false,
+    @SerialName("current_streak") val currentStreak: Int = 0,
+    @SerialName("best_streak") val bestStreak: Int = 0,
+    @SerialName("completion_rate_30d") val completionRate30d: Double = 0.0,
+    @SerialName("total_completions") val totalCompletions: Int = 0,
+    @SerialName("late_completions") val lateCompletions: Int = 0,
+    @SerialName("month_scheduled") val monthScheduled: Int = 0,
+    @SerialName("month_completed_on_time") val monthCompletedOnTime: Int = 0,
+    @SerialName("month_late_makeups") val monthLateMakeups: Int = 0,
+    @SerialName("month_missed") val monthMissed: Int = 0,
+    val days: List<HabitHistoryDay> = emptyList(),
 )
 
 @Serializable
@@ -571,6 +625,8 @@ fun HabitToday.toHabit(): Habit = Habit(
     reminderMode = reminderMode,
     reminderSnoozeMinutes = reminderSnoozeMinutes,
     reminderMessage = reminderMessage,
+    createdDate = createdDate,
+    createdTime = createdTime,
     createdAt = createdAt,
 )
 
@@ -705,6 +761,42 @@ fun formatReminderBadge(habit: Habit): String? {
     return if (times.isEmpty()) null else formatReminderBadge(true, times, habit.reminderMode)
 }
 
+fun formatCompanionReminderBadge(
+    mode: String,
+    archived: Boolean = false,
+    reminderEnabled: Boolean = false,
+    reminderTimes: List<String> = emptyList(),
+    remindTime: String? = null,
+    reminderMode: String = "notification",
+): String? {
+    val times = effectiveReminderTimes(
+        mode = mode,
+        archived = archived,
+        reminderEnabled = reminderEnabled,
+        reminderTimes = reminderTimes,
+        remindTime = remindTime,
+    )
+    if (times.isEmpty()) return null
+    if (mode == "strict" || mode == "window") {
+        val normRemind = normalizeReminderTime(remindTime.orEmpty())
+        val extraTimes = times.filterNot { it == normRemind }
+        if (extraTimes.isEmpty()) {
+            return if (reminderMode == "alarm") "⏰ Alarm" else null
+        }
+    }
+    return formatReminderBadge(enabled = true, times = times, mode = reminderMode)
+}
+
+fun formatCompanionReminderBadge(habit: Habit): String? =
+    formatCompanionReminderBadge(
+        mode = habit.mode,
+        archived = habit.archived,
+        reminderEnabled = habit.reminderEnabled,
+        reminderTimes = habit.reminderTimes,
+        remindTime = habit.remindTime,
+        reminderMode = habit.reminderMode,
+    )
+
 fun scheduledMonthlyDay(
     year: Int,
     month: Int,
@@ -805,6 +897,7 @@ data class HabitModeOption(
     val key: String,
     val label: String,
     val shortLabel: String,
+    val chipLabel: String,
     val hint: String,
 )
 
@@ -813,24 +906,28 @@ val HABIT_MODE_OPTIONS = listOf(
         key = "free",
         label = "Free Mode (No Reminders)",
         shortLabel = "Free Mode",
+        chipLabel = "Free Mode",
         hint = "Check in anytime with no time limits and no reminders or alarms.",
     ),
     HabitModeOption(
         key = "strict",
         label = "Mode 1: Strict Control",
         shortLabel = "Mode 1 · Strict",
+        chipLabel = "1 · Strict",
         hint = "Remind Time < Force Start < Force End, with notifications/alarms and mandatory Start Execution.",
     ),
     HabitModeOption(
         key = "window",
         label = "Mode 2: Flexible Window",
         shortLabel = "Mode 2 · Window",
+        chipLabel = "2 · Window",
         hint = "Triggers notification or alarm at Remind Time; complete before Force End to stay on-time.",
     ),
     HabitModeOption(
         key = "reminder",
         label = "Mode 3: Reminder & Alarm",
         shortLabel = "Mode 3 · Reminder",
+        chipLabel = "3 · Reminder",
         hint = "Sends notifications or ringing alarms at one or more times with no overdue violation.",
     ),
 )
@@ -949,7 +1046,7 @@ fun evaluateLocalHabitStatus(
     val target = habit.targetPerDay.coerceAtLeast(1)
     val completed = habit.completed || habit.count >= target
     if (completed) {
-        return if ((habit.mode == "strict" || habit.mode == "window") && habit.isLate) {
+        return if (habit.isLate) {
             LocalHabitStatus(
                 dayStatus = "late_makeup",
                 violationReason = habit.violationReason,
@@ -959,6 +1056,10 @@ fun evaluateLocalHabitStatus(
         } else {
             LocalHabitStatus(dayStatus = "on_time")
         }
+    }
+
+    if (!habit.canEdit) {
+        return LocalHabitStatus(dayStatus = "pending")
     }
 
     if (!habit.scheduledToday || selectedDateIso > todayIso) {
@@ -1002,3 +1103,33 @@ fun evaluateLocalHabitStatus(
         else -> LocalHabitStatus(dayStatus = "pending")
     }
 }
+
+fun extractHabitCreatedDate(
+    createdDate: String,
+    createdAt: String,
+    today: LocalDate,
+): LocalDate? {
+    val cleanDate = createdDate.trim()
+    val parsed = if (cleanDate.length >= 10) {
+        runCatching { LocalDate.parse(cleanDate.take(10)) }.getOrNull()
+    } else {
+        null
+    } ?: run {
+        val cleanAt = createdAt.trim()
+        if (cleanAt.length >= 10) {
+            runCatching { LocalDate.parse(cleanAt.take(10)) }.getOrNull()
+        } else {
+            null
+        }
+    } ?: return null
+    if (cleanDate.isEmpty() && parsed.isAfter(today.plusDays(1))) {
+        return null
+    }
+    return if (parsed.isAfter(today)) today else parsed
+}
+
+fun localDateToUtcPickerMillis(date: LocalDate): Long =
+    date.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+
+fun utcPickerMillisToLocalDate(millis: Long): LocalDate =
+    Instant.ofEpochMilli(millis).atZone(ZoneOffset.UTC).toLocalDate()

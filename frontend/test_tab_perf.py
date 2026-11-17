@@ -2,7 +2,7 @@ import asyncio
 import sys
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -237,6 +237,63 @@ class ApiClientPoolAsyncTests(unittest.IsolatedAsyncioTestCase):
             await client._request("GET", "/health")
             self.assertEqual(len(created_clients), 2)
             await client.aclose()
+
+    async def test_create_habit_injects_local_created_date_and_time(self) -> None:
+        captured: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        class _FakeResponse:
+            status_code = 201
+            content = b'{"id": "h1"}'
+
+            def json(self) -> dict[str, Any]:
+                return {"id": "h1"}
+
+        class _FakeAsyncClient:
+            def __init__(self, **_kwargs: Any) -> None:
+                self.is_closed = False
+
+            async def aclose(self) -> None:
+                self.is_closed = True
+
+            async def request(
+                self, method: str, url: str, json: dict[str, Any] | None = None, **_kwargs: Any
+            ) -> _FakeResponse:
+                captured.append((method, url, json))
+                return _FakeResponse()
+
+        page = _FakePage()
+        client = HabitApiClient(StorageHelper(page))  # type: ignore[arg-type]
+        await client.set_base_url("http://localhost:8000")
+
+        with patch.object(api_client.httpx, "AsyncClient", side_effect=_FakeAsyncClient):
+            with patch.object(api_client, "datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 11, 17, 14, 5)
+                await client.create_habit({"title": "Read"})
+                await client.create_habit(
+                    {
+                        "title": "Override",
+                        "created_date": "2026-11-10",
+                        "created_time": "08:00",
+                    }
+                )
+            await client.aclose()
+
+        self.assertEqual(
+            captured[0][2],
+            {
+                "created_date": "2026-11-17",
+                "created_time": "14:05",
+                "title": "Read",
+            },
+        )
+        self.assertEqual(
+            captured[1][2],
+            {
+                "created_date": "2026-11-10",
+                "created_time": "08:00",
+                "title": "Override",
+            },
+        )
 
 
 class TabPerfTests(unittest.IsolatedAsyncioTestCase):

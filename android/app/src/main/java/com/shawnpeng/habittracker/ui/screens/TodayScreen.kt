@@ -1,6 +1,7 @@
 package com.shawnpeng.habittracker.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddCircleOutline
+import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
@@ -31,20 +33,22 @@ import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.material.icons.rounded.SelfImprovement
 import androidx.compose.material.icons.rounded.Today
 import androidx.compose.material.icons.rounded.WarningAmber
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SelectableDates
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,13 +64,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.HabitToday
-import com.shawnpeng.habittracker.data.effectiveReminderTimes
 import com.shawnpeng.habittracker.data.evaluateLocalHabitStatus
+import com.shawnpeng.habittracker.data.extractHabitCreatedDate
+import com.shawnpeng.habittracker.data.formatCompanionReminderBadge
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
-import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.formatTime12h
+import com.shawnpeng.habittracker.data.localDateToUtcPickerMillis
 import com.shawnpeng.habittracker.data.parseHabitColor
+import com.shawnpeng.habittracker.data.utcPickerMillisToLocalDate
+import com.shawnpeng.habittracker.ui.components.CheckinEditDialog
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -77,11 +84,12 @@ fun TodayScreen(
     selectedDate: LocalDate,
     habits: List<HabitToday>,
     onShiftDate: (Long) -> Unit,
+    onSelectDate: (LocalDate) -> Unit,
     onJumpToday: () -> Unit,
     onStartExecution: (HabitToday) -> Unit,
     onPrimaryCheckin: (HabitToday) -> Unit,
     onDecrementCheckin: (HabitToday) -> Unit,
-    onUpdateNote: (HabitToday, String) -> Unit,
+    onEditCheckin: (HabitToday, String, Int, String) -> Unit,
 ) {
     val todayDate = LocalDate.now()
     val todayIso = todayDate.format(DateTimeFormatter.ISO_LOCAL_DATE)
@@ -89,22 +97,33 @@ fun TodayScreen(
     val nowTime = LocalTime.now()
     val nowHhmm = "${nowTime.hour.toString().padStart(2, '0')}:${nowTime.minute.toString().padStart(2, '0')}"
 
+    val earliestCreated = remember(habits, todayDate) {
+        habits.mapNotNull { extractHabitCreatedDate(it.createdDate, it.createdAt, todayDate) }.minOrNull()
+    }
+    val canStepPrev = earliestCreated == null || selectedDate.isAfter(earliestCreated)
+
     val isToday = selectedDate == todayDate
     val scheduledItems = remember(habits) { habits.filter { it.scheduledToday } }
     val extraItems = remember(habits) { habits.filter { !it.scheduledToday } }
-
-    val evalById = remember(scheduledItems, selectedIso, todayIso, nowHhmm) {
-        scheduledItems.associate { it.id to evaluateLocalHabitStatus(it, selectedIso, todayIso, nowHhmm) }
+    val progressItems = remember(scheduledItems, selectedDate, todayDate) {
+        scheduledItems.filter { h ->
+            h.canEdit && (extractHabitCreatedDate(h.createdDate, h.createdAt, todayDate)?.let { !selectedDate.isBefore(it) } ?: true)
+        }
     }
-    val doneCount = scheduledItems.count { evalById[it.id]?.dayStatus == "on_time" }
-    val lateCount = scheduledItems.count { evalById[it.id]?.dayStatus == "late_makeup" }
-    val violationCount = scheduledItems.count { evalById[it.id]?.dayStatus == "violation" }
-    val remindingTitles = scheduledItems.filter { evalById[it.id]?.dayStatus == "reminding" }.map { it.title }
-    val violatedTitles = scheduledItems.filter { evalById[it.id]?.dayStatus == "violation" }.map { it.title }
-    val totalScheduled = scheduledItems.size
+
+    val evalById = remember(progressItems, selectedIso, todayIso, nowHhmm) {
+        progressItems.associate { it.id to evaluateLocalHabitStatus(it, selectedIso, todayIso, nowHhmm) }
+    }
+    val doneCount = progressItems.count { evalById[it.id]?.dayStatus == "on_time" }
+    val lateCount = progressItems.count { evalById[it.id]?.dayStatus == "late_makeup" }
+    val violationCount = progressItems.count { evalById[it.id]?.dayStatus == "violation" }
+    val remindingTitles = progressItems.filter { evalById[it.id]?.dayStatus == "reminding" }.map { it.title }
+    val violatedTitles = progressItems.filter { evalById[it.id]?.dayStatus == "violation" }.map { it.title }
+    val totalScheduled = progressItems.size
     val progressFraction = if (totalScheduled > 0) doneCount.toFloat() / totalScheduled.toFloat() else 0f
 
-    var noteTargetHabit by remember { mutableStateOf<HabitToday?>(null) }
+    var editTargetHabit by remember { mutableStateOf<HabitToday?>(null) }
+    var showDatePicker by remember { mutableStateOf(false) }
 
     val dateFormatter = remember {
         DateTimeFormatter.ofPattern("EEE, MMM d, yyyy", Locale.ENGLISH)
@@ -122,10 +141,15 @@ fun TodayScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { onShiftDate(-1) }) {
+                    IconButton(
+                        onClick = { if (canStepPrev) onShiftDate(-1) },
+                        enabled = canStepPrev,
+                    ) {
                         Icon(Icons.Rounded.ChevronLeft, contentDescription = "Previous day")
                     }
-                    Column {
+                    Column(
+                        modifier = Modifier.clickable { showDatePicker = true },
+                    ) {
                         Text(
                             text = if (isToday) "Today" else selectedDate.format(dateFormatter),
                             style = MaterialTheme.typography.titleLarge,
@@ -142,6 +166,9 @@ fun TodayScreen(
                         enabled = !isToday,
                     ) {
                         Icon(Icons.Rounded.ChevronRight, contentDescription = "Next day")
+                    }
+                    IconButton(onClick = { showDatePicker = true }) {
+                        Icon(Icons.Rounded.CalendarMonth, contentDescription = "Jump to date")
                     }
                 }
 
@@ -337,7 +364,7 @@ fun TodayScreen(
                     onStartExecution = { onStartExecution(habit) },
                     onPrimaryCheckin = { onPrimaryCheckin(habit) },
                     onDecrementCheckin = { onDecrementCheckin(habit) },
-                    onOpenNote = { noteTargetHabit = habit },
+                    onOpenEdit = { editTargetHabit = habit },
                 )
             }
 
@@ -359,20 +386,69 @@ fun TodayScreen(
                         onStartExecution = { onStartExecution(habit) },
                         onPrimaryCheckin = { onPrimaryCheckin(habit) },
                         onDecrementCheckin = { onDecrementCheckin(habit) },
-                        onOpenNote = { noteTargetHabit = habit },
+                        onOpenEdit = { editTargetHabit = habit },
                     )
                 }
             }
         }
     }
 
-    noteTargetHabit?.let { targetHabit ->
-        CheckinNoteDialog(
-            habit = targetHabit,
-            onDismiss = { noteTargetHabit = null },
-            onSave = { updatedNote ->
-                onUpdateNote(targetHabit, updatedNote)
-                noteTargetHabit = null
+    if (showDatePicker) {
+        val rawMinYear = earliestCreated?.year ?: (todayDate.year - 1)
+        val minYear = minOf(rawMinYear, todayDate.year)
+        val datePickerState = rememberDatePickerState(
+            initialSelectedDateMillis = localDateToUtcPickerMillis(selectedDate),
+            yearRange = minYear..todayDate.year,
+            selectableDates = object : SelectableDates {
+                override fun isSelectableDate(utcTimeMillis: Long): Boolean {
+                    val d = utcPickerMillisToLocalDate(utcTimeMillis)
+                    return !d.isAfter(todayDate) && (earliestCreated == null || !d.isBefore(earliestCreated))
+                }
+
+                override fun isSelectableYear(year: Int): Boolean = year in minYear..todayDate.year
+            },
+        )
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        datePickerState.selectedDateMillis?.let { millis ->
+                            var chosen = utcPickerMillisToLocalDate(millis)
+                            if (chosen.isAfter(todayDate)) chosen = todayDate
+                            if (earliestCreated != null && chosen.isBefore(earliestCreated)) chosen = earliestCreated
+                            onSelectDate(chosen)
+                        }
+                        showDatePicker = false
+                    },
+                ) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) {
+                    Text("Cancel")
+                }
+            },
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
+
+    editTargetHabit?.let { targetHabit ->
+        CheckinEditDialog(
+            title = targetHabit.title,
+            dateIso = selectedIso,
+            scheduled = targetHabit.scheduledToday,
+            targetPerDay = targetHabit.targetPerDay,
+            initialCount = targetHabit.count,
+            initialCompleted = targetHabit.completed,
+            initialIsLate = targetHabit.isLate,
+            initialNote = targetHabit.note,
+            onDismiss = { editTargetHabit = null },
+            onSave = { statusOverride, count, note ->
+                onEditCheckin(targetHabit, statusOverride, count, note)
+                editTargetHabit = null
             },
         )
     }
@@ -386,10 +462,21 @@ private fun TodayHabitCard(
     onStartExecution: () -> Unit,
     onPrimaryCheckin: () -> Unit,
     onDecrementCheckin: () -> Unit,
-    onOpenNote: () -> Unit,
+    onOpenEdit: () -> Unit,
 ) {
     val accentColor = parseHabitColor(habit.color)
-    val localStatus = evaluateLocalHabitStatus(habit, habit.date, todayIso, nowHhmm)
+    val todayDate = remember(todayIso) { LocalDate.parse(todayIso) }
+    val targetDate = remember(habit.date) { LocalDate.parse(habit.date) }
+    val createdLocal = remember(habit.createdDate, habit.createdAt, todayDate) {
+        extractHabitCreatedDate(habit.createdDate, habit.createdAt, todayDate)
+    }
+    val isHabitEditable = habit.canEdit && (createdLocal == null || !targetDate.isBefore(createdLocal))
+    val localStatus = evaluateLocalHabitStatus(
+        habit = habit.copy(canEdit = isHabitEditable),
+        selectedDateIso = habit.date,
+        todayIso = todayIso,
+        nowHhmm = nowHhmm,
+    )
     val modeSummary = formatHabitModeSummary(
         mode = habit.mode,
         remindTime = habit.remindTime,
@@ -397,18 +484,14 @@ private fun TodayHabitCard(
         forceEndTime = habit.forceEndTime,
         reminderMode = habit.reminderMode,
     )
-    val effectiveTimes = effectiveReminderTimes(
+    val reminderBadge = formatCompanionReminderBadge(
         mode = habit.mode,
         archived = habit.archived,
         reminderEnabled = habit.reminderEnabled,
         reminderTimes = habit.reminderTimes,
         remindTime = habit.remindTime,
+        reminderMode = habit.reminderMode,
     )
-    val reminderBadge = if (effectiveTimes.isEmpty()) {
-        null
-    } else {
-        formatReminderBadge(enabled = true, times = effectiveTimes, mode = habit.reminderMode)
-    }
     val isMonthly = habit.frequencyType == "monthly"
     val streakUnit = if (isMonthly) "mo" else "d"
     val subtitleParts = buildList {
@@ -574,124 +657,107 @@ private fun TodayHabitCard(
                     }
                 }
 
-                IconButton(onClick = onOpenNote) {
-                    Icon(
-                        imageVector = Icons.Rounded.EditNote,
-                        contentDescription = "Today's note",
-                        tint = if (habit.note.isNotBlank()) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                    )
-                }
-
-                if (habit.targetPerDay > 1 && habit.count > 0 && !localStatus.canStart) {
-                    IconButton(onClick = onDecrementCheckin) {
-                        Icon(
-                            imageVector = Icons.Rounded.RemoveCircleOutline,
-                            contentDescription = "Decrease count",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                if (!isHabitEditable) {
+                    val createdLbl = createdLocal?.toString() ?: habit.createdDate
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                    ) {
+                        Text(
+                            text = if (createdLbl.isNotBlank()) "Created $createdLbl" else "Locked",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                         )
                     }
-                }
+                } else {
+                    IconButton(onClick = onOpenEdit) {
+                        Icon(
+                            imageVector = Icons.Rounded.EditNote,
+                            contentDescription = "Edit check-in",
+                            tint = if (habit.note.isNotBlank()) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
 
-                when {
-                    localStatus.canStart -> {
-                        FilledTonalButton(
-                            onClick = onStartExecution,
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        ) {
+                    if (habit.targetPerDay > 1 && habit.count > 0 && !localStatus.canStart) {
+                        IconButton(onClick = onDecrementCheckin) {
                             Icon(
-                                imageVector = Icons.Rounded.PlayArrow,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(2.dp))
-                            Text(
-                                text = "Start",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
+                                imageVector = Icons.Rounded.RemoveCircleOutline,
+                                contentDescription = "Decrease count",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
-                    localStatus.dayStatus == "violation" -> {
-                        FilledTonalButton(
-                            onClick = onPrimaryCheckin,
-                            colors = ButtonDefaults.filledTonalButtonColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer,
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                            ),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.History,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(2.dp))
-                            Text(
-                                text = "Make-up",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                            )
+
+                    when {
+                        localStatus.canStart -> {
+                            FilledTonalButton(
+                                onClick = onStartExecution,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text(
+                                    text = "Start",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
-                    }
-                    else -> {
-                        IconButton(onClick = onPrimaryCheckin) {
-                            val icon = when {
-                                habit.completed -> Icons.Rounded.CheckCircle
-                                habit.targetPerDay > 1 -> Icons.Rounded.AddCircleOutline
-                                else -> Icons.Rounded.RadioButtonUnchecked
+                        localStatus.dayStatus == "violation" -> {
+                            FilledTonalButton(
+                                onClick = onPrimaryCheckin,
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                ),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.History,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text(
+                                    text = "Make-up",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
                             }
-                            val tint: Color = when {
-                                localStatus.isLate -> Color(0xFFD97706)
-                                habit.completed -> accentColor
-                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        else -> {
+                            IconButton(onClick = onPrimaryCheckin) {
+                                val icon = when {
+                                    habit.completed -> Icons.Rounded.CheckCircle
+                                    habit.targetPerDay > 1 -> Icons.Rounded.AddCircleOutline
+                                    else -> Icons.Rounded.RadioButtonUnchecked
+                                }
+                                val tint: Color = when {
+                                    localStatus.isLate -> Color(0xFFD97706)
+                                    habit.completed -> accentColor
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = "Check in",
+                                    tint = tint,
+                                    modifier = Modifier.size(30.dp),
+                                )
                             }
-                            Icon(
-                                imageVector = icon,
-                                contentDescription = "Check in",
-                                tint = tint,
-                                modifier = Modifier.size(30.dp),
-                            )
                         }
                     }
                 }
             }
         }
     }
-}
-
-@Composable
-private fun CheckinNoteDialog(
-    habit: HabitToday,
-    onDismiss: () -> Unit,
-    onSave: (String) -> Unit,
-) {
-    var noteText by remember(habit) { mutableStateOf(habit.note) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Check-in Note · ${habit.title}", fontWeight = FontWeight.Bold) },
-        text = {
-            OutlinedTextField(
-                value = noteText,
-                onValueChange = { noteText = it },
-                label = { Text("Today's reflection or note (optional)") },
-                maxLines = 4,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = { onSave(noteText) }) {
-                Text("Save")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
-        },
-    )
 }

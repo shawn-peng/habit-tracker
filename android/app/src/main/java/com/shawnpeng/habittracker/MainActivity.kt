@@ -62,6 +62,7 @@ import com.shawnpeng.habittracker.ui.HabitViewModel
 import com.shawnpeng.habittracker.ui.HabitViewModelFactory
 import com.shawnpeng.habittracker.ui.components.ChangePasswordDialog
 import com.shawnpeng.habittracker.ui.components.HabitFormDialog
+import com.shawnpeng.habittracker.ui.components.HabitHistoryDialog
 import com.shawnpeng.habittracker.ui.components.RemindersOverviewDialog
 import com.shawnpeng.habittracker.ui.screens.AuthScreen
 import com.shawnpeng.habittracker.ui.screens.HabitsScreen
@@ -277,11 +278,14 @@ private fun MainShell(
                     selectedDate = uiState.selectedDate,
                     habits = uiState.todayHabits,
                     onShiftDate = vm::shiftDate,
+                    onSelectDate = vm::selectDate,
                     onJumpToday = vm::jumpToToday,
                     onStartExecution = vm::startHabitExecution,
                     onPrimaryCheckin = vm::primaryCheckin,
                     onDecrementCheckin = vm::decrementCheckin,
-                    onUpdateNote = vm::updateCheckinNote,
+                    onEditCheckin = { habit, statusOverride, count, note ->
+                        vm.editCheckin(habit.id, habit.date, statusOverride, count, note)
+                    },
                 )
                 1 -> ScheduleScreen(
                     period = uiState.schedulePeriod,
@@ -292,11 +296,15 @@ private fun MainShell(
                     onResetCurrent = vm::resetScheduleToCurrent,
                     onPrimaryCheckin = vm::schedulePrimaryCheckin,
                     onDecrementCheckin = vm::scheduleDecrementCheckin,
+                    onEditCheckin = { item, statusOverride, count, note ->
+                        vm.editCheckin(item.habitId, item.date, statusOverride, count, note)
+                    },
                 )
                 2 -> HabitsScreen(
                     habits = uiState.allHabits,
                     showArchived = uiState.showArchived,
                     onToggleShowArchived = vm::toggleShowArchived,
+                    onOpenHistory = { habit -> vm.openHabitHistory(habit.id, habit.title) },
                     onEditHabit = { habit ->
                         editingHabit = habit
                         showCreateDialog = true
@@ -304,7 +312,10 @@ private fun MainShell(
                     onToggleArchive = vm::toggleArchive,
                     onDeleteHabit = vm::deleteHabit,
                 )
-                3 -> StatsScreen(summary = uiState.statsSummary)
+                3 -> StatsScreen(
+                    summary = uiState.statsSummary,
+                    onOpenHabitHistory = { stat -> vm.openHabitHistory(stat.habitId, stat.title) },
+                )
                 else -> SliDashboardScreen(
                     dashboard = uiState.sliDashboard,
                     selectedWindowDays = uiState.sliWindowDays,
@@ -344,6 +355,22 @@ private fun MainShell(
             errorMessage = uiState.changePasswordError,
             onDismiss = vm::dismissChangePasswordDialog,
             onSubmit = vm::changePassword,
+        )
+    }
+
+    if (uiState.showHistoryDialog) {
+        HabitHistoryDialog(
+            fallbackTitle = uiState.historyHabitTitle,
+            history = uiState.habitHistory,
+            isLoading = uiState.isLoadingHistory,
+            onShiftMonth = vm::shiftHistoryMonth,
+            onResetCurrentMonth = vm::resetHistoryMonth,
+            onEditDay = { dateIso, statusOverride, count, note ->
+                uiState.historyHabitId?.let { hid ->
+                    vm.editCheckin(hid, dateIso, statusOverride, count, note)
+                }
+            },
+            onDismiss = vm::dismissHabitHistory,
         )
     }
 

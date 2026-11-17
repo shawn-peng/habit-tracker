@@ -3,22 +3,28 @@ package com.shawnpeng.habittracker
 import androidx.compose.ui.graphics.Color
 import com.shawnpeng.habittracker.data.ApiException
 import com.shawnpeng.habittracker.data.CheckinRequest
+import com.shawnpeng.habittracker.data.HABIT_MODE_OPTIONS
 import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.HabitCreateRequest
 import com.shawnpeng.habittracker.data.HabitUpdateRequest
 import com.shawnpeng.habittracker.data.computeNextTriggerDateTime
 import com.shawnpeng.habittracker.data.effectiveReminderTimes
+import com.shawnpeng.habittracker.data.extractHabitCreatedDate
+import com.shawnpeng.habittracker.data.formatCompanionReminderBadge
 import com.shawnpeng.habittracker.data.formatFrequencySummary
 import com.shawnpeng.habittracker.data.formatHabitModeSummary
 import com.shawnpeng.habittracker.data.formatReminderBadge
 import com.shawnpeng.habittracker.data.formatTime12h
+import com.shawnpeng.habittracker.data.localDateToUtcPickerMillis
 import com.shawnpeng.habittracker.data.normalizeReminderTime
 import com.shawnpeng.habittracker.data.normalizeReminderTimes
 import com.shawnpeng.habittracker.data.parseHabitColor
 import com.shawnpeng.habittracker.data.resolveTimeWithMeridiem
 import com.shawnpeng.habittracker.data.split24hTo12h
+import com.shawnpeng.habittracker.data.utcPickerMillisToLocalDate
 import com.shawnpeng.habittracker.data.validateHabitModeTimes
+import java.time.LocalDate
 import java.time.LocalDateTime
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
@@ -295,6 +301,8 @@ class HabitApiClientTest {
                       "monthly_weekday": 0,
                       "target_per_day": 1,
                       "archived": false,
+                      "created_date": "2026-11-14",
+                      "created_time": "14:05",
                       "created_at": "2026-11-14T00:00:00Z"
                     }
                     """.trimIndent(),
@@ -309,11 +317,15 @@ class HabitApiClientTest {
                 frequencyType = "monthly",
                 monthlyMode = "from_end",
                 monthlyDay = 2,
+                createdDate = "2026-11-14",
+                createdTime = "14:05",
             ),
         )
         assertEquals("monthly", created.frequencyType)
         assertEquals("from_end", created.monthlyMode)
         assertEquals(2, created.monthlyDay)
+        assertEquals("2026-11-14", created.createdDate)
+        assertEquals("14:05", created.createdTime)
 
         val req = server.takeRequest()
         assertEquals("POST", req.method)
@@ -324,6 +336,8 @@ class HabitApiClientTest {
         assertTrue(rawBody.contains("\"monthly_day\":2"))
         assertTrue(rawBody.contains("\"monthly_week\":1"))
         assertTrue(rawBody.contains("\"monthly_weekday\":0"))
+        assertTrue(rawBody.contains("\"created_date\":\"2026-11-14\""))
+        assertTrue(rawBody.contains("\"created_time\":\"14:05\""))
     }
 
     @Test
@@ -1293,5 +1307,173 @@ class HabitApiClientTest {
                 fromDateTime = LocalDateTime.of(2026, 4, 6, 10, 0),
             ),
         )
+
+        // Companion reminder badge avoids duplicating remindTime next to modeSummary
+        assertEquals("⏰ Alarm", formatCompanionReminderBadge(strictHabit))
+        assertNull(formatCompanionReminderBadge(windowHabit))
+        assertEquals("⏰ 9:00 AM, 8:00 PM", formatCompanionReminderBadge(reminderModeHabit))
+        assertEquals(
+            listOf("Free Mode", "1 · Strict", "2 · Window", "3 · Reminder"),
+            HABIT_MODE_OPTIONS.map { it.chipLabel },
+        )
+    }
+
+    @Test
+    fun editCheckinAndGetHabitHistoryRoundTrip() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "id": "h-hist-1",
+                      "title": "Deep Work",
+                      "frequency_type": "daily",
+                      "target_per_day": 1,
+                      "mode": "strict",
+                      "created_date": "2026-11-10",
+                      "date": "2026-11-14",
+                      "scheduled_today": true,
+                      "count": 1,
+                      "completed": true,
+                      "note": "Fixed history",
+                      "current_streak": 3,
+                      "best_streak": 3,
+                      "day_status": "on_time",
+                      "started_on_time": true,
+                      "is_late": false,
+                      "can_start": false,
+                      "can_edit": true
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    """
+                    {
+                      "habit": {
+                        "id": "h-hist-1",
+                        "title": "Deep Work",
+                        "frequency_type": "daily",
+                        "target_per_day": 1,
+                        "mode": "strict",
+                        "created_date": "2026-11-10"
+                      },
+                      "month": "2026-11",
+                      "start_date": "2026-11-01",
+                      "end_date": "2026-11-30",
+                      "first_weekday": 6,
+                      "created_date": "2026-11-10",
+                      "today": "2026-11-16",
+                      "can_prev_month": false,
+                      "can_next_month": false,
+                      "current_streak": 3,
+                      "best_streak": 3,
+                      "completion_rate_30d": 85.7,
+                      "total_completions": 6,
+                      "late_completions": 0,
+                      "month_scheduled": 7,
+                      "month_completed_on_time": 6,
+                      "month_late_makeups": 0,
+                      "month_missed": 1,
+                      "days": [
+                        {
+                          "date": "2026-11-09",
+                          "day": 9,
+                          "weekday": 0,
+                          "weekday_label": "Mon",
+                          "scheduled": true,
+                          "editable": false,
+                          "is_today": false,
+                          "count": 0,
+                          "completed": false,
+                          "is_late": false,
+                          "note": "",
+                          "state": "before_created"
+                        },
+                        {
+                          "date": "2026-11-14",
+                          "day": 14,
+                          "weekday": 5,
+                          "weekday_label": "Sat",
+                          "scheduled": true,
+                          "editable": true,
+                          "is_today": false,
+                          "count": 1,
+                          "completed": true,
+                          "is_late": false,
+                          "note": "Fixed history",
+                          "state": "on_time"
+                        }
+                      ]
+                    }
+                    """.trimIndent(),
+                ),
+        )
+
+        val edited = client.checkinHabit(
+            habitId = "h-hist-1",
+            request = CheckinRequest(
+                date = "2026-11-14",
+                action = "edit",
+                count = 1,
+                note = "Fixed history",
+                statusOverride = "on_time",
+                clientToday = "2026-11-16",
+                clientTime = "09:00",
+            ),
+        )
+        assertTrue(edited.completed)
+        assertEquals("on_time", edited.dayStatus)
+        assertEquals("Fixed history", edited.note)
+        assertTrue(edited.canEdit)
+
+        val history = client.getHabitHistory(
+            habitId = "h-hist-1",
+            month = "2026-11",
+            clientToday = "2026-11-16",
+            clientTime = "09:00",
+        )
+        assertEquals("2026-11-10", history.createdDate)
+        assertEquals(6, history.monthCompletedOnTime)
+        assertEquals(2, history.days.size)
+        assertFalse(history.days[0].editable)
+        assertEquals("before_created", history.days[0].state)
+        assertTrue(history.days[1].editable)
+        assertEquals("on_time", history.days[1].state)
+
+        val editReq = server.takeRequest()
+        val editBody = editReq.body.readUtf8()
+        assertTrue(editBody.contains("\"action\":\"edit\""))
+        assertTrue(editBody.contains("\"status_override\":\"on_time\""))
+
+        val histReq = server.takeRequest()
+        assertEquals(
+            "/api/habits/h-hist-1/history?month=2026-11&client_today=2026-11-16&client_time=09%3A00",
+            histReq.path,
+        )
+    }
+
+    @Test
+    fun createdDateExtractionAndUtcPickerRoundTrip() {
+        val today = LocalDate.of(2026, 11, 16)
+        assertEquals(
+            LocalDate.of(2026, 11, 10),
+            extractHabitCreatedDate("2026-11-10", "2026-11-10T23:55:00Z", today),
+        )
+        assertEquals(
+            today,
+            extractHabitCreatedDate("", "2026-11-17T03:00:00Z", today),
+        )
+        assertNull(
+            extractHabitCreatedDate("", "2026-11-25T00:00:00Z", today),
+        )
+
+        val sample = LocalDate.of(2026, 11, 14)
+        val millis = localDateToUtcPickerMillis(sample)
+        assertEquals(sample, utcPickerMillisToLocalDate(millis))
     }
 }

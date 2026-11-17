@@ -1,3 +1,4 @@
+import inspect
 import sys
 import unittest
 from datetime import date, datetime
@@ -403,10 +404,26 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
         all_ctrls = list(_walk_controls(dlg))
         text_fields = {
-            c.label: c for c in all_ctrls if isinstance(c, ft.TextField) and c.label
+            (c.label or c.data): c
+            for c in all_ctrls
+            if isinstance(c, ft.TextField) and (c.label or c.data)
         }
         dropdowns = {
             c.label: c for c in all_ctrls if isinstance(c, ft.Dropdown) and c.label
+        }
+        meridiems = {
+            c.data["name"]: c.data["toggle"]
+            for c in all_ctrls
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and c.data.get("role") == "meridiem"
+        }
+        meridiem_pills = {
+            (c.data["group"], c.data["meridiem_option"]): c
+            for c in all_ctrls
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and "meridiem_option" in c.data
         }
         save_btn = next(
             c
@@ -421,6 +438,15 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(c, ft.Text) and c.color == ft.Colors.RED_600
         )
 
+        # Time fields use concise headers instead of clipped floating labels, and 1-tap AM/PM pills replace dropdowns
+        self.assertIsNone(text_fields["Remind Time (HH:MM)"].label)
+        self.assertIsNone(text_fields["Force Start Time (HH:MM)"].label)
+        self.assertIsNone(text_fields["Force End Time (HH:MM)"].label)
+        self.assertNotIn("Remind AM/PM", dropdowns)
+        self.assertNotIn("Start AM/PM", dropdowns)
+        self.assertNotIn("End AM/PM", dropdowns)
+        self.assertEqual(set(meridiems.keys()), {"Remind AM/PM", "Start AM/PM", "End AM/PM", "Add Time AM/PM"})
+
         text_fields["Habit Title"].value = "Strict Study"
         mode_dd = dropdowns["Habit Mode"]
         mode_dd.value = "strict"
@@ -430,17 +456,19 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         text_fields["Remind Time (HH:MM)"].value = "09:30"
         text_fields["Force Start Time (HH:MM)"].value = "09:15"
         text_fields["Force End Time (HH:MM)"].value = "10:30"
+        meridiem_pills[("End AM/PM", "AM")].on_click(None)
         await save_btn.on_click(None)
         self.assertTrue(err_text.visible)
         app.api.create_habit.assert_not_awaited()
 
-        # Valid 12h AM/PM time ordering accepted (08:30 AM < 08:45 AM < 01:30 PM -> 13:30)
+        # Valid 12h AM/PM time ordering via 1-tap pill toggle (08:30 AM < 08:45 AM < 01:30 PM -> 13:30)
         text_fields["Remind Time (HH:MM)"].value = "08:30"
-        dropdowns["Remind AM/PM"].value = "AM"
+        meridiem_pills[("Remind AM/PM", "AM")].on_click(None)
         text_fields["Force Start Time (HH:MM)"].value = "08:45"
-        dropdowns["Start AM/PM"].value = "AM"
+        meridiem_pills[("Start AM/PM", "AM")].on_click(None)
         text_fields["Force End Time (HH:MM)"].value = "01:30"
-        dropdowns["End AM/PM"].value = "PM"
+        meridiem_pills[("End AM/PM", "PM")].on_click(None)
+        self.assertEqual(meridiems["End AM/PM"].value, "PM")
         dropdowns["Reminder Style"].value = "alarm"
         await save_btn.on_click(None)
         app.api.create_habit.assert_awaited_once()
@@ -453,7 +481,7 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["reminder_times"], ["08:30"])
         self.assertEqual(payload["reminder_mode"], "alarm")
 
-        # Opening edit dialog pre-populates 12h values + AM/PM selectors cleanly
+        # Opening edit dialog pre-populates 12h values + AM/PM pill toggles cleanly
         app._open_habit_dialog(
             {
                 "id": "h-edit",
@@ -467,14 +495,432 @@ class HabitModesUiTests(unittest.IsolatedAsyncioTestCase):
         )
         edit_dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
         edit_ctrls = list(_walk_controls(edit_dlg))
-        edit_tf = {c.label: c for c in edit_ctrls if isinstance(c, ft.TextField) and c.label}
-        edit_dd = {c.label: c for c in edit_ctrls if isinstance(c, ft.Dropdown) and c.label}
+        edit_tf = {
+            (c.label or c.data): c
+            for c in edit_ctrls
+            if isinstance(c, ft.TextField) and (c.label or c.data)
+        }
+        edit_meridiems = {
+            c.data["name"]: c.data["toggle"]
+            for c in edit_ctrls
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and c.data.get("role") == "meridiem"
+        }
         self.assertEqual(edit_tf["Remind Time (HH:MM)"].value, "01:00")
-        self.assertEqual(edit_dd["Remind AM/PM"].value, "PM")
+        self.assertEqual(edit_meridiems["Remind AM/PM"].value, "PM")
         self.assertEqual(edit_tf["Force Start Time (HH:MM)"].value, "01:15")
-        self.assertEqual(edit_dd["Start AM/PM"].value, "PM")
+        self.assertEqual(edit_meridiems["Start AM/PM"].value, "PM")
         self.assertEqual(edit_tf["Force End Time (HH:MM)"].value, "09:30")
-        self.assertEqual(edit_dd["End AM/PM"].value, "PM")
+        self.assertEqual(edit_meridiems["End AM/PM"].value, "PM")
+
+    async def test_companion_reminder_badge_and_weekly_chips_save(self) -> None:
+        # Companion reminder badge avoids duplicating remind_time shown in mode_summary
+        self.assertIsNone(
+            main.format_companion_reminder_badge(
+                {
+                    "mode": "strict",
+                    "remind_time": "08:30",
+                    "reminder_times": ["08:30"],
+                    "reminder_mode": "notification",
+                }
+            )
+        )
+        self.assertEqual(
+            main.format_companion_reminder_badge(
+                {
+                    "mode": "window",
+                    "remind_time": "08:30",
+                    "reminder_times": ["08:30"],
+                    "reminder_mode": "alarm",
+                }
+            ),
+            "⏰ Alarm",
+        )
+        self.assertEqual(
+            main.format_companion_reminder_badge(
+                {
+                    "mode": "reminder",
+                    "remind_time": "09:00",
+                    "reminder_times": ["09:00", "20:00"],
+                    "reminder_mode": "notification",
+                }
+            ),
+            "🔔 9:00 AM, 8:00 PM",
+        )
+
+        # Weekly schedule chips & presets persist selected weekdays cleanly
+        app = _make_app()
+        app.api.create_habit = AsyncMock(return_value={"id": "h-wk"})
+        app.refresh_current_tab = AsyncMock()  # type: ignore[method-assign]
+        app._open_habit_dialog()
+        dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+        all_ctrls = list(_walk_controls(dlg))
+        text_fields = {
+            (c.label or c.data): c
+            for c in all_ctrls
+            if isinstance(c, ft.TextField) and (c.label or c.data)
+        }
+        dropdowns = {
+            c.label: c for c in all_ctrls if isinstance(c, ft.Dropdown) and c.label
+        }
+        save_btn = next(
+            c
+            for c in all_ctrls
+            if isinstance(c, ft.FilledButton)
+            and isinstance(getattr(c, "content", None), ft.Text)
+            and c.content.value == "Save"
+        )
+
+        text_fields["Habit Title"].value = "Workday Standup"
+        sched_dd = dropdowns["Schedule Frequency"]
+        sched_dd.value = "weekdays"
+        sched_dd.on_select(None)
+
+        chips = {
+            c.label.value: c
+            for c in _walk_controls(dlg)
+            if isinstance(c, ft.Chip) and isinstance(getattr(c, "label", None), ft.Text)
+        }
+        chips["Weekdays"].on_select(None)
+        # Re-read chips after rebuild and toggle Fri off -> Mon..Thu ([0, 1, 2, 3])
+        chips = {
+            c.label.value: c
+            for c in _walk_controls(dlg)
+            if isinstance(c, ft.Chip) and isinstance(getattr(c, "label", None), ft.Text)
+        }
+        chips["Fri"].on_select(None)
+
+        await save_btn.on_click(None)
+        app.api.create_habit.assert_awaited_once()
+        payload = app.api.create_habit.await_args.args[0]
+        self.assertEqual(payload["frequency_type"], "weekdays")
+        self.assertEqual(payload["weekdays"], [0, 1, 2, 3])
+        self.assertEqual(payload["created_date"], date.today().isoformat())
+
+    async def test_checkin_edit_dialog_and_pre_creation_today_view(self) -> None:
+        app = _make_app()
+        app.selected_date = date(2026, 11, 15)
+        app.today_habits = [
+            {
+                "id": "h-editable",
+                "title": "Read 20 Pages",
+                "color": "#6366F1",
+                "target_per_day": 2,
+                "scheduled_today": True,
+                "count": 0,
+                "completed": False,
+                "is_late": False,
+                "note": "",
+                "current_streak": 0,
+                "mode": "strict",
+                "created_date": "2026-11-10",
+                "can_edit": True,
+            },
+            {
+                "id": "h-future-created",
+                "title": "Created Tomorrow",
+                "color": "#10B981",
+                "target_per_day": 1,
+                "scheduled_today": True,
+                "count": 0,
+                "completed": False,
+                "is_late": False,
+                "note": "",
+                "current_streak": 0,
+                "mode": "strict",
+                "created_date": "2026-11-16",
+                "can_edit": False,
+            },
+        ]
+
+        updated_item = {
+            **app.today_habits[0],
+            "count": 2,
+            "completed": True,
+            "is_late": True,
+            "note": "Made up",
+            "day_status": "late_makeup",
+        }
+        app.api.checkin_habit = AsyncMock(return_value=updated_item)
+        app.refresh_current_tab = AsyncMock()  # type: ignore[method-assign]
+
+        view = app._build_today_view()
+        texts = _collect_text_values(view)
+        self.assertIn("0 / 1 completed", texts)
+        self.assertIn("Created 2026-11-16", texts)
+
+        edit_btns = [
+            c
+            for c in _walk_controls(view)
+            if isinstance(c, ft.IconButton) and c.tooltip == "Edit check-in"
+        ]
+        self.assertEqual(len(edit_btns), 1)
+        edit_btns[0].on_click(None)
+
+        dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+        ctrls = list(_walk_controls(dlg))
+        chips = {
+            c.data["status_option"]: c
+            for c in ctrls
+            if isinstance(c, ft.Chip)
+            and isinstance(getattr(c, "data", None), dict)
+            and "status_option" in c.data
+        }
+        tf = {
+            c.label: c for c in ctrls if isinstance(c, ft.TextField) and c.label
+        }
+        save_btn = next(
+            c
+            for c in ctrls
+            if isinstance(c, ft.FilledButton)
+            and isinstance(getattr(c, "content", None), ft.Text)
+            and c.content.value == "Save"
+        )
+
+        # Selecting Overdue Make-up auto-syncs count from 0 to target (2)
+        chips["late_makeup"].on_select(None)
+        self.assertEqual(tf["Count"].value, "2")
+        tf["Check-in Note (optional)"].value = "Made up"
+        await save_btn.on_click(None)
+
+        app.api.checkin_habit.assert_awaited_once()
+        kwargs = app.api.checkin_habit.await_args.kwargs
+        self.assertEqual(kwargs["habit_id"], "h-editable")
+        self.assertEqual(kwargs["target_date"], "2026-11-15")
+        self.assertEqual(kwargs["action"], "edit")
+        self.assertEqual(kwargs["count"], 2)
+        self.assertEqual(kwargs["note"], "Made up")
+        self.assertEqual(kwargs["status_override"], "late_makeup")
+
+        # Schedule row Edit check-in -> Clear Day resets count=0, note=""
+        app.api.checkin_habit.reset_mock()
+        row = app._build_schedule_day_item_row(
+            {
+                "habit_id": "h-sched",
+                "title": "Deep Work",
+                "date": "2026-11-14",
+                "completed": True,
+                "count": 1,
+                "target_per_day": 1,
+                "is_late": False,
+                "note": "Done",
+                "status": "completed",
+                "mode": "free",
+            },
+            is_future=False,
+        )
+        sched_edit_btn = next(
+            c
+            for c in _walk_controls(row)
+            if isinstance(c, ft.IconButton) and c.tooltip == "Edit check-in"
+        )
+        sched_edit_btn.on_click(None)
+        sched_dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+        clear_btn = next(
+            c
+            for c in _walk_controls(sched_dlg)
+            if isinstance(c, ft.TextButton)
+            and isinstance(getattr(c, "content", None), ft.Text)
+            and c.content.value == "Clear Day"
+        )
+        await clear_btn.on_click(None)
+        c_kwargs = app.api.checkin_habit.await_args.kwargs
+        self.assertEqual(c_kwargs["action"], "edit")
+        self.assertEqual(c_kwargs["status_override"], "clear")
+        self.assertEqual(c_kwargs["count"], 0)
+        self.assertEqual(c_kwargs["note"], "")
+
+    async def test_habit_history_dialog_from_habits_and_stats_live_refresh(self) -> None:
+        app = _make_app()
+        app.refresh_current_tab = AsyncMock()  # type: ignore[method-assign]
+        app.all_habits = [
+            {
+                "id": "h1",
+                "title": "Deep Work",
+                "color": "#6366F1",
+                "frequency_type": "daily",
+                "target_per_day": 1,
+                "target_slo": 90.0,
+                "mode": "strict",
+                "archived": False,
+            }
+        ]
+        app.stats_summary = {
+            "best_active_streak": 2,
+            "overall_completion_rate_30d": 75.0,
+            "completed_today": 1,
+            "scheduled_today": 1,
+            "late_today": 0,
+            "violated_today": 0,
+            "last_7_days": [],
+            "habit_stats": [
+                {
+                    "habit_id": "h1",
+                    "title": "Deep Work",
+                    "color": "#6366F1",
+                    "frequency_type": "daily",
+                    "mode": "strict",
+                    "current_streak": 2,
+                    "best_streak": 2,
+                    "completion_rate_30d": 75.0,
+                    "total_completions": 3,
+                    "late_completions": 0,
+                }
+            ],
+        }
+
+        habits_view = app._build_habits_view()
+        stats_view = app._build_stats_view()
+        habits_hist_btn = next(
+            c
+            for c in _walk_controls(habits_view)
+            if isinstance(c, ft.IconButton) and c.tooltip == "Check-in history"
+        )
+        stats_hist_btn = next(
+            c
+            for c in _walk_controls(stats_view)
+            if isinstance(c, ft.IconButton) and c.tooltip == "Check-in history"
+        )
+        # Flet requires async coroutine functions directly on on_click (never sync lambdas)
+        self.assertTrue(inspect.iscoroutinefunction(habits_hist_btn.on_click))
+        self.assertTrue(inspect.iscoroutinefunction(stats_hist_btn.on_click))
+
+        initial_hist = {
+            "habit": app.all_habits[0],
+            "month": "2026-11",
+            "start_date": "2026-11-01",
+            "end_date": "2026-11-30",
+            "first_weekday": 6,
+            "created_date": "2026-11-10",
+            "today": "2026-11-16",
+            "can_prev_month": False,
+            "can_next_month": False,
+            "current_streak": 1,
+            "best_streak": 2,
+            "completion_rate_30d": 71.4,
+            "total_completions": 5,
+            "late_completions": 0,
+            "month_scheduled": 7,
+            "month_completed_on_time": 5,
+            "month_late_makeups": 0,
+            "month_missed": 1,
+            "days": [
+                {
+                    "date": "2026-11-09",
+                    "day": 9,
+                    "weekday": 0,
+                    "weekday_label": "Mon",
+                    "scheduled": True,
+                    "editable": False,
+                    "is_today": False,
+                    "count": 0,
+                    "completed": False,
+                    "is_late": False,
+                    "note": "",
+                    "state": "before_created",
+                },
+                {
+                    "date": "2026-11-13",
+                    "day": 13,
+                    "weekday": 4,
+                    "weekday_label": "Fri",
+                    "scheduled": True,
+                    "editable": True,
+                    "is_today": False,
+                    "count": 0,
+                    "completed": False,
+                    "is_late": False,
+                    "note": "",
+                    "state": "missed",
+                },
+                {
+                    "date": "2026-11-17",
+                    "day": 17,
+                    "weekday": 1,
+                    "weekday_label": "Tue",
+                    "scheduled": True,
+                    "editable": False,
+                    "is_today": False,
+                    "count": 0,
+                    "completed": False,
+                    "is_late": False,
+                    "note": "",
+                    "state": "future",
+                },
+            ],
+        }
+        updated_hist = {
+            **initial_hist,
+            "current_streak": 4,
+            "month_completed_on_time": 6,
+            "month_missed": 0,
+            "days": [
+                initial_hist["days"][0],
+                {
+                    **initial_hist["days"][1],
+                    "count": 1,
+                    "completed": True,
+                    "note": "Fixed",
+                    "state": "on_time",
+                },
+                initial_hist["days"][2],
+            ],
+        }
+        app.api.get_habit_history = AsyncMock(side_effect=[initial_hist, updated_hist])
+        app.api.checkin_habit = AsyncMock(return_value={"id": "h1", "completed": True})
+
+        await stats_hist_btn.on_click(None)
+        history_dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+
+        cells = {
+            c.data["history_date"]: c
+            for c in _walk_controls(history_dlg)
+            if isinstance(c, ft.Container)
+            and isinstance(getattr(c, "data", None), dict)
+            and "history_date" in c.data
+        }
+        self.assertIsNone(cells["2026-11-09"].on_click)
+        self.assertIsNone(cells["2026-11-17"].on_click)
+        self.assertIsNotNone(cells["2026-11-13"].on_click)
+
+        # Clicking editable calendar cell opens stacked edit dialog
+        cells["2026-11-13"].on_click(None)
+        edit_dlg = app.page.dialogs[-1]  # type: ignore[attr-defined]
+        self.assertIsNot(edit_dlg, history_dlg)
+
+        edit_ctrls = list(_walk_controls(edit_dlg))
+        on_time_chip = next(
+            c
+            for c in edit_ctrls
+            if isinstance(c, ft.Chip)
+            and isinstance(getattr(c, "data", None), dict)
+            and c.data.get("status_option") == "on_time"
+        )
+        on_time_chip.on_select(None)
+        save_btn = next(
+            c
+            for c in edit_ctrls
+            if isinstance(c, ft.FilledButton)
+            and isinstance(getattr(c, "content", None), ft.Text)
+            and c.content.value == "Save"
+        )
+        await save_btn.on_click(None)
+
+        self.assertEqual(app.api.get_habit_history.await_count, 2)
+        self.assertIn(history_dlg, app.page.dialogs)  # type: ignore[attr-defined]
+        self.assertNotIn(edit_dlg, app.page.dialogs)  # type: ignore[attr-defined]
+        self.assertIn("Streak 4d", _collect_text_values(history_dlg))
+
+        close_btn = next(
+            c
+            for c in _walk_controls(history_dlg)
+            if isinstance(c, ft.TextButton)
+            and isinstance(getattr(c, "content", None), ft.Text)
+            and c.content.value == "Close"
+        )
+        close_btn.on_click(None)
+        self.assertNotIn(history_dlg, app.page.dialogs)  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

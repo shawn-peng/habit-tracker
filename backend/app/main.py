@@ -1,6 +1,8 @@
 import asyncio
+import calendar
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+import re
 from typing import Literal
 
 from bson import ObjectId
@@ -17,6 +19,7 @@ from app.core import (
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     HabitCreate,
+    HabitHistoryOut,
     HabitOut,
     HabitStreakStat,
     HabitTodayOut,
@@ -37,6 +40,7 @@ from app.core import (
     TokenResponse,
     UserPublic,
     VerifyEmailRequest,
+    build_habit_history,
     build_period_schedule,
     build_reminders_overview,
     build_sli_dashboard,
@@ -49,15 +53,19 @@ from app.core import (
     evaluate_habit_day_status,
     extract_habit_mode_fields,
     extract_reminder_fields,
+    format_habit_created_date,
+    format_habit_created_time,
     generate_reset_code,
     get_current_user,
     get_db,
+    habit_sli_start_date,
     hash_password,
     hash_reset_code,
     hash_verification_code,
     is_scheduled_on,
     normalize_reminder_time,
     resolve_client_clock,
+    resolve_habit_created_date,
     send_password_reset_email,
     send_registration_verification_email,
     settings,
@@ -152,6 +160,8 @@ def _serialize_habit(habit_doc: dict) -> HabitOut:
         reminder_snooze_minutes=reminder_snooze_minutes,
         reminder_message=reminder_message,
         archived=habit_doc.get("archived", False),
+        created_date=format_habit_created_date(habit_doc),
+        created_time=format_habit_created_time(habit_doc),
         created_at=habit_doc["created_at"],
     )
 
@@ -721,6 +731,10 @@ async def create_habit(
         "archived": False,
         "created_at": datetime.now(timezone.utc),
     }
+    if payload.created_date is not None:
+        doc["created_date"] = payload.created_date
+    if payload.created_time is not None:
+        doc["created_time"] = payload.created_time
     res = await db.habits.insert_one(doc)
     doc["_id"] = res.inserted_id
     return _serialize_habit(doc)
@@ -994,6 +1008,10 @@ async def list_habits_for_date(
         hid = str(h["_id"])
         chk = day_checkins.get(hid)
         scheduled = is_scheduled_on(h, parsed_date)
+        min_created = resolve_habit_created_date(h, client_today_date)
+        can_edit = parsed_date <= client_today_date and (
+            min_created is None or parsed_date >= min_created
+        )
         ev = evaluate_habit_day_status(
             habit=h,
             checkin=chk,
@@ -1001,9 +1019,11 @@ async def list_habits_for_date(
             client_today_str=client_today_iso,
             client_time=resolved_time,
             scheduled=scheduled,
+            can_edit=can_edit,
         )
         today_violated = (
             scheduled
+            and can_edit
             and iso_date <= client_today_iso
             and ev.day_status in ("violation", "late_makeup")
         )
@@ -1030,6 +1050,7 @@ async def list_habits_for_date(
                 started_on_time=ev.started_on_time,
                 is_late=ev.is_late,
                 can_start=ev.can_start,
+                can_edit=can_edit,
             )
         )
     return results
@@ -1157,9 +1178,19 @@ async def checkin_habit(
     if not habit:
         raise HTTPException(status_code=404, detail="Habit not found")
 
+    min_created = resolve_habit_created_date(habit, client_today_date)
+    if min_created is not None and parsed_date < min_created:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot edit check-in history before habit creation date "
+                f"({min_created.isoformat()})"
+            ),
+        )
+
     mode, _, force_start_time, force_end_time = extract_habit_mode_fields(habit)
     scheduled = is_scheduled_on(habit, parsed_date)
-    target = habit.get("target_per_day", 1)
+    target = max(1, int(habit.get("target_per_day", 1)))
     existing = await db.checkins.find_one(
         {"habit_id": habit_id, "user_id": user_id, "date": iso_date}
     )
@@ -1197,6 +1228,63 @@ async def checkin_habit(
         started_at_time = prev_started_at_time or resolved_time
         is_late = False
         violation_reason = None
+    elif payload.action == "edit" or payload.status_override is not None:
+        note = payload.note.strip() if payload.note is not None else prev_note
+        if payload.status_override is not None:
+            effective_status = payload.status_override
+        else:
+            candidate_count = payload.count if payload.count is not None else prev_count
+            if candidate_count >= target:
+                effective_status = (
+                    "late_makeup" if (prev_completed and prev_is_late) else "on_time"
+                )
+            else:
+                effective_status = "clear"
+
+        if effective_status == "on_time":
+            if payload.count is not None and payload.count < target:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Completed status requires count >= {target}",
+                )
+            new_count = payload.count if payload.count is not None else max(target, prev_count)
+            completed = True
+            is_late = False
+            violation_reason = None
+            started_on_time = True if mode == "strict" else prev_started_on_time
+            started_at_time = prev_started_at_time or (
+                force_start_time if mode == "strict" else None
+            )
+        elif effective_status == "late_makeup":
+            if payload.count is not None and payload.count < target:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Overdue make-up status requires count >= {target}",
+                )
+            new_count = payload.count if payload.count is not None else max(target, prev_count)
+            completed = True
+            is_late = True
+            violation_reason = prev_violation_reason or (
+                "missed_start"
+                if (mode == "strict" and not prev_started_on_time)
+                else "missed_end"
+            )
+            started_on_time = (
+                prev_started_on_time if violation_reason == "missed_end" else False
+            )
+            started_at_time = prev_started_at_time if started_on_time else None
+        else:  # "clear"
+            if payload.count is not None and payload.count >= target:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Count must be less than {target} when status is Not Completed",
+                )
+            new_count = payload.count if payload.count is not None else 0
+            completed = False
+            is_late = False
+            violation_reason = None
+            started_on_time = False
+            started_at_time = None
     else:
         if payload.action == "increment":
             new_count = prev_count + 1
@@ -1257,25 +1345,30 @@ async def checkin_habit(
             is_late = False
             violation_reason = None
 
-    await db.checkins.update_one(
-        {"habit_id": habit_id, "date": iso_date},
-        {
-            "$set": {
-                "user_id": user_id,
-                "habit_id": habit_id,
-                "date": iso_date,
-                "count": new_count,
-                "completed": completed,
-                "note": note,
-                "started_on_time": started_on_time,
-                "started_at_time": started_at_time,
-                "is_late": is_late,
-                "violation_reason": violation_reason,
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
-        upsert=True,
-    )
+    if new_count == 0 and not note and not started_on_time:
+        await db.checkins.delete_one(
+            {"habit_id": habit_id, "user_id": user_id, "date": iso_date}
+        )
+    else:
+        await db.checkins.update_one(
+            {"habit_id": habit_id, "date": iso_date},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "habit_id": habit_id,
+                    "date": iso_date,
+                    "count": new_count,
+                    "completed": completed,
+                    "note": note,
+                    "started_on_time": started_on_time,
+                    "started_at_time": started_at_time,
+                    "is_late": is_late,
+                    "violation_reason": violation_reason,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
 
     completed_dates: set[str] = set()
     async for chk in db.checkins.find(
@@ -1327,6 +1420,111 @@ async def checkin_habit(
         started_on_time=ev.started_on_time,
         is_late=ev.is_late,
         can_start=ev.can_start,
+        can_edit=True,
+    )
+
+
+@app.get("/api/habits/{habit_id}/history", response_model=HabitHistoryOut)
+async def get_habit_history(
+    habit_id: str,
+    month: str | None = Query(default=None),
+    client_today: str | None = Query(default=None),
+    client_time: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncDatabase = Depends(get_db),
+) -> HabitHistoryOut:
+    if not ObjectId.is_valid(habit_id):
+        raise HTTPException(status_code=400, detail="Invalid habit ID")
+
+    try:
+        client_today_date, resolved_time = resolve_client_clock(
+            client_today, client_time
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client_today or client_time format",
+        ) from exc
+
+    if month is not None and month.strip():
+        match = re.fullmatch(r"(\d{4})-(\d{2})", month.strip())
+        if not match:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid month format, expected YYYY-MM",
+            )
+        year = int(match.group(1))
+        mon = int(match.group(2))
+        if not (1 <= mon <= 12):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid month format, expected YYYY-MM",
+            )
+    else:
+        year = client_today_date.year
+        mon = client_today_date.month
+
+    user_id = str(current_user["_id"])
+    habit = await db.habits.find_one({"_id": ObjectId(habit_id), "user_id": user_id})
+    if not habit:
+        raise HTTPException(status_code=404, detail="Habit not found")
+
+    _, last_day = calendar.monthrange(year, mon)
+    start_iso = date(year, mon, 1).isoformat()
+    end_iso = date(year, mon, last_day).isoformat()
+    client_today_iso = client_today_date.isoformat()
+
+    async def _fetch_month_checkins() -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        async for chk in db.checkins.find(
+            {
+                "user_id": user_id,
+                "habit_id": habit_id,
+                "date": {"$gte": start_iso, "$lte": end_iso},
+            }
+        ):
+            result[chk["date"]] = chk
+        return result
+
+    async def _fetch_completed_dates() -> tuple[set[str], set[str]]:
+        on_time: set[str] = set()
+        late: set[str] = set()
+        async for chk in db.checkins.find(
+            {"user_id": user_id, "habit_id": habit_id, "completed": True},
+            {"_id": 0, "date": 1, "is_late": 1},
+        ):
+            if chk.get("is_late", False):
+                late.add(chk["date"])
+            else:
+                on_time.add(chk["date"])
+        return on_time, late
+
+    async def _fetch_today_checkin() -> dict | None:
+        if start_iso <= client_today_iso <= end_iso:
+            return None
+        return await db.checkins.find_one(
+            {"user_id": user_id, "habit_id": habit_id, "date": client_today_iso}
+        )
+
+    month_checkins, (completed_dates, late_dates), today_chk = await asyncio.gather(
+        _fetch_month_checkins(),
+        _fetch_completed_dates(),
+        _fetch_today_checkin(),
+    )
+    if start_iso <= client_today_iso <= end_iso:
+        today_chk = month_checkins.get(client_today_iso)
+
+    return build_habit_history(
+        habit=habit,
+        habit_out=_serialize_habit(habit),
+        month_checkins=month_checkins,
+        completed_dates=completed_dates,
+        late_dates=late_dates,
+        year=year,
+        month=mon,
+        client_today_date=client_today_date,
+        client_time=resolved_time,
+        today_checkin=today_chk,
     )
 
 
@@ -1526,7 +1724,10 @@ async def get_sli_dashboard(
     violated_habit_ids: set[str] = set()
     for h in habits:
         hid = str(h["_id"])
-        if not is_scheduled_on(h, ref_date):
+        sli_start = habit_sli_start_date(
+            h, completed_by_habit[hid], ref_date, fallback=ref_date
+        )
+        if ref_date < sli_start or not is_scheduled_on(h, ref_date):
             continue
         ev = evaluate_habit_day_status(
             habit=h,

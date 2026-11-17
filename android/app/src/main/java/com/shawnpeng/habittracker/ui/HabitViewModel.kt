@@ -10,6 +10,7 @@ import com.shawnpeng.habittracker.data.DEFAULT_EMULATOR_URL
 import com.shawnpeng.habittracker.data.Habit
 import com.shawnpeng.habittracker.data.HabitApiClient
 import com.shawnpeng.habittracker.data.HabitCreateRequest
+import com.shawnpeng.habittracker.data.HabitHistory
 import com.shawnpeng.habittracker.data.HabitToday
 import com.shawnpeng.habittracker.data.HabitUpdateRequest
 import com.shawnpeng.habittracker.data.PeriodSchedule
@@ -26,6 +27,7 @@ import com.shawnpeng.habittracker.notifications.HabitNotificationHelper
 import com.shawnpeng.habittracker.notifications.NoOpHabitAlarmController
 import java.time.LocalDate
 import java.time.LocalTime
+import java.time.YearMonth
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -64,6 +66,12 @@ data class HabitUiState(
     val showRemindersDialog: Boolean = false,
     val remindersOverview: RemindersOverview? = null,
     val isLoadingReminders: Boolean = false,
+    val showHistoryDialog: Boolean = false,
+    val historyHabitId: String? = null,
+    val historyHabitTitle: String = "",
+    val historyMonth: YearMonth = YearMonth.now(),
+    val habitHistory: HabitHistory? = null,
+    val isLoadingHistory: Boolean = false,
     val snackbarMessage: String? = null,
 )
 
@@ -638,6 +646,11 @@ class HabitViewModel(
                     showRemindersDialog = false,
                     remindersOverview = null,
                     isLoadingReminders = false,
+                    showHistoryDialog = false,
+                    historyHabitId = null,
+                    historyHabitTitle = "",
+                    habitHistory = null,
+                    isLoadingHistory = false,
                 )
             }
         }
@@ -662,6 +675,14 @@ class HabitViewModel(
         val today = LocalDate.now()
         if (_uiState.value.selectedDate == today) return
         _uiState.update { it.copy(selectedDate = today) }
+        launchTabLoad(0)
+    }
+
+    fun selectDate(date: LocalDate) {
+        val today = LocalDate.now()
+        if (date.isAfter(today)) return
+        if (_uiState.value.selectedDate == date) return
+        _uiState.update { it.copy(selectedDate = date) }
         launchTabLoad(0)
     }
 
@@ -728,6 +749,102 @@ class HabitViewModel(
                 clientTime = currentNowHhmm(),
             ),
         )
+    }
+
+    fun editCheckin(
+        habitId: String,
+        date: String,
+        statusOverride: String,
+        count: Int,
+        note: String,
+    ) {
+        performCheckin(
+            habitId,
+            CheckinRequest(
+                date = date,
+                action = "edit",
+                count = count,
+                note = note.trim(),
+                statusOverride = statusOverride,
+                clientToday = isoDate(LocalDate.now()),
+                clientTime = currentNowHhmm(),
+            ),
+        )
+    }
+
+    fun openHabitHistory(habitId: String, title: String = "") {
+        val currentMonth = YearMonth.now()
+        _uiState.update {
+            it.copy(
+                showHistoryDialog = true,
+                historyHabitId = habitId,
+                historyHabitTitle = title,
+                historyMonth = currentMonth,
+                habitHistory = null,
+                isLoadingHistory = true,
+            )
+        }
+        viewModelScope.launch {
+            loadHabitHistory(habitId, currentMonth)
+        }
+    }
+
+    fun shiftHistoryMonth(deltaMonths: Long) {
+        val hid = _uiState.value.historyHabitId ?: return
+        val target = _uiState.value.historyMonth.plusMonths(deltaMonths)
+        val current = YearMonth.now()
+        if (target.isAfter(current)) return
+        _uiState.update { it.copy(historyMonth = target, isLoadingHistory = true) }
+        viewModelScope.launch {
+            loadHabitHistory(hid, target)
+        }
+    }
+
+    fun resetHistoryMonth() {
+        val hid = _uiState.value.historyHabitId ?: return
+        val current = YearMonth.now()
+        _uiState.update { it.copy(historyMonth = current, isLoadingHistory = true) }
+        viewModelScope.launch {
+            loadHabitHistory(hid, current)
+        }
+    }
+
+    fun dismissHabitHistory() {
+        _uiState.update {
+            it.copy(
+                showHistoryDialog = false,
+                historyHabitId = null,
+                historyHabitTitle = "",
+                habitHistory = null,
+                isLoadingHistory = false,
+            )
+        }
+    }
+
+    private suspend fun loadHabitHistory(habitId: String, month: YearMonth) {
+        _uiState.update { it.copy(isLoadingHistory = true) }
+        try {
+            val history = api.getHabitHistory(
+                habitId = habitId,
+                month = month.format(DateTimeFormatter.ofPattern("yyyy-MM")),
+                clientToday = isoDate(LocalDate.now()),
+                clientTime = currentNowHhmm(),
+            )
+            _uiState.update { state ->
+                if (state.historyHabitId == habitId) {
+                    state.copy(
+                        isLoadingHistory = false,
+                        habitHistory = history,
+                        historyHabitTitle = history.habit.title,
+                    )
+                } else {
+                    state
+                }
+            }
+        } catch (exc: ApiException) {
+            _uiState.update { it.copy(isLoadingHistory = false) }
+            handleAuthenticatedError(exc)
+        }
     }
 
     fun updateCheckinNote(habit: HabitToday, note: String) {
@@ -842,6 +959,13 @@ class HabitViewModel(
                         refreshAndSyncAlarms()
                     }
                 }
+                if (request.action == "edit") {
+                    _uiState.update { it.copy(snackbarMessage = "Updated check-in for ${request.date}") }
+                }
+                val activeHistoryState = _uiState.value
+                if (activeHistoryState.showHistoryDialog && activeHistoryState.historyHabitId == habitId) {
+                    loadHabitHistory(habitId, activeHistoryState.historyMonth)
+                }
             } catch (exc: ApiException) {
                 handleAuthenticatedError(exc)
             }
@@ -881,7 +1005,12 @@ class HabitViewModel(
                     )
                     _uiState.update { it.copy(snackbarMessage = "Habit updated") }
                 } else {
-                    api.createHabit(request)
+                    api.createHabit(
+                        request.copy(
+                            createdDate = request.createdDate ?: isoDate(LocalDate.now()),
+                            createdTime = request.createdTime ?: currentNowHhmm(),
+                        ),
+                    )
                     _uiState.update { it.copy(snackbarMessage = "Habit created") }
                 }
                 invalidateTabs(0, 1, 2, 3, 4)
@@ -1121,6 +1250,11 @@ class HabitViewModel(
                     showRemindersDialog = false,
                     remindersOverview = null,
                     isLoadingReminders = false,
+                    showHistoryDialog = false,
+                    historyHabitId = null,
+                    historyHabitTitle = "",
+                    habitHistory = null,
+                    isLoadingHistory = false,
                     authError = "Session expired. Please sign in again.",
                     authInfoMessage = null,
                     resetCodeSentEmail = null,

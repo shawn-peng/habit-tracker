@@ -18,11 +18,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircleOutline
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.LocalFireDepartment
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,11 +37,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.shawnpeng.habittracker.data.HABIT_MODE_OPTIONS
+import com.shawnpeng.habittracker.data.HabitStreakStat
 import com.shawnpeng.habittracker.data.StatsSummary
 import com.shawnpeng.habittracker.data.parseHabitColor
 
 @Composable
-fun StatsScreen(summary: StatsSummary?) {
+fun StatsScreen(
+    summary: StatsSummary?,
+    onOpenHabitHistory: (HabitStreakStat) -> Unit,
+) {
     val stats = summary ?: StatsSummary()
 
     LazyColumn(
@@ -251,18 +257,29 @@ fun StatsScreen(summary: StatsSummary?) {
                             }
                         }
 
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(
-                                text = "Current: ${hs.currentStreak}$streakUnit",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.tertiary,
-                            )
-                            Text(
-                                text = "Best: ${hs.bestStreak}$streakUnit",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(
+                                    text = "Current: ${hs.currentStreak}$streakUnit",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                )
+                                Text(
+                                    text = "Best: ${hs.bestStreak}$streakUnit",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(onClick = { onOpenHabitHistory(hs) }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.History,
+                                    contentDescription = "Check-in history",
+                                )
+                            }
                         }
                     }
                 }

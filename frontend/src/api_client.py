@@ -308,7 +308,13 @@ class HabitApiClient:
         )
 
     async def create_habit(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/api/habits", json_body=payload)
+        now_dt = datetime.now()
+        body: dict[str, Any] = {
+            "created_date": now_dt.date().isoformat(),
+            "created_time": now_dt.strftime("%H:%M"),
+            **payload,
+        }
+        return await self._request("POST", "/api/habits", json_body=body)
 
     async def update_habit(
         self, habit_id: str, payload: dict[str, Any]
@@ -325,6 +331,7 @@ class HabitApiClient:
         action: str = "increment",
         count: int | None = None,
         note: str | None = None,
+        status_override: str | None = None,
         client_today: str | None = None,
         client_time: str | None = None,
     ) -> dict[str, Any]:
@@ -339,8 +346,28 @@ class HabitApiClient:
             body["count"] = count
         if note is not None:
             body["note"] = note
+        if status_override is not None:
+            body["status_override"] = status_override
         return await self._request(
             "POST", f"/api/habits/{habit_id}/checkin", json_body=body
+        )
+
+    async def get_habit_history(
+        self,
+        habit_id: str,
+        month: str | None = None,
+        client_today: str | None = None,
+        client_time: str | None = None,
+    ) -> dict[str, Any]:
+        now_dt = datetime.now()
+        params: dict[str, Any] = {
+            "client_today": client_today or now_dt.date().isoformat(),
+            "client_time": client_time or now_dt.strftime("%H:%M"),
+        }
+        if month:
+            params["month"] = month
+        return await self._request(
+            "GET", f"/api/habits/{habit_id}/history", params=params
         )
 
     async def get_stats_summary(
@@ -385,7 +412,16 @@ def open_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
 
 
 def close_dialog(page: ft.Page, dialog: ft.AlertDialog) -> None:
-    if hasattr(page, "pop_dialog"):
+    if hasattr(page, "_dialogs") and getattr(dialog, "page", None) is not None:
+        dialog.open = False
+        dialog.update()
+    elif (
+        hasattr(page, "dialogs")
+        and isinstance(getattr(page, "dialogs"), list)
+        and dialog in page.dialogs
+    ):
+        page.dialogs.remove(dialog)
+    elif hasattr(page, "pop_dialog"):
         page.pop_dialog()
     elif hasattr(page, "close"):
         page.close(dialog)
